@@ -1,11 +1,16 @@
 """配置加载（用户级 / 项目级 / 本地级三源合并）。
 
-M0 阶段仅占位——具体 schema、三源合并与覆盖规则随 M1 落地。
+M1 阶段：Config 为简单 dataclass；`load_api_key` 从环境变量 / `.env` 读取
+DeepSeek key（live 测试与 TUI 启动共用）。
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 @dataclass(slots=True)
@@ -19,5 +24,19 @@ class Config:
 
 
 def load_config() -> Config:
-    """从三源（用户级 / 项目级 / 本地级）合并加载配置。M0 返回默认值。"""
+    """从三源（用户级 / 项目级 / 本地级）合并加载配置。M1 返回默认值。"""
     return Config()
+
+
+def load_api_key() -> str:
+    """读取 DEEPSEEK_API_KEY：环境变量优先，回退项目根 `.env`。"""
+    key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if key:
+        return key
+    for env_path in (Path.cwd() / ".env", _PROJECT_ROOT / ".env"):
+        if env_path.is_file():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("DEEPSEEK_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    return ""

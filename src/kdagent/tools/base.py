@@ -11,11 +11,15 @@ Tool 是 Protocol（结构子类型），内置工具用普通类实现；注册
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
 from kdagent.config import Config
+
+# 05 UI 提供的确认钩子：工具名 + 参数 → 是否放行。async，因为确认对话框要等用户输入。
+AsyncConfirm: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[bool]]
 
 
 @dataclass(slots=True)
@@ -24,12 +28,14 @@ class ToolContext:
 
     work_dir：相对路径基准（内置工具强制绝对路径时以此兜底）；
     config：运行时配置；
-    tool_use_id：当前调用对应的 tool_use id，由 02 `_exec_one` 注入，供 ToolResult 回填。
+    tool_use_id：当前调用对应的 tool_use id，由 02 `_exec_one` 注入，供 ToolResult 回填；
+    confirm：05 注入的确认钩子（require_confirm 前置），None 表示非交互环境直接执行。
     """
 
     work_dir: Path
     config: Config
     tool_use_id: str = ""
+    confirm: AsyncConfirm | None = None
 
 
 @dataclass(frozen=True, slots=True)

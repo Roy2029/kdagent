@@ -36,7 +36,7 @@ from kdagent.engine.events import (
 )
 from kdagent.engine.llm.base import LLMClient, Payload, Usage
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
-from kdagent.tools.base import ToolContext, ToolResult
+from kdagent.tools.base import AsyncConfirm, ToolContext, ToolResult
 from kdagent.tools.registry import ToolRegistry
 
 AgentStatus = Literal["CONTINUE", "TERMINAL"]
@@ -88,6 +88,7 @@ class Agent:
         events: AgentEventSink,
         work_dir: Path | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        confirm: AsyncConfirm | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -96,11 +97,26 @@ class Agent:
         self._events = events
         self._work_dir = Path.cwd() if work_dir is None else work_dir
         self._system_prompt = system_prompt
+        self._confirm = confirm  # 05 UI 确认钩子，None = 非交互环境直接执行
         self._usage: Usage | None = None
         self._consecutive_failures = 0
         self._turn = 0
         self._pending_text: list[str] = []
         self._pending_tool_uses: list[ToolUseBlock] = []
+
+    def set_system_prompt(self, text: str) -> None:
+        """运行时切换 system prompt（05 /plan 模式切换用）。"""
+        self._system_prompt = text
+
+    @property
+    def tool_count(self) -> int:
+        """已注册工具数（05 /status 展示用）。"""
+        return len(self._tools.all())
+
+    @property
+    def conversation(self) -> ConversationManager:
+        """当前对话历史（05 命令 / 会话接线用）。"""
+        return self._conversation
 
     async def run(self, user_input: str) -> None:
         """跑完整循环直到终止；用户取消或超限也干净返回。"""
@@ -228,8 +244,27 @@ class Agent:
         if errors:
             return self._error_result(tool_use, "参数校验失败：\n" + "\n".join(errors))
         ctx = ToolContext(
-            work_dir=self._work_dir, config=self._config, tool_use_id=tool_use.id
+            work_dir=self._work_dir,
+            config=self._config,
+            tool_use_id=tool_use.id,
+            confirm=self._confirm,
         )
+        # 规格 05 §3.4：Y/N 前置——选 no 返回 is_error=True 结果，模型下轮自行调整。
+        if (
+            tool.require_confirm
+            and ctx.confirm is not None
+            and not await ctx.confirm(tool_use.name, tool_use.input)
+        ):
+            result = self._error_result(tool_use, "执行已被用户拒绝")
+            self._events(
+                ToolResultEvent(
+                    name=result.name,
+                    content=result.content,
+                    is_error=True,
+                    duration_ms=0,
+                )
+            )
+            return result
         try:
             result = await tool.execute(ctx, tool_use.input)
         except Exception as exc:
