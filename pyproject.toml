@@ -37,6 +37,9 @@ extend-exclude = ["主循环代码.py"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]  # 测试 SSE 数据行结构性长
+
 [tool.mypy]
 python_version = "3.11"
 strict = true
