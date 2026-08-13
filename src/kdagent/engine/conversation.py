@@ -51,6 +51,10 @@ class ConversationManager:
         ]
         self._append(Message(role="user", content=blocks))
 
+    def restore(self, messages: list[Message]) -> None:
+        """`04` 会话恢复：整批替换历史（调用方保证消息链已映射为领域 Message）。"""
+        self._messages = list(messages)
+
     def last_tool_use_ids(self) -> list[str]:
         """返回最近一条 assistant 消息里的 tool_use id 集合（校验配对用）。"""
         for msg in reversed(self._messages):

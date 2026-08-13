@@ -120,6 +120,9 @@ class Agent:
         self._events(MaxIterationsReachedEvent(limit=MAX_ITERATIONS))
 
     async def _loop_iteration(self) -> AgentStatus:
+        # 恢复四步②（04 §3.4）：链修复守在"发请求前"这一个出口——悬空 tool_use
+        # 补错误结果、孤儿 tool_result 剔除，保证交替/配对合法。
+        self._conversation.repair_chain()
         payload = self._assemble_payload()
         self._pending_text = []
         self._pending_tool_uses = []
