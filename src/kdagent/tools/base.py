@@ -1,0 +1,63 @@
+"""工具协议（规格 03 §3.2）。
+
+不止「名字 + 执行」，每个工具还声明元信息：
+- is_read_only / is_destructive：供权限系统（06）决策
+- is_concurrency_safe：供 02 分批执行决策
+- require_confirm：供 05 确认对话框前置
+- validate_input：进入执行前先做参数校验
+
+Tool 是 Protocol（结构子类型），内置工具用普通类实现；注册时 registry 校验其元信息完备。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+from kdagent.config import Config
+
+
+@dataclass(slots=True)
+class ToolContext:
+    """一次工具调用的运行环境（依赖注入）。
+
+    work_dir：相对路径基准（内置工具强制绝对路径时以此兜底）；
+    config：运行时配置；
+    tool_use_id：当前调用对应的 tool_use id，由 02 `_exec_one` 注入，供 ToolResult 回填。
+    """
+
+    work_dir: Path
+    config: Config
+    tool_use_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    """工具执行结果（03 §3.2；07 可观测性消费 duration_ms）。"""
+
+    tool_use_id: str
+    name: str
+    content: str
+    is_error: bool = False
+    duration_ms: int = 0
+
+
+class Tool(Protocol):
+    """统一工具协议：元信息 + 校验 + 执行。"""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    category: str
+    require_confirm: bool
+
+    def is_read_only(self) -> bool: ...
+
+    def is_destructive(self) -> bool: ...
+
+    def is_concurrency_safe(self, input: dict[str, Any]) -> bool: ...
+
+    def validate_input(self, input: dict[str, Any]) -> list[str]: ...
+
+    async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult: ...

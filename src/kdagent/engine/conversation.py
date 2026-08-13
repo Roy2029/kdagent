@@ -8,8 +8,6 @@ M1 阶段自持 history；M2 起委托 `01` 的 ConversationHistory / ContextMan
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from kdagent.engine.messages import (
     ContentBlock,
     Message,
@@ -17,15 +15,7 @@ from kdagent.engine.messages import (
     ToolResultBlock,
     ToolUseBlock,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class ToolResult:
-    """工具执行结果（对齐 `03` 工具系统的 ToolResult；M1-b 起共用）。"""
-
-    tool_use_id: str
-    content: str
-    is_error: bool = False
+from kdagent.tools.base import ToolResult
 
 
 class ConversationManager:
