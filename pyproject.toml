@@ -1,0 +1,51 @@
+[project]
+name = "kdagent"
+version = "0.1.0"
+description = "KDAgent - 类 Claude Code 的 Coding Agent（Python 3.11+ / Textual）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    "httpx>=0.27",
+    "mcp>=1.0",
+    "textual>=0.80",
+]
+
+[project.scripts]
+kdagent = "kdagent.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kdagent"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["主循环代码.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+# 国内网络环境使用镜像源（pypi.org 直连常 TLS 失败）
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
