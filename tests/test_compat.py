@@ -63,6 +63,20 @@ def test_translate_modifier_keys_dropped() -> None:
     assert compat.translate_key_event(compat.VK_MENU, 0, "") is None
 
 
+def test_should_drop_key_event_ime_submission() -> None:
+    """传统模式下 VK=0 的 IME 汉字事件必须保留（修复中文误杀）。
+
+    conhost 把 IME 确认的汉字以 VK=0 + UnicodeChar 提交；原 VT 模式的
+    "dwControlKeyState and vk==0" 过滤会把中文丢进黑名单。
+    """
+    assert not compat._should_drop_key_event(0, "你")  # IME 确认提交的汉字
+    assert not compat._should_drop_key_event(0, "好")
+    assert not compat._should_drop_key_event(0, "A")  # 普通字符
+    assert compat._should_drop_key_event(0, "")  # 无 VK 且无字符 → 丢弃
+    assert compat._should_drop_key_event(0, "\x00")
+    assert not compat._should_drop_key_event(compat.VK_RETURN, "")  # 特殊键不丢
+
+
 # ---- MOUSE_EVENT → SGR 鼠标序列 ------------------------------------------
 
 

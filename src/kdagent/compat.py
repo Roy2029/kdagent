@@ -26,8 +26,9 @@ Textual 8.2.8 的 Windows 驱动（windows_driver.py / drivers/win32.py）有三
 
 from __future__ import annotations
 
+import os
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TextIO
 
 if TYPE_CHECKING:
     from textual.drivers.windows_driver import WindowsDriver
@@ -187,6 +188,18 @@ def translate_mouse_event(
     return f"\x1b[<{3 + mod};{x};{y}m"  # 释放
 
 
+def _should_drop_key_event(vkey: int, unicode_char: str) -> bool:
+    """传统模式下该 KEY_EVENT 是否应丢弃。
+
+    conhost 传统模式把 IME 确认的汉字作为 ``wVirtualKeyCode=0`` + 非空
+    ``UnicodeChar`` 的 KEY_EVENT 提交（拼音阶段不发事件，确认后整串提交）。
+    Textual 原版在 VT 输入模式下用 ``dwControlKeyState and vkey==0`` 过滤
+    辅助事件——传统模式下该判断会把 IME 汉字误杀（VK=0 的汉字被丢弃，
+    正是中文上屏失败的根因），故改为仅丢弃"无 VK 且无字符"的空事件。
+    """
+    return vkey == 0 and unicode_char in ("", "\x00")
+
+
 # ---------------------------------------------------------------------------
 # 驱动 monkeypatch（仅 win32 生效）
 # ---------------------------------------------------------------------------
@@ -238,6 +251,19 @@ def _compat_event_monitor_run(self: Any) -> None:
     from textual._xterm_parser import XTermParser
     from textual.drivers import win32
 
+    # KDA_INPUT_DEBUG=1 时把每个 KEY_EVENT 原始字段写入 .kdagent/input-debug.log，
+    # 供 conhost 按键/IME 路径排障（Textual 默认日志不落盘，需独立文件）。
+    debug_input = os.environ.get("KDA_INPUT_DEBUG") == "1"
+    _debug_file: TextIO | None = None
+    if debug_input:
+        kd_dir = os.path.join(os.getcwd(), ".kdagent")
+        os.makedirs(kd_dir, exist_ok=True)
+        # 文件须跨事件循环生命周期保持打开，finally 中统一关闭 → 不用 with
+        _debug_file = open(  # noqa: SIM115
+            os.path.join(kd_dir, "input-debug.log"),
+            "a",
+            encoding="utf-8",
+        )
     exit_requested = self.exit_event.is_set
     parser = XTermParser(debug=constants.DEBUG)
 
@@ -277,8 +303,20 @@ def _compat_event_monitor_run(self: Any) -> None:
                 if event_type == KEY_EVENT:
                     key_event = input_record.Event.KeyEvent
                     if key_event.bKeyDown:
-                        if key_event.dwControlKeyState and key_event.wVirtualKeyCode == 0:
-                            continue  # IME 辅助事件，无字符
+                        if debug_input and _debug_file is not None:
+                            _debug_file.write(
+                                f"KEY vk={key_event.wVirtualKeyCode:#x} "
+                                f"state={key_event.dwControlKeyState:#x} "
+                                f"uni={key_event.uChar.UnicodeChar!r}\n"
+                            )
+                            _debug_file.flush()
+                        # 见 _should_drop_key_event：VK=0 的 IME 汉字必须保留，
+                        # 不能沿用 VT 模式"dwControlKeyState and vk==0"过滤。
+                        if _should_drop_key_event(
+                            key_event.wVirtualKeyCode,
+                            key_event.uChar.UnicodeChar,
+                        ):
+                            continue
                         translated = translate_key_event(
                             key_event.wVirtualKeyCode,
                             key_event.dwControlKeyState,
@@ -312,6 +350,9 @@ def _compat_event_monitor_run(self: Any) -> None:
 
     except Exception as error:
         self.app.log.error("EVENT MONITOR ERROR", error)
+    finally:
+        if _debug_file is not None:
+            _debug_file.close()
 
 
 def patch_windows_input() -> bool:
