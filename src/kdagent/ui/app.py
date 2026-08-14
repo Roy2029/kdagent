@@ -81,14 +81,54 @@ class ChatInput(TextArea):
         Binding("tab", "complete", "补全", priority=True),
     ]
 
-    # 鼠标/IME 序列泄漏防御：Windows 终端把鼠标事件（\x1b[<...M）或 CSI 残留
-    # 当作可打印文本送入 TextArea 时，丢弃而不插入（claude-code #72269 同类）。
-    _MOUSE_LEAK_RE = re.compile(r"\x1b?\[<[0-9;]*[Mm]")
+    # 鼠标序列泄漏防御（M1-i 加固）：完整 \x1b[<...M 会被 Textual 解析为 MouseEvent，
+    # 但缺 ESC 前缀的 `[<35;56;28m`（Windows 终端丢 ESC/协议不全）会被拆成
+    # 逐个可打印字符 Key 插入。单字符过滤挡不住 → 用状态机：`[` 后跟 `<数字;数字` 到
+    # `m/M` 闭合才判定为泄漏整段丢弃；否则回补缓冲字符（正常输入仅延迟一个 `[`）。
+    _LEAK_FULL_RE = re.compile(r"\[<[0-9;]*[Mm]")
+    _LEAK_PREFIX_RE = re.compile(r"\[<[0-9;]*$")
     _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._leak_buf = ""
+
+    def _flush_leak_buf(self) -> None:
+        """priority 绑定（enter/newline/tab）绕过 _on_key，需在此回补残留缓冲。"""
+        if self._leak_buf:
+            self.insert(self._leak_buf)
+            self._leak_buf = ""
 
     async def _on_key(self, event: Key) -> None:
         ch = event.character
-        if ch is not None and (self._CONTROL_RE.search(ch) or self._MOUSE_LEAK_RE.search(ch)):
+        if ch is not None and self._CONTROL_RE.search(ch):
+            event.stop()
+            event.prevent_default()
+            return
+        if ch is None:
+            # 非可打印键（enter/方向键等）：单个 `[` 回补，多字符残留丢弃
+            if len(self._leak_buf) == 1:
+                self.insert(self._leak_buf)
+            self._leak_buf = ""
+            await super()._on_key(event)
+            return
+        if self._leak_buf:
+            candidate = self._leak_buf + ch
+            if self._LEAK_FULL_RE.fullmatch(candidate):
+                self._leak_buf = ""  # 命中鼠标序列 → 整段丢弃
+                event.stop()
+                event.prevent_default()
+                return
+            if self._LEAK_PREFIX_RE.match(candidate):
+                self._leak_buf = candidate  # 继续收集
+                event.stop()
+                event.prevent_default()
+                return
+            buf, self._leak_buf = self._leak_buf, ""  # 不是泄漏 → 回补缓冲
+            if buf:
+                self.insert(buf)
+        elif ch == "[":
+            self._leak_buf = "["
             event.stop()
             event.prevent_default()
             return
@@ -107,6 +147,7 @@ class ChatInput(TextArea):
         self.placeholder = "输入消息，/ 开头为命令（/help 查看）"
 
     def action_submit(self) -> None:
+        self._flush_leak_buf()
         text = self.text.strip()
         if not text:
             return  # 空输入不发 API，防误触（05 §3.3）
@@ -114,10 +155,12 @@ class ChatInput(TextArea):
         self.text = ""
 
     def action_newline(self) -> None:
+        self._flush_leak_buf()
         self.insert("\n")
 
     def action_complete(self) -> None:
         """Tab：发出 TabComplete 消息，App 侧做 / 前缀补全。"""
+        self._flush_leak_buf()
         self.post_message(self.TabComplete())
 
 

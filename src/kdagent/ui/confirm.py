@@ -20,13 +20,16 @@ from textual.widgets import Button, Static
 # 会覆盖 align（实测基类选择器不生效，具体类选择器才居中）。
 _DIALOG_CSS = """
 ConfirmDialog, ExitDialog { align: center middle; }
-#dialog { width: 60; height: 9; border: thick $primary;
-          background: $surface; padding: 1 2; }
+#dialog { width: 60; height: auto; min-height: 9; max-height: 18;
+          border: thick $primary; background: $surface; padding: 1 2; }
 #dialog-title { text-align: center; }
-#dialog-args { text-align: center; margin: 1 0; color: $text-muted; }
-#dialog-actions { align: center middle; }
+#dialog-args { margin: 1 0; color: $text-muted; text-align: center; }
+#dialog-actions { align: center middle; padding-top: 1; }
 #dialog-actions Button { margin: 0 1; }
 """
+
+# 工具参数过长时截断显示，避免长命令把按钮挤出弹窗（M1-i 用户反馈）。
+_MAX_ARGS_LEN = 80
 
 
 class ConfirmDialog(ModalScreen[bool]):
@@ -52,6 +55,8 @@ class ConfirmDialog(ModalScreen[bool]):
         with Vertical(id="dialog"):
             yield Static(f"允许执行 {self._tool_name}？", id="dialog-title")
             args = " ".join(f"{k}={v}" for k, v in self._tool_input.items()) or "（无参数）"
+            if len(args) > _MAX_ARGS_LEN:
+                args = args[:_MAX_ARGS_LEN] + "…"
             yield Static(args, id="dialog-args")
             with Horizontal(id="dialog-actions"):
                 yield Button("允许", variant="success", id="yes")
