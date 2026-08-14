@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
 
 from kdagent.config import Config
 from kdagent.tools.base import ToolContext
-from kdagent.tools.filesystem import EditFile, Glob, Grep, ReadFile, WriteFile
+from kdagent.tools.filesystem import (
+    EditFile,
+    Glob,
+    Grep,
+    ReadFile,
+    WriteFile,
+    _wsl_path_to_windows,
+)
 
 
 def _ctx(work_dir: Path) -> ToolContext:
@@ -134,3 +142,38 @@ def test_meta_declarations() -> None:
     assert EditFile().require_confirm is True
     assert Glob().is_concurrency_safe({}) is True
     assert Grep().is_concurrency_safe({}) is True
+
+
+# ---- WSL 路径转换（demo 实测：Bash 走 WSL 时 ReadFile/WriteFile 拒绝 /mnt/c/...） ----
+# 见 src/kdagent/tools/filesystem.py `_resolve_path` 注释。
+
+
+def test_wsl_path_to_windows() -> None:
+    assert _wsl_path_to_windows("/mnt/c/Users/Roy/x.c") == "C:\\Users\\Roy\\x.c"
+    assert _wsl_path_to_windows("/mnt/d/") == "D:\\"
+    assert _wsl_path_to_windows("/mnt/C/Users/a") == "C:\\Users\\a"  # 盘符大小写归一
+    assert _wsl_path_to_windows("C:\\Users\\Roy\\x.c") is None  # 非 WSL 路径原样
+    assert _wsl_path_to_windows("/home/user/x.c") is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="WSL 路径转换仅在 win32 生效")
+def test_validate_accepts_wsl_absolute_path() -> None:
+    assert ReadFile().validate_input({"path": "/mnt/c/Users/Roy/x.c"}) == []
+    assert WriteFile().validate_input(
+        {"path": "/mnt/d/out.txt", "content": "x"}
+    ) == []
+    assert EditFile().validate_input(
+        {"path": "/mnt/e/a.txt", "old_string": "a", "new_string": "b"}
+    ) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="WSL 路径转换仅在 win32 生效")
+async def test_read_file_accepts_wsl_path(tmp_path: Path) -> None:
+    """Agent 从 Bash 拿到的 /mnt/<drive>/... 路径可直接读（demo 中被拒的复现）。"""
+    target = tmp_path / "a.txt"
+    _write(target, "hello wsl")
+    drive = target.drive[0].lower()
+    wsl_path = f"/mnt/{drive}/{target.relative_to(target.anchor).as_posix()}"
+    result = await ReadFile().execute(_ctx(tmp_path), {"path": wsl_path})
+    assert result.is_error is False
+    assert "hello wsl" in result.content

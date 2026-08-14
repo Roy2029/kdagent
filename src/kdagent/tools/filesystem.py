@@ -6,7 +6,9 @@ ReadFile / Glob / Grep 只读 + 并发安全；WriteFile / EditFile 破坏性 + 
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -30,8 +32,37 @@ def _result(
     )
 
 
+# WSL 挂载路径前缀：/mnt/<drive>/...（Bash 工具若命中 WSL bash，Agent 从输出
+# 得到的文件路径即此风格；Windows Python 的 Path.is_absolute() 会误判为相对）
+_WSL_MNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
+
+
+def _wsl_path_to_windows(raw: str) -> str | None:
+    """WSL 挂载路径 /mnt/<drive>/... → Windows 路径字符串；非 WSL 路径返回 None。"""
+    m = _WSL_MNT_RE.match(raw)
+    if not m:
+        return None
+    drive = m.group(1).upper()
+    rest = raw[m.end() :].replace("/", "\\")
+    return f"{drive}:\\{rest}"
+
+
+def _resolve_path(raw: str) -> Path:
+    """解析工具路径参数：win32 下把 WSL 挂载路径转为 Windows 路径后返回。
+
+    demo 实测：ReadFile/WriteFile 收到 Agent 从 Bash(pwd) 得到的 /mnt/c/...，
+    WindowsPath.is_absolute() 判 False → 工具被拒，Agent 只能改用 Bash 写文件。
+    本函数让 ReadFile/WriteFile/EditFile/Glob/Grep 直接接受 WSL 路径；Linux 原样。
+    """
+    if sys.platform == "win32":
+        win = _wsl_path_to_windows(raw)
+        if win is not None:
+            return Path(win)
+    return Path(raw)
+
+
 def _absolute(base: Path, raw: str) -> Path:
-    p = Path(raw)
+    p = _resolve_path(raw)
     return p if p.is_absolute() else base / p
 
 
@@ -73,13 +104,13 @@ class ReadFile:
         path = input.get("path")
         if not isinstance(path, str) or not path:
             errors.append("path 必填且为字符串")
-        elif not Path(path).is_absolute():
+        elif not _resolve_path(path).is_absolute():
             errors.append("path 必须是绝对路径")
         return errors
 
     async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
         start = time.perf_counter()
-        path = Path(input["path"])
+        path = _resolve_path(input["path"])
         offset = int(input.get("offset", 0))
         limit = input.get("limit")
         try:
@@ -135,7 +166,7 @@ class WriteFile:
         path = input.get("path")
         if not isinstance(path, str) or not path:
             errors.append("path 必填且为字符串")
-        elif not Path(path).is_absolute():
+        elif not _resolve_path(path).is_absolute():
             errors.append("path 必须是绝对路径")
         if "content" not in input or not isinstance(input["content"], str):
             errors.append("content 必填且为字符串")
@@ -143,7 +174,7 @@ class WriteFile:
 
     async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
         start = time.perf_counter()
-        path = Path(input["path"])
+        path = _resolve_path(input["path"])
         content = input["content"]
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,7 +223,7 @@ class EditFile:
         path = input.get("path")
         if not isinstance(path, str) or not path:
             errors.append("path 必填且为字符串")
-        elif not Path(path).is_absolute():
+        elif not _resolve_path(path).is_absolute():
             errors.append("path 必须是绝对路径")
         for key in ("old_string", "new_string"):
             if key not in input or not isinstance(input[key], str):
@@ -201,7 +232,7 @@ class EditFile:
 
     async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
         start = time.perf_counter()
-        path = Path(input["path"])
+        path = _resolve_path(input["path"])
         old_string = input["old_string"]
         new_string = input["new_string"]
         try:
