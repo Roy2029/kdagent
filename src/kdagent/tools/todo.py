@@ -67,9 +67,14 @@ class TodoWrite:
 
     name = "TodoWrite"
     description = (
-        "写入或更新任务规划列表。结构为 todo → task → steps："
-        "todo 是整体目标，task 是可执行子任务，step 是任务的具体步骤"
-        "（每步可带可选完成判据 accept_criteria）。任务推进时用 TodoWrite 更新状态并回传完整列表。"
+        "写入或更新任务规划列表。结构为 todo → task → steps：todo 是整体目标，"
+        "task 是可执行子任务，step 是任务的具体步骤（每步可带可选完成判据 accept_criteria）。"
+        "何时使用：接到多步任务时先规划 todo，任务推进时更新状态并回传完整列表。"
+        "何时不使用：一次性小请求无需规划；不要为单一操作创建 todo。"
+        "参数约束：每次调用回传全部 todo（非增量）；status 仅 pending/completed；"
+        "空 content 项会被忽略。"
+        "返回格式：回传完整规范化快照（含每任务状态与判据）。"
+        "配合：todo 状态驱动 UI 面板与检查点（12 T35）；完成型步骤必写判据、探索型可省（12 T36）。"
     )
     input_schema = {
         "type": "object",

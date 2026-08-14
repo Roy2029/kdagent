@@ -71,10 +71,10 @@ def todo_items_from_raw(raw_todos: list[RawTodo]) -> list[TodoItemRecord]:
     items: list[TodoItemRecord] = []
     for todo in raw_todos:
         group = str(todo.get("content", "")).strip()
-        for task in todo.get("tasks", []) or []:
+        for task in todo.get("tasks", []) or []:#遍历任务
             steps = None
             raw_steps = task.get("steps")
-            if raw_steps:
+            if raw_steps:#遍历任务中的步骤
                 steps = [
                     StepRecord(
                         description=str(s.get("description", "")).strip(),

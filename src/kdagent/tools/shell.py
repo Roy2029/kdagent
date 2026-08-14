@@ -22,7 +22,8 @@ class Bash:
         "执行 shell 命令，返回 stdout、stderr 与退出码。"
         "何时使用：需要运行编译器、脚本、构建、文件操作命令时。"
         "何时不使用：纯文件读取/搜索请用 ReadFile/Grep（更安全、无副作用）。"
-        "参数约束：command 为待执行命令；优先 bash（Git Bash），无则回退系统 shell。"
+        "参数约束：command 为待执行命令，在项目工作目录下执行；优先 bash（Git Bash），"
+        "无则回退系统 shell。"
         "返回格式：stdout + stderr + [exit] 退出码；退出码非 0 视为错误。"
         "配合：写代码 → Bash 编译验证。"
     )
