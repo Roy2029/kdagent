@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from kdagent import __version__
+from kdagent.compat import patch_windows_input
 from kdagent.config import load_api_key, load_config
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, LLMStreamEvent, Payload, ProviderConfig
@@ -78,6 +79,9 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     work_dir = Path(args.dir) if args.dir else None
+    # 方案 A：Windows 终端不支持 Kitty 时禁用（对齐 Claude Code 回退传统流），
+    # 恢复中文 IME；非 win32 为 no-op（compat.patch_windows_input）。
+    patch_windows_input()
     build_kdapp(work_dir=work_dir).run()
 
 

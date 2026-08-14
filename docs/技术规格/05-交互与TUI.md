@@ -239,7 +239,8 @@ class CommandRegistry:
 - [ ] `TestingEvent` 渲染"正在跑测试…"及 passed/failed/regression_detected 三态（`12` TestRunner）
 - [x] Tab 补全：`/` 列命令、前缀补全（ChatInput priority 绑定，规避 Screen focus_next 抢键）（M1-e + M1 收尾 ✅）
 - [x] 别名冲突 → 启动时报错；未知命令 → 带 /help 引导（M1-e ✅）
-- [x] 输入框 TextArea：支持中文 IME 组合输入（依赖 Textual ≥8.2.8 Kitty associated-text 解析 + **终端 Kitty 键盘协议**，Windows Terminal **需 ≥1.25 Preview**（2026-03 起），稳定版 1.24 及更早不支持——这是中文 IME 失败的环境根因）；Enter 提交、Shift+Enter 换行；聚焦时 Ctrl+C 复制 / Ctrl+V 粘贴，clipboard 经 pyperclip 接**系统剪贴板**（Textual 默认进程内，M1-i 修复）；`ChatInput` **状态机过滤**鼠标序列残留（完整 `\x1b[<...M` 被 Textual 解析为 MouseEvent，但缺 ESC 前缀的 `[<35;56;28m` 会被拆成逐字符 Key 插入——状态机按 `[<数字;数字→m/M` 闭合判定，整段丢弃；`[` 正常输入延迟一个字符回补，M1-i 修复）（M1-i ✅）
+- [x] 输入框 TextArea：支持中文 IME 组合输入（Enter 提交、Shift+Enter 换行）；聚焦时 Ctrl+C 复制 / Ctrl+V 粘贴，clipboard 经 pyperclip 接**系统剪贴板**（Textual 默认进程内，M1-i 修复）；`ChatInput` **状态机过滤**鼠标序列残留（完整 `\x1b[<...M` 被 Textual 解析为 MouseEvent，但缺 ESC 前缀的 `[<35;56;28m` 会被拆成逐字符 Key 插入——状态机按 `[<数字;数字→m/M` 闭合判定，整段丢弃；`[` 正常输入延迟一个字符回补，M1-i 修复）（M1-i ✅）
+- [x] 中文 IME 环境根因与方案 A（M1-i2）：Textual 8.2.8 **Windows 驱动无条件** `\x1b[>1u` 启用 Kitty（[windows_driver.py:99](../.venv/Lib/site-packages/textual/drivers/windows_driver.py#L99)），而 Kitty 需终端支持（Windows Terminal **≥1.25 Preview**，2026-03 加入；稳定版 1.24 及更早不支持）；Textual 自带 `constants.DISABLE_KITTY_KEY`（`TEXTUAL_DISABLE_KITTY_KEY`）但 8.2.8 仅 linux_driver 读取、Windows 驱动无检查。**Claude Code 用能力探测（`CSI ? u` 握手），终端不支持则回退传统输入流 → 同终端中文正常**。对齐方案：`src/kdagent/compat.py` monkeypatch 过滤 Kitty 启用序列 → 回退传统 VT 输入（win32 生效、非 win32 no-op、幂等），`cli.main()` 启动前调用。⚠️ 待用户实测确认中文恢复；若仍失败则根因在 `enable_application_mode` 的 `ENABLE_VIRTUAL_TERMINAL_INPUT`（Textual 输入架构层），需进一步对齐或升级 WT（方案 B）
 
 ---
 
