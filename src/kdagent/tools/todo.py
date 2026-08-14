@@ -141,6 +141,8 @@ class TodoWrite:
     async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
         start = time.perf_counter()
         self._todos = normalize_todos(input["todos"])
+        if ctx.todos is not None:
+            ctx.todos(self._todos)  # 03 §3.6 数据流：→ 04 会话状态 + 05 面板渲染
         content = format_todos(self._todos)
         duration_ms = int((time.perf_counter() - start) * 1000)
         return ToolResult(

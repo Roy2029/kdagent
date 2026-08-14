@@ -9,6 +9,7 @@ from kdagent.sessions.records import (
     SessionRecord,
     StepRecord,
     TodoItemRecord,
+    todo_items_from_raw,
 )
 
 
@@ -82,3 +83,52 @@ def test_todos_serialization_roundtrip() -> None:
     assert restored.todos[0].content == "目标"
     assert restored.todos[0].status == "completed"
     assert restored.todos[0].steps[0].accept_criteria == "判据"
+
+
+def test_todos_roundtrip_preserves_group() -> None:
+    todos = [
+        TodoItemRecord(
+            content="任务1",
+            status="pending",
+            steps=[StepRecord("步骤", "判据")],
+            group="目标",
+        )
+    ]
+    rec = SessionRecord(role="user", content="x", todos=todos, ts=1)
+    restored = SessionRecord.from_json(rec.to_json())
+    assert restored.todos is not None
+    assert restored.todos[0].group == "目标"
+
+
+def test_todo_items_from_raw_three_layer_to_items() -> None:
+    """03 TodoWrite 三层结构 → 04 TodoItemRecord（task 为条目，group 记 todo 目标）。"""
+    raw = [
+        {
+            "content": "写 HTTP 服务器",
+            "tasks": [
+                {
+                    "content": "搭骨架",
+                    "status": "completed",
+                    "steps": [{"description": "建文件", "accept_criteria": "能 import"}],
+                },
+                {
+                    "content": "编译通过",
+                    "status": "pending",
+                    "steps": [{"description": "跑 pytest"}],
+                },
+            ],
+        }
+    ]
+    items = todo_items_from_raw(raw)
+    assert len(items) == 2
+    assert items[0].content == "搭骨架"
+    assert items[0].status == "completed"
+    assert items[0].group == "写 HTTP 服务器"
+    assert items[0].steps[0].accept_criteria == "能 import"
+    assert items[1].content == "编译通过"
+    assert items[1].status == "pending"
+    assert items[1].steps[0].description == "跑 pytest"
+
+
+def test_todo_items_from_raw_empty_tasks_empty_list() -> None:
+    assert todo_items_from_raw([{"content": "无任务的目标", "tasks": []}]) == []

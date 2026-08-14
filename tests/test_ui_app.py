@@ -16,10 +16,12 @@ from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.events import LoopCompleteEvent, StreamTextEvent, ToolResultEvent
 from kdagent.engine.llm.base import LLMStreamEvent
+from kdagent.engine.messages import TextBlock
 from kdagent.tools import build_default_registry
 from kdagent.ui.app import KDApp
 from kdagent.ui.chat import ChatView
 from kdagent.ui.statusbar import StatusBar
+from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
 
 
@@ -35,11 +37,12 @@ def _make_app(tmp_path: Path) -> KDApp:
     )
 
 
-async def test_three_region_layout(tmp_path: Path) -> None:
+async def test_four_region_layout(tmp_path: Path) -> None:
     app = _make_app(tmp_path)
     async with app.run_test() as pilot:
         await pilot.pause()
         assert app.query_one("#chat", ChatView)
+        assert app.query_one("#todo", TodoRegion)
         assert app.query_one("#tools", ToolRegion)
         assert app.query_one("#status", StatusBar)
         assert app.query_one("#input")
@@ -105,6 +108,36 @@ async def test_agent_run_sends_user_message(tmp_path: Path) -> None:
         chat = app.query_one("#chat", ChatView)
         assert any("hi" in m for m in chat.messages)
         assert app._agent.conversation.messages[-1].role == "assistant"
+
+
+async def test_session_new_switches_conversation(tmp_path: Path) -> None:
+    """/session new → Agent 切换到新会话（conversation 换新对象）。"""
+    app = _make_app(tmp_path)
+    old_sid = app._session.id
+    old_conv = app._agent.conversation
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.dispatch_command("session", "new")
+        await pilot.pause()
+        assert app._session.id != old_sid
+        assert app._agent.conversation is not old_conv
+
+
+async def test_session_resume_switches_conversation(tmp_path: Path) -> None:
+    """/session resume <id> → Agent 切回旧会话，消息历史可读。"""
+    app = _make_app(tmp_path)
+    # 先在当前会话落一条消息
+    app._session.append_user("存档内容")
+    old_conv = app._agent.conversation
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.dispatch_command("session", "resume " + app._session.id)
+        await pilot.pause()
+        assert app._agent.conversation is not old_conv
+        texts = [
+            b.text for m in app._agent.conversation.messages for b in m.content if isinstance(b, TextBlock)
+        ]
+        assert any("存档内容" in t for t in texts)
 
 
 async def test_esc_cancels_agent_cleanly(tmp_path: Path) -> None:

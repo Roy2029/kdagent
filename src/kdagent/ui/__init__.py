@@ -8,6 +8,7 @@ from kdagent.ui.chat import ChatView
 from kdagent.ui.commands import Command, CommandRegistry, build_default_commands, parse_command
 from kdagent.ui.confirm import ConfirmDialog, ExitDialog
 from kdagent.ui.statusbar import StatusBar
+from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "ExitDialog",
     "KDApp",
     "StatusBar",
+    "TodoRegion",
     "ToolRegion",
     "build_default_commands",
     "parse_command",

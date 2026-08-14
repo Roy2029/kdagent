@@ -112,3 +112,24 @@ def test_meta_declarations() -> None:
     assert tool.is_destructive() is False
     assert tool.is_concurrency_safe({}) is False
     assert tool.require_confirm is False
+
+
+async def test_execute_triggers_todos_callback(tmp_path: Path) -> None:
+    """M1-f：TodoWrite execute 触发 todos 回调（→ 04 会话状态 + 05 面板渲染）。"""
+    received: list[dict[str, object]] = []
+
+    def capture(raw: list[dict[str, object]]) -> None:
+        received.append(raw)
+
+    tool = TodoWrite()
+    ctx = ToolContext(
+        work_dir=tmp_path, config=Config(), tool_use_id="todo_1", todos=capture
+    )
+    result = await tool.execute(
+        ctx,
+        {"todos": [{"content": "目标", "tasks": [{"content": "任务", "steps": []}]}]},
+    )
+    assert received, "todos 回调应被触发"
+    assert received[0][0]["content"] == "目标"
+    assert received[0][0]["tasks"][0]["content"] == "任务"
+    assert result.is_error is False

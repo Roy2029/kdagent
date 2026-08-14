@@ -83,8 +83,14 @@ class Session:
         self._conversation.add_tool_results(results)
         self._flush_last()
 
+    def flush_last(self) -> None:
+        """公开落盘：Agent 直接操作 conversation 时由 UI 层调用（M1-f 接线）。"""
+        self._flush_last()
+
     def _flush_last(self) -> None:
         """§3.5 顺序：先写文件、再更新内存计数。最新一条消息落盘为一行。"""
+        if not self._conversation.messages:
+            return
         msg = self._conversation.messages[-1]
         record = SessionRecord.from_message(msg, int(time.time()))
         if self._todos is not None:
@@ -101,13 +107,16 @@ class SessionManager:
     def sessions_dir(self) -> Path:
         return self._dir
 
-    def create(self) -> Session:
-        """生成 id + 建 .jsonl（父目录懒创建）。"""
+    def create(self, conversation: ConversationManager | None = None) -> Session:
+        """生成 id + 建 .jsonl（父目录懒创建）。
+
+        conversation 可选（App 启动时用已在运行的 Agent 会话）；缺省自建空会话。
+        """
         sid = make_session_id(datetime.now())
         file = self._dir / f"{sid}.jsonl"
         file.parent.mkdir(parents=True, exist_ok=True)
         file.touch()
-        return Session(sid, file, ConversationManager())
+        return Session(sid, file, conversation or ConversationManager())
 
     def resume(self, sid: str) -> Session:
         """恢复四步：①逐行解析 →（②链修复在出口）→ ③token 检查占位 → ④时间跨度提示。"""

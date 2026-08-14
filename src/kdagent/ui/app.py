@@ -35,12 +35,14 @@ from kdagent.engine.events import (
     UsageEvent,
 )
 from kdagent.engine.llm.base import LLMClient, Usage
-from kdagent.sessions.manager import SessionManager
+from kdagent.sessions.manager import Session, SessionManager
+from kdagent.sessions.records import todo_items_from_raw
 from kdagent.tools.registry import ToolRegistry
 from kdagent.ui.chat import ChatView
 from kdagent.ui.commands import CommandContext, build_default_commands, parse_command
 from kdagent.ui.confirm import ConfirmDialog, ExitDialog
 from kdagent.ui.statusbar import StatusBar
+from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
 
 PLAN_SYSTEM_PROMPT = (
@@ -48,9 +50,10 @@ PLAN_SYSTEM_PROMPT = (
     "不要修改文件或执行有副作用的操作。"
 )
 
-# 三区域布局：对话区 1fr、工具活动区固定、输入框与状态栏底部（05 §3.1）
+# 四区域布局：对话区 1fr、todo 面板、工具活动区、输入框与状态栏底部（05 §3.1）
 _CSS = """
 #chat { height: 1fr; border: round $primary; margin: 0 1; }
+#todo { height: auto; max-height: 8; border: round $accent; margin: 0 1; }
 #tools { height: 6; border: round $secondary; margin: 0 1; }
 #input { height: 3; margin: 0 1; }
 #status { height: 1; background: $panel; color: $text; padding: 0 1; }
@@ -99,18 +102,22 @@ class KDApp(App[None]):
         self._config = config
         self._work_dir = work_dir
         self._session_manager = SessionManager(sessions_dir or Path(".kdagent") / "sessions")
+        # 当前会话（M1-f：App 持 Session，Agent 对话实时落盘，/session 切换）。
+        self._session = self._session_manager.create(conversation)
         # 属性名不用 `_registry`：Textual 内部也有 `_registry`（其 CommandRegistry），
         # 同名会覆盖冲突（启动即崩）。
         self._commands = build_default_commands()
         self._agent = Agent(
             config=config,
             llm=llm,
-            conversation=conversation,
+            conversation=self._session.conversation,
             tools=tools,
             events=self._on_event,
             work_dir=work_dir,
             system_prompt=system_prompt,
             confirm=self._confirm,
+            todos=self._on_todos,
+            on_conversation_change=self._on_conversation_change,
         )
         self._default_prompt = system_prompt
         self._agent_worker: Worker[Any] | None = None
@@ -119,6 +126,7 @@ class KDApp(App[None]):
         # widget 在 on_mount 后可用；mypy 不知道，先声明为 None 后按需断言
         self._chat: ChatView | None = None
         self._tools_region: ToolRegion | None = None
+        self._todo_region: TodoRegion | None = None
         self._status: StatusBar | None = None
         self._input: InputBar | None = None
 
@@ -127,6 +135,7 @@ class KDApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield ChatView(id="chat")
+        yield TodoRegion(id="todo")
         yield ToolRegion(id="tools")
         yield InputBar(id="input")
         yield StatusBar(id="status")
@@ -134,6 +143,7 @@ class KDApp(App[None]):
     def on_mount(self) -> None:
         self._chat = self.query_one("#chat", ChatView)
         self._tools_region = self.query_one("#tools", ToolRegion)
+        self._todo_region = self.query_one("#todo", TodoRegion)
         self._status = self.query_one("#status", StatusBar)
         self._input = self.query_one("#input", InputBar)
         self._input.focus()
@@ -178,6 +188,20 @@ class KDApp(App[None]):
             + usage.cache_creation_tokens,
         )
 
+    # ---- TodoWrite 数据流（03 §3.6）：归一化 → 会话状态 + 面板渲染 -----------
+
+    def _on_todos(self, raw_todos: list[dict[str, Any]]) -> None:
+        """TodoWrite 回调：更新当前 Session 的 todos 并实时渲染面板。"""
+        items = todo_items_from_raw(raw_todos)
+        self._session.set_todos(items)
+        todo_region = self._todo_region
+        if todo_region is not None:
+            todo_region.show_todos(items)
+
+    def _on_conversation_change(self) -> None:
+        """每落一条消息后实时写盘（04 §3.2 实时落盘；todos 随最新记录落盘）。"""
+        self._session.flush_last()
+
     # ---- 用户输入：命令快车道 vs Agent Loop（05 §3.3） ---------------------
 
     @on(Input.Submitted)
@@ -217,7 +241,7 @@ class KDApp(App[None]):
             args=args,
             agent=self._agent,
             conversation=self._agent.conversation,
-            session=None,
+            session=self._session,
             ui=self,
             config=self._config,
             registry=self._commands,
@@ -283,6 +307,20 @@ class KDApp(App[None]):
         chat = self._chat
         if chat is not None:
             chat.clear_messages()
+
+    def set_active_session(self, session: Session | None) -> None:
+        """切换当前会话（/session new/resume）：换 conversation + 恢复 todo 面板。"""
+        if session is None:
+            return
+        self._session = session
+        self._agent.set_conversation(session.conversation)
+        todo_region = self._todo_region
+        if todo_region is not None:
+            if session.todos:
+                todo_region.show_todos(session.todos)
+            else:
+                todo_region.reset()
+        self.refresh_status()
 
     def request_exit(self) -> None:
         self.push_screen(ExitDialog(), self._maybe_exit)

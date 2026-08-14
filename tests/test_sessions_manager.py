@@ -11,7 +11,7 @@ import pytest
 
 from kdagent.engine.messages import TextBlock, ToolUseBlock
 from kdagent.sessions.manager import SessionManager, make_session_id
-from kdagent.sessions.records import SessionRecord
+from kdagent.sessions.records import SessionRecord, todo_items_from_raw
 from kdagent.tools.base import ToolResult
 
 
@@ -130,3 +130,37 @@ def test_cleanup_disabled_keeps_all(tmp_path: Path) -> None:
     s = mgr.create()
     assert mgr.cleanup_expired(days=30, enabled=False) == []
     assert s.file.exists()
+
+
+def test_todos_persist_with_latest_record_and_resume(tmp_path: Path) -> None:
+    """M1-f 链路：TodoWrite 归一化 → Session.set_todos → 随最新记录落盘 → resume 恢复。"""
+    mgr = _make_manager(tmp_path)
+    s = mgr.create()
+    raw = [
+        {
+            "content": "目标",
+            "tasks": [
+                {"content": "任务", "status": "completed", "steps": [{"description": "步骤"}]}
+            ],
+        }
+    ]
+    s.set_todos(todo_items_from_raw(raw))
+    s.append_user("下一轮输入")  # 新消息落盘时携带 todos（04 §3.2）
+    resumed = mgr.resume(s.id)
+    assert resumed.todos is not None
+    assert resumed.todos[0].content == "任务"
+    assert resumed.todos[0].status == "completed"
+    assert resumed.todos[0].group == "目标"
+    assert resumed.todos[0].steps[0].description == "步骤"
+
+
+def test_create_with_existing_conversation(tmp_path: Path) -> None:
+    """M1-f：App 启动时把已在运行的 Agent 会话包装为 Session。"""
+    mgr = _make_manager(tmp_path)
+    from kdagent.engine.conversation import ConversationManager
+
+    conv = ConversationManager()
+    conv.add_user_message("已有输入")
+    s = mgr.create(conversation=conv)
+    assert s.conversation is conv
+    assert s.conversation.messages[0].content[0].text == "已有输入"

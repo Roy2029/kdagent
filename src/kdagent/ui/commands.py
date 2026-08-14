@@ -33,6 +33,7 @@ class UIController(Protocol):
     def refresh_status(self) -> None: ...
     def clear_chat(self) -> None: ...
     def request_exit(self) -> None: ...
+    def set_active_session(self, session: Session | None) -> None: ...
 
 
 @dataclass
@@ -188,8 +189,12 @@ def _cmd_session(ctx: CommandContext) -> None:
         return
     parts = ctx.args.split(maxsplit=1)
     sub, arg = parts[0], (parts[1] if len(parts) > 1 else "")
-    if sub == "list" and ctx.session_manager is not None:
-        metas = ctx.session_manager.list()
+    mgr = ctx.session_manager
+    if mgr is None:
+        ctx.ui.add_system_message("会话管理器不可用。")
+        return
+    if sub == "list":
+        metas = mgr.list()
         if not metas:
             ctx.ui.add_system_message("暂无历史会话。")
             return
@@ -198,12 +203,33 @@ def _cmd_session(ctx: CommandContext) -> None:
             active = datetime.fromtimestamp(m.last_active_ts).strftime("%m-%d %H:%M")
             lines.append(f"  {m.sid}  活跃 {active}")
         ctx.ui.add_system_message("\n".join(lines))
+    elif sub == "new":
+        session = mgr.create()
+        ctx.ui.set_active_session(session)
+        ctx.ui.add_system_message(f"已新建会话：{session.id}")
+    elif sub == "resume":
+        if not arg:
+            ctx.ui.add_system_message("/session resume <id>：恢复指定会话。")
+            return
+        try:
+            session = mgr.resume(arg)
+        except FileNotFoundError as exc:
+            ctx.ui.add_system_message(str(exc))
+            return
+        ctx.ui.set_active_session(session)
+        ctx.ui.add_system_message(
+            f"已恢复会话：{arg}（消息 {len(session.conversation.messages)} 条）"
+        )
+    elif sub == "delete":
+        if not arg:
+            ctx.ui.add_system_message("/session delete <id>：删除指定会话。")
+            return
+        mgr.delete(arg)
+        ctx.ui.add_system_message(f"已删除会话：{arg}")
     else:
         ctx.ui.add_system_message(
-            "/session 支持：无参（概要）、list。resume/new/delete 在 M1-f 打通。"
+            "/session 支持：无参（概要）、list、new、resume <id>、delete <id>。"
         )
-        if arg:
-            ctx.ui.add_system_message(f"（当前已忽略参数：{arg}）")
 
 
 def _cmd_exit(ctx: CommandContext) -> None:
@@ -265,8 +291,8 @@ def build_default_commands() -> CommandRegistry:
     registry.register(
         Command(
             name="session",
-            description="会话：无参概要 / list 历史",
-            usage="/session [list]",
+            description="会话：概要 / list / new / resume / delete",
+            usage="/session [list|new|resume <id>|delete <id>]",
             type="local",
             handler=_cmd_session,
         )

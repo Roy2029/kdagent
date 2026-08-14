@@ -21,6 +21,10 @@ from kdagent.config import Config
 # 05 UI 提供的确认钩子：工具名 + 参数 → 是否放行。async，因为确认对话框要等用户输入。
 AsyncConfirm: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[bool]]
 
+# 03 TodoWrite 触发回调：归一化后的 todo 结构（todo→task→steps）→ 会话状态 + UI 渲染。
+# 回调由 UI 层注入，TodoWrite 不感知 Session/UI（03 §3.6 数据流）。
+TodosCallback: TypeAlias = Callable[[list[dict[str, Any]]], None]
+
 
 @dataclass(slots=True)
 class ToolContext:
@@ -29,13 +33,15 @@ class ToolContext:
     work_dir：相对路径基准（内置工具强制绝对路径时以此兜底）；
     config：运行时配置；
     tool_use_id：当前调用对应的 tool_use id，由 02 `_exec_one` 注入，供 ToolResult 回填；
-    confirm：05 注入的确认钩子（require_confirm 前置），None 表示非交互环境直接执行。
+    confirm：05 注入的确认钩子（require_confirm 前置），None 表示非交互环境直接执行；
+    todos：03 TodoWrite 归一化结果回调（会话状态 + UI 渲染），None 表示未接线（纯工具测试）。
     """
 
     work_dir: Path
     config: Config
     tool_use_id: str = ""
     confirm: AsyncConfirm | None = None
+    todos: TodosCallback | None = None
 
 
 @dataclass(frozen=True, slots=True)

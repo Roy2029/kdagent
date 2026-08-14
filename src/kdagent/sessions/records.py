@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 from kdagent.engine.messages import (
     ContentBlock,
@@ -55,6 +55,42 @@ class TodoItemRecord:
     status: str = "pending"  # pending / in_progress / completed
     active_form: str = ""
     steps: list[StepRecord] | None = None
+    group: str = ""  # 所属 todo 目标（TodoWrite 三层 todo→task→steps 的顶层 content）
+
+
+RawTodo: TypeAlias = dict[str, Any]  # TodoWrite 归一化后的三层结构（03 §3.6）
+
+
+def todo_items_from_raw(raw_todos: list[RawTodo]) -> list[TodoItemRecord]:
+    """`03` TodoWrite 归一化结构（todo→task→steps）→ `04` 会话级 TodoItemRecord。
+
+    TodoItemRecord 的 content/steps 表示 **task 层**（含完成状态），group 记所属 todo
+    目标——三层在落盘前压成两层，渲染时按 group 还原三层（05 §3.2b）。
+    映射在 M1-f 落地（04 §3.2：TodoWrite → SessionRecord.todos）。
+    """
+    items: list[TodoItemRecord] = []
+    for todo in raw_todos:
+        group = str(todo.get("content", "")).strip()
+        for task in todo.get("tasks", []) or []:
+            steps = None
+            raw_steps = task.get("steps")
+            if raw_steps:
+                steps = [
+                    StepRecord(
+                        description=str(s.get("description", "")).strip(),
+                        accept_criteria=str(s.get("accept_criteria", "")).strip() or None,
+                    )
+                    for s in raw_steps
+                ]
+            items.append(
+                TodoItemRecord(
+                    content=str(task.get("content", "")).strip(),
+                    status=str(task.get("status", "pending")),
+                    steps=steps,
+                    group=group,
+                )
+            )
+    return items
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +190,7 @@ class SessionRecord:
                         status=raw.get("status", "pending"),
                         active_form=raw.get("active_form", ""),
                         steps=steps,
+                        group=raw.get("group", ""),
                     )
                 )
         return cls(

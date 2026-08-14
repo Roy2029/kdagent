@@ -16,6 +16,7 @@ M1-c 能跑档范围：
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -36,7 +37,7 @@ from kdagent.engine.events import (
 )
 from kdagent.engine.llm.base import LLMClient, Payload, Usage
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
-from kdagent.tools.base import AsyncConfirm, ToolContext, ToolResult
+from kdagent.tools.base import AsyncConfirm, TodosCallback, ToolContext, ToolResult
 from kdagent.tools.registry import ToolRegistry
 
 AgentStatus = Literal["CONTINUE", "TERMINAL"]
@@ -89,6 +90,8 @@ class Agent:
         work_dir: Path | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         confirm: AsyncConfirm | None = None,
+        todos: TodosCallback | None = None,
+        on_conversation_change: Callable[[], None] | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -98,6 +101,8 @@ class Agent:
         self._work_dir = Path.cwd() if work_dir is None else work_dir
         self._system_prompt = system_prompt
         self._confirm = confirm  # 05 UI 确认钩子，None = 非交互环境直接执行
+        self._todos = todos  # 03 TodoWrite 归一化回调 → 会话状态 + UI 渲染
+        self._on_conversation_change = on_conversation_change  # 每次落一条消息后回调
         self._usage: Usage | None = None
         self._consecutive_failures = 0
         self._turn = 0
@@ -118,9 +123,25 @@ class Agent:
         """当前对话历史（05 命令 / 会话接线用）。"""
         return self._conversation
 
+    def set_conversation(self, conversation: ConversationManager) -> None:
+        """切换到另一个会话的对话历史（`04` /session new/resume 接线，M1-f）。
+
+        保留 events/tools/confirm 等依赖，只换对话上下文。
+        """
+        self._conversation = conversation
+        self._pending_text = []
+        self._pending_tool_uses = []
+        self._usage = None
+
+    def _notify_conversation_change(self) -> None:
+        """每次对话落一条消息后触发（UI 层由此把最新一条实时落盘，04 §3.2）。"""
+        if self._on_conversation_change is not None:
+            self._on_conversation_change()
+
     async def run(self, user_input: str) -> None:
         """跑完整循环直到终止；用户取消或超限也干净返回。"""
         self._conversation.add_user_message(user_input)
+        self._notify_conversation_change()
         for turn in range(MAX_ITERATIONS):
             self._turn = turn
             try:
@@ -172,12 +193,14 @@ class Agent:
         if not blocks:
             return "TERMINAL"  # 空回复，防死循环
         self._conversation.add_assistant_message(blocks)
+        self._notify_conversation_change()
 
         if tool_uses:
             batches = partition_tool_calls(tool_uses, self._tools)
             for batch in batches:
                 results = await self._execute_batch(batch)
                 self._conversation.add_tool_results(results)
+                self._notify_conversation_change()
                 self._update_circuit_breaker(results)
             self._events(TurnCompleteEvent(turn=self._turn))
             return "CONTINUE"
@@ -212,6 +235,7 @@ class Agent:
         blocks = self._assemble_blocks(self._pending_text, self._pending_tool_uses)
         if blocks:
             self._conversation.add_assistant_message(blocks)
+            self._notify_conversation_change()
         self._pending_text = []
         self._pending_tool_uses = []
 
@@ -248,6 +272,7 @@ class Agent:
             config=self._config,
             tool_use_id=tool_use.id,
             confirm=self._confirm,
+            todos=self._todos,
         )
         # 规格 05 §3.4：Y/N 前置——选 no 返回 is_error=True 结果，模型下轮自行调整。
         if (
@@ -298,3 +323,4 @@ class Agent:
             self._conversation.add_user_message(
                 "", extra_blocks=[TextBlock(_CIRCUIT_REMINDER)]
             )
+            self._notify_conversation_change()

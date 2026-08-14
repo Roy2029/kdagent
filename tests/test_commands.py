@@ -10,7 +10,7 @@ from conftest import FakeLLM
 from kdagent.config import Config
 from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
-from kdagent.sessions.manager import SessionManager
+from kdagent.sessions.manager import Session, SessionManager
 from kdagent.tools import build_default_registry
 from kdagent.ui.commands import (
     Command,
@@ -48,6 +48,8 @@ class RecordingUI:
     def clear_chat(self) -> None: ...
 
     def request_exit(self) -> None: ...
+
+    def set_active_session(self, session: Session | None) -> None: ...
 
 
 def _ctx(tmp_path: Path, ui: UIController, args: str = "") -> CommandContext:
@@ -173,3 +175,89 @@ def test_compact_below_threshold_hints_no_need(tmp_path: Path) -> None:
     ui = RecordingUI()
     build_default_commands().find("compact").handler(_ctx(tmp_path, ui))  # type: ignore[union-attr]
     assert any("无需压缩" in m for m in ui.messages)
+
+
+# ---- /session resume/new/delete（M1-f 接线） --------------------------------
+
+
+class SwitchingUI(RecordingUI):
+    """记录 set_active_session 的会话切换替身。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.active: Session | None = None
+
+    def set_active_session(self, session: Session | None) -> None:
+        self.active = session
+
+
+def _ctx_session(tmp_path: Path, ui: UIController, args: str = "") -> CommandContext:
+    conv = ConversationManager()
+    agent = Agent(
+        config=Config(),
+        llm=FakeLLM([]),
+        conversation=conv,
+        tools=build_default_registry(),
+        events=lambda e: None,
+        work_dir=tmp_path,
+    )
+    return CommandContext(
+        args=args,
+        agent=agent,
+        conversation=conv,
+        session=None,
+        ui=ui,
+        config=Config(),
+        registry=build_default_commands(),
+        session_manager=SessionManager(tmp_path / ".kdagent" / "sessions"),
+    )
+
+
+def test_session_new_creates_and_activates(tmp_path: Path) -> None:
+    ui = SwitchingUI()
+    cmd = build_default_commands().find("session")
+    cmd.handler(_ctx_session(tmp_path, ui, args="new"))  # type: ignore[union-attr]
+    assert ui.active is not None
+    assert ui.active.conversation.messages == []
+    assert any("已新建会话" in m for m in ui.messages)
+
+
+def test_session_resume_activates_saved(tmp_path: Path) -> None:
+    mgr = SessionManager(tmp_path / ".kdagent" / "sessions")
+    saved = mgr.create()
+    saved.append_user("你好")
+    ui = SwitchingUI()
+    cmd = build_default_commands().find("session")
+    cmd.handler(_ctx_session(tmp_path, ui, args=f"resume {saved.id}"))  # type: ignore[union-attr]
+    assert ui.active is not None and ui.active.id == saved.id
+    assert [m.role for m in ui.active.conversation.messages] == ["user"]
+    assert any("已恢复会话" in m for m in ui.messages)
+
+
+def test_session_resume_unknown_guides(tmp_path: Path) -> None:
+    ui = SwitchingUI()
+    cmd = build_default_commands().find("session")
+    cmd.handler(_ctx_session(tmp_path, ui, args="resume nope"))  # type: ignore[union-attr]
+    assert ui.active is None
+    assert any("会话不存在" in m for m in ui.messages)
+
+
+def test_session_delete_removes_file(tmp_path: Path) -> None:
+    mgr = SessionManager(tmp_path / ".kdagent" / "sessions")
+    saved = mgr.create()
+    saved.append_user("hi")
+    ui = SwitchingUI()
+    cmd = build_default_commands().find("session")
+    cmd.handler(_ctx_session(tmp_path, ui, args=f"delete {saved.id}"))  # type: ignore[union-attr]
+    assert mgr.list() == []
+    assert any("已删除会话" in m for m in ui.messages)
+
+
+def test_session_list_shows_entries(tmp_path: Path) -> None:
+    mgr = SessionManager(tmp_path / ".kdagent" / "sessions")
+    saved = mgr.create()
+    saved.append_user("hi")
+    ui = RecordingUI()
+    cmd = build_default_commands().find("session")
+    cmd.handler(_ctx_session(tmp_path, ui, args="list"))  # type: ignore[union-attr]
+    assert any(saved.id in m for m in ui.messages)
