@@ -18,7 +18,7 @@ from kdagent.engine.events import LoopCompleteEvent, StreamTextEvent, ToolResult
 from kdagent.engine.llm.base import LLMStreamEvent
 from kdagent.engine.messages import TextBlock
 from kdagent.tools import build_default_registry
-from kdagent.ui.app import KDApp
+from kdagent.ui.app import ChatInput, KDApp
 from kdagent.ui.chat import ChatView
 from kdagent.ui.statusbar import StatusBar
 from kdagent.ui.todoregion import TodoRegion
@@ -138,6 +138,66 @@ async def test_session_resume_switches_conversation(tmp_path: Path) -> None:
             b.text for m in app._agent.conversation.messages for b in m.content if isinstance(b, TextBlock)
         ]
         assert any("存档内容" in t for t in texts)
+
+
+def test_control_re_whitelists_editing_keys() -> None:
+    """M1-i2：_CONTROL_RE 放行删除键与中文 UTF-8 续字节，仅挡 ESC/8-bit CSI 头。"""
+    for ch in ("\x08", "\x7f", "\xe4", "\xbd", "\x80", "\xa0"):
+        assert not ChatInput._CONTROL_RE.search(ch), f"应放行 {ch!r}"
+    for ch in ("\x1b", "\x9b"):
+        assert ChatInput._CONTROL_RE.search(ch), f"应拦截 {ch!r}"
+
+
+def test_chat_input_bindings_include_editing() -> None:
+    """M1-i2：Textual 合并父类绑定（dom._merge_bindings），ChatInput 须含删除/复制/粘贴。"""
+    keys = set(ChatInput._merged_bindings.key_to_bindings)
+    assert {"backspace", "ctrl+h", "ctrl+c", "ctrl+v"} <= keys
+
+
+async def test_chat_input_backspace_deletes(tmp_path: Path) -> None:
+    """M1-i2：ctrl+h（= \\x08，Windows 传统 backspace）触发 delete_left 删除字符。"""
+    app = _make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_bar = app.query_one("#input", ChatInput)
+        input_bar.focus()
+        input_bar.text = "abc"
+        input_bar.cursor_location = (0, 3)
+        await pilot.press("ctrl+h")
+        await pilot.pause()
+        assert input_bar.text == "ab"
+
+
+async def test_chat_input_copy(tmp_path: Path) -> None:
+    """M1-i2：Ctrl+C（priority）走 copy action → 系统剪贴板（不触发 App 退出）。"""
+    app = _make_app(tmp_path)
+    copied: list[str] = []
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.copy_to_clipboard = lambda text: copied.append(str(text))  # type: ignore[method-assign]
+        input_bar = app.query_one("#input", ChatInput)
+        input_bar.focus()
+        input_bar.text = "hello"
+        input_bar.select_all()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert copied == ["hello"]
+
+
+async def test_chat_input_paste(tmp_path: Path, monkeypatch: Any) -> None:
+    """M1-i2：Ctrl+V（priority）走 paste action → 读系统剪贴板插入。"""
+    from kdagent.ui import app as ui_app
+
+    monkeypatch.setattr(ui_app.pyperclip, "paste", lambda: "你好")
+    app = _make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        input_bar = app.query_one("#input", ChatInput)
+        input_bar.focus()
+        await pilot.press("ctrl+v")
+        await pilot.pause()
+        assert input_bar.text == "你好"
 
 
 async def test_esc_cancels_agent_cleanly(tmp_path: Path) -> None:

@@ -79,6 +79,14 @@ class ChatInput(TextArea):
         Binding("shift+enter", "newline", "换行", priority=True),
         Binding("ctrl+j", "newline", "换行", priority=True),
         Binding("tab", "complete", "补全", priority=True),
+        # M1-i2：禁用 Kitty（compat.py）后 Windows 传统模式 backspace 发 \x08 → Textual
+        # 解析为 key='ctrl+h'，而 TextArea 只有 backspace(=\x7f) 绑定 → 加 ctrl+h 兜底，
+        # \x08 与 \x7f 两路都能删除。Textual BINDINGS 会合并父类（dom._merge_bindings），
+        # 此处显式声明不丢 TextArea 的编辑绑定。
+        Binding("ctrl+h", "delete_left", "删除", priority=True),
+        # 显式 priority 复制/粘贴：焦点在输入框时防 App 层 ctrl+c=request_quit 抢键。
+        Binding("ctrl+c", "copy", "复制", priority=True),
+        Binding("ctrl+v", "paste", "粘贴", priority=True),
     ]
 
     # 鼠标序列泄漏防御（M1-i 加固）：完整 \x1b[<...M 会被 Textual 解析为 MouseEvent，
@@ -87,7 +95,10 @@ class ChatInput(TextArea):
     # `m/M` 闭合才判定为泄漏整段丢弃；否则回补缓冲字符（正常输入仅延迟一个 `[`）。
     _LEAK_FULL_RE = re.compile(r"\[<[0-9;]*[Mm]")
     _LEAK_PREFIX_RE = re.compile(r"\[<[0-9;]*$")
-    _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+    # M1-i2 收窄：原 `[\x00-\x1f\x7f-\x9f]` 误杀 backspace（\x08/\x7f）与中文
+    # UTF-8 续字节（\x80-\x9f）→ 仅挡 ESC(\x1b) 与 8-bit CSI(\x9b)（鼠标序列泄漏的
+    # control 头）；删除/换行/Tab 及 IME 字节均放行。
+    _CONTROL_RE = re.compile(r"[\x1b\x9b]")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
