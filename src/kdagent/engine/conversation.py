@@ -63,12 +63,23 @@ class ConversationManager:
         return []
 
     def repair_chain(self) -> None:
-        """`04` 会话恢复时调用：剔除孤立 tool_result、保证交替合法。"""
+        """`04` 会话恢复时调用：剔除孤立 tool_result、补齐悬空 tool_use 的错误结果。
+
+        规格 02 §3.3 要求"补缺失的 tool_result、剔除孤立块、保证交替合法"。
+        悬空 tool_use（assistant 请求了工具但从未返回结果，如会话中断/取消）若不补，
+        发请求时 OpenAI 兼容 API 会因 tool_call 无对应 `role=tool` 响应而拒收（HTTP 400）。
+        """
         tool_use_ids: set[str] = set()
         for msg in self._messages:
             for block in msg.content:
                 if isinstance(block, ToolUseBlock):
                     tool_use_ids.add(block.id)
+        answered_ids = {
+            block.tool_use_id
+            for msg in self._messages
+            for block in msg.content
+            if isinstance(block, ToolResultBlock)
+        }
         repaired: list[Message] = []
         for msg in self._messages:
             blocks = [
@@ -82,6 +93,18 @@ class ConversationManager:
             if blocks:
                 repaired.append(Message(role=msg.role, content=blocks))
         self._messages = repaired
+        # 悬空 tool_use → 补一条 errorResult（合并进最后一条 user 消息或追加一条）
+        missing = tool_use_ids - answered_ids
+        if missing:
+            blocks = [
+                ToolResultBlock(
+                    tool_use_id=bid,
+                    content="[system-reminder] 该工具调用在上次会话中断，未实际执行，请重新评估",
+                    is_error=True,
+                )
+                for bid in sorted(missing)
+            ]
+            self._append(Message(role="user", content=blocks))
 
     def _append(self, msg: Message) -> None:
         """交替规则兜底：相邻同角色自动合并（Anthropic API 自动合并；OpenAI 需自行合并）。"""

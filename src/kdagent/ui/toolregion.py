@@ -30,6 +30,7 @@ class ToolRegion(Vertical):
         """模型请求调用工具：活动条显示正在执行（ToolUseEvent）。"""
         args = " ".join(f"{k}={v}" for k, v in input.items())
         self._lines.append(f"[bold yellow]⚙ {name}[/bold yellow] {args}")
+        self.display = True  # Claude Code 风格：有活动才展开
         self._update_lines()
 
     def show_result(self, name: str, content: str, is_error: bool, duration_ms: int) -> None:
@@ -43,6 +44,7 @@ class ToolRegion(Vertical):
     def reset(self) -> None:
         """一轮结束收起活动区（LoopCompleteEvent）。"""
         self._lines.clear()
+        self.display = False
         self._update_lines()
 
     def compose(self) -> ComposeResult:

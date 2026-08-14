@@ -93,10 +93,10 @@ async def test_tab_completion_fills_command(tmp_path: Path) -> None:
         await pilot.pause()
         input_bar = app.query_one("#input")
         input_bar.focus()
-        input_bar.value = "/he"
+        input_bar.text = "/he"  # ChatInput(TextArea)：文本属性是 .text（.value 仅 Input 有）
         app.action_complete_command()
         await pilot.pause()
-        assert input_bar.value == "/help"
+        assert input_bar.text == "/help"
 
 
 async def test_agent_run_sends_user_message(tmp_path: Path) -> None:

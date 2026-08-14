@@ -16,7 +16,8 @@ from typing import Any
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Header, Input
+from textual.message import Message
+from textual.widgets import Header, TextArea
 from textual.worker import Worker
 
 from kdagent.config import Config
@@ -50,28 +51,58 @@ PLAN_SYSTEM_PROMPT = (
     "不要修改文件或执行有副作用的操作。"
 )
 
-# 四区域布局：对话区 1fr、todo 面板、工具活动区、输入框与状态栏底部（05 §3.1）
+# Claude Code 风格布局（05 §3.1）：Chat 主区 1fr，todo/tools 有内容才展开，
+# 输入框与状态栏固定底部。弹窗样式在 ui/confirm.py（ModalScreen 内）。
 _CSS = """
 #chat { height: 1fr; border: round $primary; margin: 0 1; }
 #todo { height: auto; max-height: 8; border: round $accent; margin: 0 1; }
-#tools { height: 6; border: round $secondary; margin: 0 1; }
+#tools { height: auto; max-height: 10; border: round $secondary; margin: 0 1; }
 #input { height: 3; margin: 0 1; }
 #status { height: 1; background: $panel; color: $text; padding: 0 1; }
-#dialog { width: 60; height: 9; border: thick $primary;
-          background: $surface; padding: 1 2; align: center middle; }
-#dialog-title { text-align: center; }
-#dialog-args { text-align: center; margin: 1 0; color: $text-muted; }
-#dialog-actions { align: center middle; }
-#dialog-actions Button { margin: 0 1; }
 """
 
 
-class InputBar(Input):
-    """用户输入框：/ 开头走命令快车道。"""
+class ChatInput(TextArea):
+    """用户输入框（TextArea 而非 Input）：IME 组合输入支持更完整（参考 mewcode）。
+
+    `priority=True` 关键：widget 层绑定优先于 Textual Screen 默认的
+    `tab=app.focus_next` / App 层 `ctrl+c=退出`，避免抢键。
+    """
+
+    BINDINGS = [
+        Binding("enter", "submit", "提交", priority=True),
+        Binding("shift+enter", "newline", "换行", priority=True),
+        Binding("ctrl+j", "newline", "换行", priority=True),
+        Binding("tab", "complete", "补全", priority=True),
+        Binding("ctrl+c", "copy", "复制", priority=True),
+        Binding("ctrl+v", "paste", "粘贴", priority=True),
+    ]
+
+    class Submitted(Message):
+        def __init__(self, text: str) -> None:
+            super().__init__()
+            self.text = text
+
+    class TabComplete(Message):
+        """Tab 请求补全（交给 App 处理，mewcode 同款模式）。"""
 
     def on_mount(self) -> None:
         self.border_title = "输入"
         self.placeholder = "输入消息，/ 开头为命令（/help 查看）"
+
+    def action_submit(self) -> None:
+        text = self.text.strip()
+        if not text:
+            return  # 空输入不发 API，防误触（05 §3.3）
+        self.post_message(self.Submitted(text))
+        self.text = ""
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    def action_complete(self) -> None:
+        """Tab：发出 TabComplete 消息，App 侧做 / 前缀补全。"""
+        self.post_message(self.TabComplete())
 
 
 class KDApp(App[None]):
@@ -128,7 +159,7 @@ class KDApp(App[None]):
         self._tools_region: ToolRegion | None = None
         self._todo_region: TodoRegion | None = None
         self._status: StatusBar | None = None
-        self._input: InputBar | None = None
+        self._input: ChatInput | None = None
 
     # ---- 布局与生命周期 ---------------------------------------------------
 
@@ -137,7 +168,7 @@ class KDApp(App[None]):
         yield ChatView(id="chat")
         yield TodoRegion(id="todo")
         yield ToolRegion(id="tools")
-        yield InputBar(id="input")
+        yield ChatInput(id="input")
         yield StatusBar(id="status")
 
     def on_mount(self) -> None:
@@ -145,7 +176,7 @@ class KDApp(App[None]):
         self._tools_region = self.query_one("#tools", ToolRegion)
         self._todo_region = self.query_one("#todo", TodoRegion)
         self._status = self.query_one("#status", StatusBar)
-        self._input = self.query_one("#input", InputBar)
+        self._input = self.query_one("#input", ChatInput)
         self._input.focus()
         self.refresh_status()
 
@@ -159,6 +190,7 @@ class KDApp(App[None]):
         if isinstance(ev, StreamTextEvent):
             chat.append_stream(ev.text)
         elif isinstance(ev, ToolUseEvent):
+            chat.finish_stream()  # 流式文本到此结束 → 渲染 markdown，再显示工具
             tools.show_running(ev.name, ev.input)
         elif isinstance(ev, ToolResultEvent):
             tools.show_result(ev.name, ev.content, ev.is_error, ev.duration_ms)
@@ -166,17 +198,22 @@ class KDApp(App[None]):
             self._accumulate_usage(ev.usage)
             self.refresh_status()
         elif isinstance(ev, TurnCompleteEvent):
+            chat.finish_stream()
             chat.append_system(f"— 第 {ev.turn + 1} 轮完成 —")
         elif isinstance(ev, LoopCompleteEvent):
+            chat.finish_stream()
             chat.append_system(f"✔ 完成（{ev.turns} 轮）")
             tools.reset()
             chat.scroll_end(animate=False)
         elif isinstance(ev, ErrorEvent):
+            chat.finish_stream()
             chat.append_error(ev.error)
             chat.append_system("输入 /help 查看命令")
         elif isinstance(ev, CancelledEvent):
+            chat.finish_stream()
             chat.append_system("已取消。")
         elif isinstance(ev, MaxIterationsReachedEvent):
+            chat.finish_stream()
             chat.append_error(f"达到迭代上限（{ev.limit} 轮），已强制停止。")
 
     def _accumulate_usage(self, usage: Usage) -> None:
@@ -204,19 +241,20 @@ class KDApp(App[None]):
 
     # ---- 用户输入：命令快车道 vs Agent Loop（05 §3.3） ---------------------
 
-    @on(Input.Submitted)
-    def _on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value
+    @on(ChatInput.Submitted)
+    def _on_input_submitted(self, event: ChatInput.Submitted) -> None:
+        text = event.text
         if not text.strip():
-            return  # 空输入不发 API，防误触（05 §3.3）
-        input_bar = self._input
-        if input_bar is not None:
-            input_bar.value = ""
+            return  # 空输入不发 API，防误触（05 §3.3）；输入框已在 action_submit 清空
         name, args, is_cmd = parse_command(text)
         if is_cmd:
             self.dispatch_command(name, args)
             return
         self.send_user_message(text)
+
+    @on(ChatInput.TabComplete)
+    def _on_tab_complete(self, event: ChatInput.TabComplete) -> None:
+        self.action_complete_command()
 
     def send_user_message(self, text: str) -> None:
         chat = self._chat
@@ -309,11 +347,14 @@ class KDApp(App[None]):
             chat.clear_messages()
 
     def set_active_session(self, session: Session | None) -> None:
-        """切换当前会话（/session new/resume）：换 conversation + 恢复 todo 面板。"""
+        """切换当前会话（/session new/resume）：换 conversation + 恢复对话/todo。"""
         if session is None:
             return
         self._session = session
         self._agent.set_conversation(session.conversation)
+        chat = self._chat
+        if chat is not None:
+            chat.load_conversation(session.conversation.messages)
         todo_region = self._todo_region
         if todo_region is not None:
             if session.todos:
@@ -344,15 +385,15 @@ class KDApp(App[None]):
     def action_complete_command(self) -> None:
         """Tab：/ 后前缀补全；单选补全，多选列候选（05 §3.5）。"""
         input_bar = self._input
-        if input_bar is None or not input_bar.value.startswith("/"):
+        if input_bar is None or not input_bar.text.startswith("/"):
             return
-        rest = input_bar.value[1:].strip()
+        rest = input_bar.text[1:].strip()
         prefix = rest.split()[0] if rest else ""
         matches = self._commands.complete(prefix)
         if len(matches) == 1:
             cmd_name = matches[0]
-            input_bar.value = f"/{cmd_name}" if cmd_name != prefix else f"/{cmd_name} "
-            input_bar.cursor_position = len(input_bar.value)
+            input_bar.text = f"/{cmd_name}" if cmd_name != prefix else f"/{cmd_name} "
+            input_bar.cursor_location = (0, len(input_bar.text))
         elif len(matches) > 1:
             chat = self._chat
             if chat is not None:

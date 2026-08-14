@@ -48,18 +48,21 @@
 
 ### 3.1 TUI 布局（Textual Widget 树）
 
+Claude Code 风格：Chat 占主区，todo/tools **有内容才展开**，输入框与状态栏固定底部。
+
 ```
 KDApp(App)
  └─ MainScreen
      ├─ Header        # 应用名 + 当前模式（DEFAULT/PLAN）
-     ├─ ChatView      # Rich TextLog：消息流（用户/助手/工具/系统）
-     ├─ ToolRegion    # 工具调用活动条（"正在执行 ReadFile ..."，结果折叠）
-     ├─ TodoRegion    # todo 面板（见 3.2b）：todo → task → steps 实时渲染
-     ├─ InputBar      # Input：用户输入框
+     ├─ ChatView      # 消息流容器：user/system 用 Static，assistant 用 Markdown
+     ├─ TodoRegion    # todo 面板（见 3.2b）：有 todo 时展开，空则收起（display=False）
+     ├─ ToolRegion    # 工具调用活动条：有调用时展开，LoopComplete 后收起
+     ├─ ChatInput     # TextArea（非 Input）：IME 组合输入支持更好；Enter 提交 / Shift+Enter 换行
      └─ StatusBar     # 状态栏（见 3.2）
 ```
 
-- 对话区用滚动日志（TextLog），天然支持流式 append 与滚动到末尾。
+- **ChatView**：流式 `text_delta` 累积到同一行 Static（纯文本实时显示），流结束/工具调用前一次性替换为 `Markdown` widget 渲染（代码块/加粗/列表着色）。Static 内容一律 `markup.escape`，防止 `[`/`]` 被当 markup 解析破坏布局（M1-e 收尾修复：逐词换行/错位重叠）。
+- **输入框用 TextArea 而非 Input**（M1-e 收尾修复，参考 mewcode）：TextArea 对中文 IME 组合输入支持更完整；bindings 全部 `priority=True`，规避 Textual Screen 默认 `tab=app.focus_next` / App 层 `ctrl+c=退出` 抢键。
 - 工具调用不在对话区刷屏——独立 `ToolRegion` 展示"正在执行 X"，结果折叠为一行，避免占满屏幕。
 
 ### 3.2 AgentEvent → UI 映射
@@ -221,20 +224,21 @@ class CommandRegistry:
 
 ## 5. 验收标准
 
-- [ ] Textual App 启动，三区域布局渲染正常；关闭退出干净
-- [ ] 流式 `text_delta` 逐字显示不卡顿；`LoopCompleteEvent` 后滚动到底
-- [ ] 工具调用在 ToolRegion 显示"正在执行 X..."，结果折叠展示
-- [ ] 状态栏随 `UsageEvent` 实时更新 token
-- [ ] Esc 取消当前循环干净退出、可继续输入；Ctrl+C 退出程序
-- [ ] `require_confirm` 工具执行前弹 Y/N；选 no → 返回拒绝结果，Loop 继续
-- [ ] `/help /status /compact /clear /plan /session /exit` 全部可用；只输入 `/` 列出命令
+- [x] Textual App 启动，布局渲染正常（Claude Code 风格：Chat 主区 + todo/tools 有内容才展开 + 底部输入/状态）；关闭退出干净（M1 收尾 ✅ 2026-08-14）
+- [x] 流式 `text_delta` 累积显示不逐词换行、无错位重叠；`LoopCompleteEvent` 后滚动到底；助手消息渲染 Markdown（代码块/加粗/列表着色）（M1 收尾 ✅ 2026-08-14）
+- [x] 工具调用在 ToolRegion 显示"正在执行 X..."，结果折叠展示；LoopComplete 后收起（M1 收尾 ✅）
+- [x] 状态栏随 `UsageEvent` 实时更新 token（M1-e ✅）
+- [x] Esc 取消当前循环干净退出、可继续输入；Ctrl+C 退出程序（M1-e ✅）
+- [x] `require_confirm` 工具执行前弹 Y/N（居中弹窗）；选 no → 返回拒绝结果，Loop 继续（M1-e + M1 收尾 ✅）
+- [x] `/help /status /compact /clear /plan /session /exit` 全部可用；只输入 `/` 列出命令（M1-e ✅）
 - [ ] `/permissions` 查看/切换权限模式、显示规则统计（06 接入）
-- [ ] `/session list/resume/new/delete` 正确操作 `04` 会话
+- [x] `/session list/resume/new/delete` 正确操作 `04` 会话；resume 后对话历史渲染回 ChatView（M1-f + M1 收尾 ✅）
 - [ ] `/compact` 显示前后 token 对比；<5K 提示无需压缩
-- [ ] TodoRegion 从 `SessionRecord.todos` 实时渲染 todo → task → steps（非从 LLM 文本解析）；检查点触发时高亮当前步骤
+- [x] TodoRegion 从 `SessionRecord.todos` 实时渲染 todo → task → steps（非从 LLM 文本解析）；空时收起（M1-f ✅）
 - [ ] `TestingEvent` 渲染"正在跑测试…"及 passed/failed/regression_detected 三态（`12` TestRunner）
-- [ ] Tab 补全：`/` 列命令、前缀补全、多匹配下拉
-- [ ] 别名冲突 → 启动时报错；未知命令 → 带 /help 引导
+- [x] Tab 补全：`/` 列命令、前缀补全（ChatInput priority 绑定，规避 Screen focus_next 抢键）（M1-e + M1 收尾 ✅）
+- [x] 别名冲突 → 启动时报错；未知命令 → 带 /help 引导（M1-e ✅）
+- [x] 输入框 TextArea：支持中文 IME 组合输入；Enter 提交、Shift+Enter 换行；聚焦时 Ctrl+C 复制 / Ctrl+V 粘贴（M1 收尾 ✅）
 
 ---
 

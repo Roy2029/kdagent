@@ -30,11 +30,13 @@ class TodoRegion(Vertical):
     def show_todos(self, items: list[TodoItemRecord]) -> None:
         """TodoWrite 回调 → 实时刷新（03 §3.6 数据流：05 从会话状态读渲染）。"""
         self._items = list(items)
+        self.display = bool(items)  # Claude Code 风格：空面板收起，有内容才展开
         self._update_lines()
 
     def reset(self) -> None:
         """切换会话 / 清空时收起面板。"""
         self._items = []
+        self.display = False
         self._update_lines()
 
     def _update_lines(self) -> None:
