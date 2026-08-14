@@ -8,3 +8,4 @@ __pycache__/
 .env
 .playwright-mcp/
 回收箱/
+.kd/

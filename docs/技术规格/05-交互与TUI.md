@@ -124,6 +124,7 @@ async def run_agent(text):
 ```
 
 - 钩子通过 `03` 的 `ToolContext` 注入（`03` 已预留 permission 依赖位），02 无需知道 UI 存在。
+- 键盘操作（M1-i）：**y/n 键直选**（不依赖焦点），←/→ 在按钮间移动焦点；Esc 默认关闭返回 None（= 拒绝）。
 - 能跑档不落盘权限规则；`06` 升级后此路径替换为 `deny > ask > allow` 裁决 + 权限学习。
 
 ### 3.5 Slash Command 框架
@@ -229,7 +230,7 @@ class CommandRegistry:
 - [x] 工具调用在 ToolRegion 显示"正在执行 X..."，结果折叠展示；LoopComplete 后收起（M1 收尾 ✅）
 - [x] 状态栏随 `UsageEvent` 实时更新 token（M1-e ✅）
 - [x] Esc 取消当前循环干净退出、可继续输入；Ctrl+C 退出程序（M1-e ✅）
-- [x] `require_confirm` 工具执行前弹 Y/N（居中弹窗）；选 no → 返回拒绝结果，Loop 继续（M1-e + M1 收尾 ✅）
+- [x] `require_confirm` 工具执行前弹 Y/N（居中弹窗）；选 no → 返回拒绝结果，Loop 继续；y/n 键直选、方向键切换按钮（M1-e + M1 收尾 + M1-i ✅；居中须用具体类选择器 `ConfirmDialog, ExitDialog { align: center middle }`，基类 `Screen`/`ModalScreen` 选择器被 Textual 8.2.8 覆盖不生效）
 - [x] `/help /status /compact /clear /plan /session /exit` 全部可用；只输入 `/` 列出命令（M1-e ✅）
 - [ ] `/permissions` 查看/切换权限模式、显示规则统计（06 接入）
 - [x] `/session list/resume/new/delete` 正确操作 `04` 会话；resume 后对话历史渲染回 ChatView（M1-f + M1 收尾 ✅）
@@ -238,7 +239,7 @@ class CommandRegistry:
 - [ ] `TestingEvent` 渲染"正在跑测试…"及 passed/failed/regression_detected 三态（`12` TestRunner）
 - [x] Tab 补全：`/` 列命令、前缀补全（ChatInput priority 绑定，规避 Screen focus_next 抢键）（M1-e + M1 收尾 ✅）
 - [x] 别名冲突 → 启动时报错；未知命令 → 带 /help 引导（M1-e ✅）
-- [x] 输入框 TextArea：支持中文 IME 组合输入；Enter 提交、Shift+Enter 换行；聚焦时 Ctrl+C 复制 / Ctrl+V 粘贴（M1 收尾 ✅）
+- [x] 输入框 TextArea：支持中文 IME 组合输入（依赖 Textual ≥8.2.8 Kitty associated-text 解析 + 终端支持，Windows Terminal 建议新版）；Enter 提交、Shift+Enter 换行；聚焦时 Ctrl+C 复制 / Ctrl+V 粘贴，clipboard 经 pyperclip 接**系统剪贴板**（Textual 默认进程内，M1-i 修复）；`ChatInput._on_key` 过滤鼠标序列残留（`[<...M`）与控制字符（M1-i ✅）
 
 ---
 

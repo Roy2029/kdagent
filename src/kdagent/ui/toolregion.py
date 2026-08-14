@@ -21,6 +21,7 @@ class ToolRegion(Vertical):
 
     def on_mount(self) -> None:
         self.border_title = "工具"
+        self.display = False  # Claude Code 风格：初始收起，有活动才展开
 
     def _update_lines(self) -> None:
         # 注意：不能用 `_render` 命名——那是 Textual Widget 内部渲染方法，覆盖会崩。

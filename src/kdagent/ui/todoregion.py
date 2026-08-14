@@ -26,6 +26,7 @@ class TodoRegion(Vertical):
 
     def on_mount(self) -> None:
         self.border_title = "待办"
+        self.display = False  # Claude Code 风格：初始收起，有 todo 才展开
 
     def show_todos(self, items: list[TodoItemRecord]) -> None:
         """TodoWrite 回调 → 实时刷新（03 §3.6 数据流：05 从会话状态读渲染）。"""

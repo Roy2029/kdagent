@@ -7,11 +7,16 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import time
 from typing import Any
 
 from kdagent.tools.base import ToolContext, ToolResult
+
+# 终端控制序列（CSI/OSC/其他 ESC 开头）——命令输出里的颜色/光标码必须剥离，
+# 否则 \x1b 序列进入上下文污染模型（工具结果应为纯文本）。
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-_]")
 
 
 class Bash:
@@ -82,8 +87,8 @@ class Bash:
                 is_error=True,
                 duration_ms=int((time.perf_counter() - start) * 1000),
             )
-        out = stdout.decode(errors="replace").rstrip()
-        err = stderr.decode(errors="replace").rstrip()
+        out = _ANSI_RE.sub("", stdout.decode(errors="replace")).rstrip()
+        err = _ANSI_RE.sub("", stderr.decode(errors="replace")).rstrip()
         exit_code = proc.returncode
         parts: list[str] = []
         if out:

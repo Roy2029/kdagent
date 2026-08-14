@@ -10,12 +10,16 @@ M1-f：接入 SessionManager 持久会话；TodoRegion。
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import re
 from pathlib import Path
 from typing import Any
 
+import pyperclip  # type: ignore[import-untyped]
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.events import Key
 from textual.message import Message
 from textual.widgets import Header, TextArea
 from textual.worker import Worker
@@ -67,6 +71,7 @@ class ChatInput(TextArea):
 
     `priority=True` 关键：widget 层绑定优先于 Textual Screen 默认的
     `tab=app.focus_next` / App 层 `ctrl+c=退出`，避免抢键。
+    ctrl+c/ctrl+v 用 TextArea 内置绑定（经 app 系统剪贴板）。
     """
 
     BINDINGS = [
@@ -74,9 +79,20 @@ class ChatInput(TextArea):
         Binding("shift+enter", "newline", "换行", priority=True),
         Binding("ctrl+j", "newline", "换行", priority=True),
         Binding("tab", "complete", "补全", priority=True),
-        Binding("ctrl+c", "copy", "复制", priority=True),
-        Binding("ctrl+v", "paste", "粘贴", priority=True),
     ]
+
+    # 鼠标/IME 序列泄漏防御：Windows 终端把鼠标事件（\x1b[<...M）或 CSI 残留
+    # 当作可打印文本送入 TextArea 时，丢弃而不插入（claude-code #72269 同类）。
+    _MOUSE_LEAK_RE = re.compile(r"\x1b?\[<[0-9;]*[Mm]")
+    _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+    async def _on_key(self, event: Key) -> None:
+        ch = event.character
+        if ch is not None and (self._CONTROL_RE.search(ch) or self._MOUSE_LEAK_RE.search(ch)):
+            event.stop()
+            event.prevent_default()
+            return
+        await super()._on_key(event)
 
     class Submitted(Message):
         def __init__(self, text: str) -> None:
@@ -179,6 +195,22 @@ class KDApp(App[None]):
         self._input = self.query_one("#input", ChatInput)
         self._input.focus()
         self.refresh_status()
+
+    # ---- 系统剪贴板（Textual 默认是进程内 _clipboard，不接系统剪贴板） -------
+
+    @property
+    def clipboard(self) -> str:
+        """读取系统剪贴板；失败降级为 Textual 进程内值（headless/无剪贴板）。"""
+        try:
+            return str(pyperclip.paste())
+        except Exception:
+            return self._clipboard
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """写系统剪贴板；失败降级为 Textual 进程内值。"""
+        self._clipboard = text
+        with contextlib.suppress(Exception):
+            pyperclip.copy(text)
 
     # ---- AgentEvent 消费（05 §3.2 映射表） ---------------------------------
 

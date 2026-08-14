@@ -39,7 +39,9 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
         if msg.role == "assistant":
             text = "".join(b.text for b in msg.content if isinstance(b, TextBlock))
             tool_uses = [b for b in msg.content if isinstance(b, ToolUseBlock)]
-            item: dict[str, Any] = {"role": "assistant", "content": text or None}
+            # content 用空串而非 None：OpenAI 兼容厂商（含 DeepSeek）对
+            # content: null 的 assistant 消息有时返回 400（带 tool_calls 时亦然）。
+            item: dict[str, Any] = {"role": "assistant", "content": text or ""}
             if tool_uses:
                 item["tool_calls"] = [
                     {
@@ -187,7 +189,10 @@ class OpenAICompatClient:
             httpx.AsyncClient(timeout=self._timeout) as client,
             client.stream("POST", self._url, json=body, headers=headers) as resp,
         ):
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                # 手动读响应体再抛，带上 DeepSeek 具体报错（raise_for_status 不含 body）。
+                body_text = (await resp.aread())[:1000].decode("utf-8", errors="replace")
+                raise RuntimeError(f"LLM API {resp.status_code}: {body_text}")
             async for line in resp.aiter_lines():
                 for event in parser.feed(line):
                     yield event
