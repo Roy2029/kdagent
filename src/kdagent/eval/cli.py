@@ -90,6 +90,7 @@ def load_tasks_file(path: Path) -> tuple[str, Path, Path, list[EvalTask]]:
                 pass_to_pass=[str(x) for x in raw.get("pass_to_pass", [])],
                 gold_patch=str(raw.get("gold_patch", "")),
                 test_cmd=str(raw.get("test_cmd", "")),
+                p2p_cmd=str(raw.get("p2p_cmd", "")),
                 constraint=str(raw.get("constraint", "")),
             )
         )

@@ -31,6 +31,7 @@ class EvalTask:
     pass_to_pass: list[str] = field(default_factory=list)  # 原通过测试不能被碰坏
     gold_patch: str = ""  # 官方参考补丁（gold 校验用）
     test_cmd: str = ""  # 判分测试命令（可选；给了才跑真实测试）
+    p2p_cmd: str = ""  # PASS_TO_PASS 判分测试命令（D81：给了则跑，破坏 → 不 resolved）
     constraint: str = ""  # 任务约束（如「不要改测试文件」）→ 类 5 标记
 
 

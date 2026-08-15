@@ -12,6 +12,7 @@ from conftest import FakeLLM, done, tool_call
 
 from kdagent.config import Config
 from kdagent.eval import (
+    EvalReport,
     EvalRunner,
     EvalTask,
     classify,
@@ -293,6 +294,127 @@ def test_load_tasks_file(tmp_path: Path) -> None:
     assert t.test_cmd == "python -m pytest"
     assert t.constraint == "别改测试"
     assert work_dir.is_dir()
+
+
+# ---- PASS_TO_PASS 保护判分（11 §3.2 单题判定 + §5 223，D81） -----------------
+
+
+def _repo_with_keep(tmp_path: Path) -> Path:
+    """base commit 含 keep.txt 的仓库（P2P 测试保护的对象）。"""
+    repo = tmp_path / "repo-keep"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "t@test.local")
+    _git(repo, "config", "user.name", "t")
+    (repo / "README.md").write_text("# t\n", encoding="utf-8")
+    (repo / "keep.txt").write_text("keep\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "base")
+    (repo / "bug.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "add bug")
+    return repo
+
+
+async def _run_eval(repo: Path, tmp_path: Path, llm: FakeLLM, task: EvalTask) -> EvalReport:
+    runner = _runner(tmp_path, llm)
+    manager = AgentManager([BUILTIN_AGENTS_DIR])
+    manager.scan()
+    definition = manager.get("general-purpose")
+    assert definition is not None
+    ev = EvalRunner(
+        runner, definition=definition, source_repo=repo,
+        work_dir=tmp_path / "eval", task_loader=lambda: [task],
+    )
+    return await ev.run("run-p2p")
+
+
+@pytest.mark.asyncio
+async def test_eval_runner_p2p_protection_passes(tmp_path: Path) -> None:
+    """F2P 过 + P2P 过（未破坏 keep.txt）→ resolved + passed_to_passed 计入。"""
+    repo = _repo_with_keep(tmp_path)
+    llm = FakeLLM([tool_call("Bash", {"command": "echo fixed > flag.txt"}), done("改完了")])
+    task = EvalTask(
+        instance_id="p1",
+        base_commit=_base_commit(repo),
+        problem_statement="制造一个 flag.txt",
+        test_cmd="test -f flag.txt",   # F2P：必须全过
+        p2p_cmd="test -f keep.txt",    # P2P：原通过资源不能被破坏
+    )
+    report = await _run_eval(repo, tmp_path, llm, task)
+    assert report.resolved == ["p1"]
+    assert report.metrics.resolved == 1
+    assert report.metrics.passed_to_passed == 1  # P2P 实测确认无损坏
+    assert report.failed == []
+
+
+@pytest.mark.asyncio
+async def test_eval_runner_p2p_broken_is_regression(tmp_path: Path) -> None:
+    """F2P 过但 P2P 被破坏（rm keep.txt）→ 不 resolved，归 regression。"""
+    repo = _repo_with_keep(tmp_path)
+    llm = FakeLLM(
+        [tool_call("Bash", {"command": "echo fixed > flag.txt && rm -f keep.txt"}), done("改完了")]
+    )
+    task = EvalTask(
+        instance_id="p2",
+        base_commit=_base_commit(repo),
+        problem_statement="制造一个 flag.txt",
+        test_cmd="test -f flag.txt",   # F2P 过
+        p2p_cmd="test -f keep.txt",    # P2P 破坏 → 不算 resolved
+    )
+    report = await _run_eval(repo, tmp_path, llm, task)
+    assert report.resolved == []
+    assert report.metrics.resolved == 0
+    assert len(report.failed) == 1
+    assert report.failed[0].kind == "regression"
+    assert "PASS_TO_PASS" in report.failed[0].reason
+    assert report.failed[0].patch  # 失败题带补丁供复查
+
+
+@pytest.mark.asyncio
+async def test_eval_runner_no_p2p_cmd_keeps_behavior(tmp_path: Path) -> None:
+    """p2p_cmd 未给 → 原行为：F2P 过即 resolved，passed_to_passed 不计。"""
+    repo = _repo_with_keep(tmp_path)
+    llm = FakeLLM([tool_call("Bash", {"command": "echo fixed > flag.txt"}), done("改完了")])
+    task = EvalTask(
+        instance_id="p3",
+        base_commit=_base_commit(repo),
+        problem_statement="制造一个 flag.txt",
+        test_cmd="test -f flag.txt",
+        # 无 p2p_cmd
+    )
+    report = await _run_eval(repo, tmp_path, llm, task)
+    assert report.resolved == ["p3"]
+    assert report.metrics.passed_to_passed == 0
+
+
+def test_load_tasks_parses_p2p_cmd(tmp_path: Path) -> None:
+    """tasks.json 解析 p2p_cmd 字段。"""
+    (tmp_path / "repo").mkdir()
+    _git(tmp_path / "repo", "init")
+    tasks = tmp_path / "tasks.json"
+    tasks.write_text(
+        json.dumps(
+            {
+                "repo_dir": str(tmp_path / "repo"),
+                "tasks": [
+                    {
+                        "instance_id": "a1",
+                        "base_commit": "HEAD",
+                        "problem_statement": "修",
+                        "fail_to_pass": ["test_a.py"],
+                        "test_cmd": "python -m pytest",
+                        "p2p_cmd": "python -m pytest tests/test_b.py",
+                        "constraint": "别改测试",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, _, _, tasks_list = load_tasks_file(tasks)
+    assert tasks_list[0].p2p_cmd == "python -m pytest tests/test_b.py"
+    assert tasks_list[0].constraint == "别改测试"
 
 
 def test_load_tasks_file_empty(tmp_path: Path) -> None:

@@ -265,10 +265,35 @@ class EvalRunner:
         test_passed: bool | None = None
         if task.test_cmd:
             test_passed = self._run_test(sealed, task.test_cmd)
-        if test_passed is True or (
-            test_passed is None and gold_similarity(model_patch, task.gold_patch)
-            >= self._similarity_threshold
+        # 11 §3.2 单题判定（D81 补 P2P 保护）：FAIL_TO_PASS 全过 **且** PASS_TO_PASS
+        # 无损坏才算 resolved。p2p_cmd 给了才跑 P2P 实测；未给保持原行为（只判 F2P）。
+        p2p_passed: bool | None = None
+        if task.p2p_cmd:
+            p2p_passed = self._run_test(sealed, task.p2p_cmd)
+        if test_passed is True:
+            if p2p_passed is None or p2p_passed is True:
+                report.resolved.append(task.instance_id)
+                report.metrics.resolved += 1
+                if p2p_passed is True:
+                    report.metrics.passed_to_passed += 1  # P2P 实测确认无损坏
+                self._backfill(report, task, True)  # 07 §3.8：判分通过回填 passed
+                return
+            # F2P 全过但 P2P 被碰坏 → regression（修好目标测试不能破坏原通过测试）
+            reason = f"PASS_TO_PASS 测试被破坏（{task.p2p_cmd}）"
+            report.failed.append(
+                FailureCase(
+                    instance_id=task.instance_id,
+                    kind="regression",
+                    reason=reason,
+                    patch=model_patch,
+                )
+            )
+            self._backfill(report, task, False, "regression", reason)
+            return
+        if test_passed is None and (
+            gold_similarity(model_patch, task.gold_patch) >= self._similarity_threshold
         ):
+            # gold 相似度路径：无真实测试，P2P 无从实测 → resolved 但不计 passed_to_passed
             report.resolved.append(task.instance_id)
             report.metrics.resolved += 1
             self._backfill(report, task, True)  # 07 §3.8：判分通过回填 passed
@@ -279,7 +304,6 @@ class EvalRunner:
                 instance_id=task.instance_id, kind=kind, reason=reason, patch=model_patch
             )
         )
-        report.metrics.passed_to_passed += 0  # PASS_TO_PASS 无损坏（MVP 无 p2p 实测）
         self._backfill(report, task, False, kind, reason)  # 07 §3.8：失败归类回填
 
     def _backfill(
