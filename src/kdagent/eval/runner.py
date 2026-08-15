@@ -28,6 +28,7 @@ from kdagent.eval.model import (
     FailureCase,
     FailureKind,
 )
+from kdagent.obs.telemetry import Telemetry
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.runner import SubAgentRunner
 
@@ -162,6 +163,7 @@ class EvalRunner:
         work_dir: Path,
         task_loader: Callable[[], list[EvalTask]],
         similarity_threshold: float = _GOLD_SIM_THRESHOLD,
+        obs_dir: Path | None = None,
     ) -> None:
         self._runner = runner
         self._definition = definition
@@ -169,6 +171,9 @@ class EvalRunner:
         self._work_dir = work_dir
         self._task_loader = task_loader
         self._similarity_threshold = similarity_threshold
+        # 07 trace 数据层：子 Agent 全程产 trace，带 eval.run_id/task_id 标记，
+        # 供失败定位（11 §3.4/§3.5，trace_store.load_traces / failed_events）。
+        self._telemetry = Telemetry(obs_dir) if obs_dir is not None else None
 
     async def run(self, run_id: str) -> EvalReport:
         tasks = self._task_loader()
@@ -185,8 +190,12 @@ class EvalRunner:
             shutil.rmtree(work)
         sealed = seal_copy(self._source_repo, task.base_commit, work)
         prompt = self._build_prompt(task)
+        if self._telemetry is not None:
+            self._telemetry.set_trace_attributes(
+                {"eval.run_id": report.run_id, "eval.task_id": task.instance_id}
+            )
         result = await self._runner.run_to_completion(
-            self._definition, prompt, work_dir=sealed
+            self._definition, prompt, work_dir=sealed, telemetry=self._telemetry
         )
         model_patch = extract_patch(sealed)
         report.metrics.total += 1

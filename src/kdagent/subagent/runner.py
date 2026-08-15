@@ -37,6 +37,7 @@ from kdagent.engine.events import (
 )
 from kdagent.engine.llm.base import LLMClient, Usage
 from kdagent.engine.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock
+from kdagent.obs.telemetry import Telemetry
 from kdagent.permission.checker import PermissionChecker
 from kdagent.subagent.model import AgentDef
 from kdagent.tools.registry import ToolRegistry
@@ -205,6 +206,7 @@ class SubAgentRunner:
         model: str = "",
         background: bool = False,
         work_dir: Path | None = None,
+        telemetry: Telemetry | None = None,
     ) -> SubAgentResult:
         """任务注入 → 独立 Agent 跑完 → 返回最后文本（10 §3.5）。
 
@@ -213,6 +215,8 @@ class SubAgentRunner:
         `model` 非空且 ≠ 主模型时新建 LLMClient；`background` 套后台白名单。
         `work_dir` 覆盖子 Agent 工作目录（explicit cwd 模式，10 §3.11：Worktree
         隔离时工具显式取 worktree 路径作本次调用 cwd，无全局 chdir）。
+        `telemetry` 传入则子 Agent run() 全程产 07 trace（11 评估失败定位数据源）；
+        None = 无 obs 环境（保持默认，不落盘）。
         """
         background = background or fork  # Fork 无条件后台（10 §3.2）
         registry = filter_tools(self._tools, definition, background=background, fork=fork)
@@ -236,7 +240,7 @@ class SubAgentRunner:
             ),
             max_iterations=definition.max_turns,
             permission_checker=self._permission_checker,
-            telemetry=None,
+            telemetry=telemetry,
         )
         await agent.run(task if not fork else "")
         return self._extract_result(agent, conversation, sink)

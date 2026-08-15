@@ -24,6 +24,7 @@ from kdagent.engine.llm.base import ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
 from kdagent.eval.model import EvalReport, EvalTask
 from kdagent.eval.runner import EvalRunner
+from kdagent.eval.trace_store import failed_events, load_traces
 from kdagent.subagent import BUILTIN_AGENTS_DIR, AgentManager, SubAgentRunner
 from kdagent.tools import build_default_registry
 
@@ -93,13 +94,25 @@ def run_eval_cli(tasks_file: Path) -> int:
     if definition is None:
         print("内置 general-purpose Agent 缺失", file=sys.stderr)
         return 2
+    obs_dir = work_dir / ".kdagent" / "obs"  # 07 trace 落盘（评估本地观测）
     eval_runner = EvalRunner(
         runner,
         definition=definition,
         source_repo=repo_dir,
         work_dir=work_dir,
         task_loader=lambda: tasks,
+        obs_dir=obs_dir,
     )
     report: EvalReport = asyncio.run(eval_runner.run(run_id))
     print(report.summary())
+    if report.failed:
+        print("\n失败定位（07 trace）：")
+        for case in report.failed:
+            traces = load_traces(obs_dir, run_id=run_id, task_id=case.instance_id)
+            if not traces:
+                print(f"- {case.instance_id}：无 trace（子代理未接 telemetry 或落盘失败）")
+                continue
+            bad = failed_events(traces[0])
+            detail = f"{len(bad)} 个失败事件" if bad else "trace 完整但无 error span"
+            print(f"- {case.instance_id}：{detail}（{traces[0].session_id}/{traces[0].trace_id}）")
     return 0 if not report.failed else 1

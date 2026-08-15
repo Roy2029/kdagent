@@ -45,10 +45,19 @@ class Telemetry:
         self.log_full_prompt = log_full_prompt
         self._enabled = enabled
         self._trace_token: Any | None = None
+        self._preset_attributes: dict[str, Any] = {}  # 实例级预置（07 §3.8 eval 标记）
 
     @property
     def enabled(self) -> bool:
         return self._enabled
+
+    def set_trace_attributes(self, attributes: dict[str, Any]) -> None:
+        """预置本次 begin_trace 的 trace attributes（07 §3.8：eval.run_id/task_id 关联）。
+
+        eval runner 每任务前调用，子 Agent 内部 begin_trace 时自动带上；串行跑批安全，
+        并发子代理共享实例会竞争（评估并发跑批留待后续，记待决）。
+        """
+        self._preset_attributes = dict(attributes)
 
     def begin_trace(
         self,
@@ -59,13 +68,14 @@ class Telemetry:
         """02 Agent.run() 进入时调用：创建 Trace 并设为当前，落头行。"""
         if not self._enabled:
             return None
+        merged = {**self._preset_attributes, **(attributes or {})}
         trace = Trace(
             trace_id=gen_id(),
             session_id=session_id,
             user_input_snapshot=user_input_snapshot,
             root_span_id="",
             ts=now_ms(),
-            attributes=dict(attributes or {}),
+            attributes=merged,
         )
         self._trace_token = _current_trace.set(trace)
         self._exporter.export_trace_header(trace)
