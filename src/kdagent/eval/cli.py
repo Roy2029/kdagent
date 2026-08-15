@@ -32,6 +32,7 @@ from kdagent.config import load_api_key, load_config
 from kdagent.engine.llm.base import ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
 from kdagent.eval.model import EvalReport, EvalTask, FailureCase, FailureKind
+from kdagent.eval.report_diff import diff_runs, load_report, metrics_by_run, render_run_diff
 from kdagent.eval.review import (
     focus_labels,
     focus_spans,
@@ -46,6 +47,23 @@ from kdagent.eval.runner import EvalRunner
 from kdagent.eval.trace_store import failed_events, load_traces
 from kdagent.subagent import BUILTIN_AGENTS_DIR, AgentManager, SubAgentRunner
 from kdagent.tools import build_default_registry
+
+
+def load_workspace(path: Path) -> tuple[Path, Path]:
+    """只读命令：从 tasks.json 取 (repo_dir, work_dir)，不要求 tasks 非空。
+
+    复核/对比/报表只看落盘报告与 obs，tasks 内容无关——与 load_tasks_file 分离。
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取评测配置 {path}：{exc}") from exc
+    repo_dir = Path(data.get("repo_dir", "")).resolve()
+    if not repo_dir.is_dir():
+        raise ValueError(f"repo_dir 不存在：{repo_dir}")
+    work_dir = Path(data.get("work_dir", str(repo_dir / ".kdagent" / "eval"))).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    return repo_dir, work_dir
 
 
 def load_tasks_file(path: Path) -> tuple[str, Path, Path, list[EvalTask]]:
@@ -148,29 +166,15 @@ def persist_report(work_dir: Path, run_id: str, report: EvalReport) -> Path:
 
 def _load_report(work_dir: Path, run_id: str) -> list[FailureCase]:
     """读跑批报告失败题（重建 FailureCase）。报告缺失 → 报错退出。"""
-    path = work_dir / ".kdagent" / "eval" / run_id / "report.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except OSError:
+    report = load_report(work_dir, run_id)
+    if report is None:
         hint = f"（先跑 `kdagent eval <tasks.json>` 生成，run_id={run_id}）"
-        print(f"找不到该 run 的报告：{path}\n{hint}", file=sys.stderr)
+        print(f"找不到该 run 的报告：\n{hint}", file=sys.stderr)
         sys.exit(2)
-    except json.JSONDecodeError as exc:
-        print(f"报告损坏：{exc}", file=sys.stderr)
-        sys.exit(2)
-    failed = [
-        FailureCase(
-            instance_id=str(c["instance_id"]),
-            kind=str(c["kind"]),  # type: ignore[arg-type]
-            reason=str(c["reason"]),
-            patch=str(c.get("patch", "")),
-        )
-        for c in data.get("failed", [])
-    ]
-    if not failed:
+    if not report.failed:
         print("该 run 无失败题（全部通过，无需复核）")
         sys.exit(0)
-    return failed
+    return report.failed
 
 
 def _review_index(
@@ -193,7 +197,7 @@ def run_review_cli(tasks_file: Path, run_id: str) -> int:
     （e 报错 / c 压缩 / p 权限）；`d<行号>` 看详情；`b` 返回索引；`q` 退出。
     """
     try:
-        _, _, work_dir, _ = load_tasks_file(tasks_file)
+        _, work_dir = load_workspace(tasks_file)
     except ValueError as exc:
         print(f"评测配置错误：{exc}", file=sys.stderr)
         return 2
@@ -284,11 +288,43 @@ def run_annotate_cli(
         print(f"非法归类：{kind}（可选 {sorted(valid)}）", file=sys.stderr)
         return 2
     try:
-        _, _, work_dir, _ = load_tasks_file(tasks_file)
+        _, work_dir = load_workspace(tasks_file)
     except ValueError as exc:
         print(f"评测配置错误：{exc}", file=sys.stderr)
         return 2
     obs_dir = work_dir / ".kdagent" / "obs"
     path = save_annotation(obs_dir, run_id, task_id, cast(FailureKind, kind), note)
     print(f"已批注 {task_id} → [{kind}]：{path}")
+    return 0
+
+
+def run_diff_cli(tasks_file: Path, run_a: str, run_b: str) -> int:
+    """复测对比（11 §3.5 一次一变量复测）：两轮 run 的题级变化。免 api_key。"""
+    try:
+        _, work_dir = load_workspace(tasks_file)
+    except ValueError as exc:
+        print(f"评测配置错误：{exc}", file=sys.stderr)
+        return 2
+    try:
+        diff = diff_runs(work_dir, run_a, run_b)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(render_run_diff(diff))
+    return 0
+
+
+def run_metrics_cli(tasks_file: Path, run_id: str) -> int:
+    """单版本报表（11 §3.8 metrics_by_run）：重看一轮历史 run 的指标。免 api_key。"""
+    try:
+        _, work_dir = load_workspace(tasks_file)
+    except ValueError as exc:
+        print(f"评测配置错误：{exc}", file=sys.stderr)
+        return 2
+    try:
+        report = metrics_by_run(work_dir, run_id)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(report.summary())
     return 0

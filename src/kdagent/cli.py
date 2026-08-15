@@ -94,6 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="--annotate 的备注文本",
     )
+    eval_p.add_argument(
+        "--diff",
+        nargs=2,
+        metavar=("RUN_A", "RUN_B"),
+        help="复测对比（11 §3.5）：两轮 run 题级变化（fail2pass/pass2fail/fail2fail/pass2pass）",
+    )
+    eval_p.add_argument(
+        "--metrics",
+        metavar="RUN_ID",
+        help="单版本报表（11 §3.8 metrics_by_run）：通过率/token/耗时，免 api_key",
+    )
     return parser
 
 
@@ -256,7 +267,13 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     # eval 子命令：长任务后台执行（11 §3.9），不走 TUI/IME 补丁。
     if args.command == "eval":
-        from kdagent.eval import run_annotate_cli, run_eval_cli, run_review_cli
+        from kdagent.eval import (
+            run_annotate_cli,
+            run_diff_cli,
+            run_eval_cli,
+            run_metrics_cli,
+            run_review_cli,
+        )
 
         if args.report:
             raise SystemExit(run_review_cli(Path(args.tasks), args.report))
@@ -265,6 +282,11 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(
                 run_annotate_cli(Path(args.tasks), run_id, task_id, kind, args.note)
             )
+        if args.diff:
+            run_a, run_b = args.diff
+            raise SystemExit(run_diff_cli(Path(args.tasks), run_a, run_b))
+        if args.metrics:
+            raise SystemExit(run_metrics_cli(Path(args.tasks), args.metrics))
         raise SystemExit(run_eval_cli(Path(args.tasks)))
     work_dir = Path(args.dir) if args.dir else None
     # 方案 A：Windows 终端不支持 Kitty 时禁用（对齐 Claude Code 回退传统流），

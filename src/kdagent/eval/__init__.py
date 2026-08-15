@@ -1,6 +1,14 @@
 """评估体系（规格 11）：数据模型 / 评测流水线 / 失败归类 / CLI 子命令（M5-e MVP）。"""
 
-from kdagent.eval.cli import load_tasks_file, run_annotate_cli, run_eval_cli, run_review_cli
+from kdagent.eval.cli import (
+    load_tasks_file,
+    load_workspace,
+    run_annotate_cli,
+    run_diff_cli,
+    run_eval_cli,
+    run_metrics_cli,
+    run_review_cli,
+)
 from kdagent.eval.model import (
     EvalReport,
     EvalTask,
@@ -29,8 +37,11 @@ __all__ = [
     "extract_patch",
     "gold_similarity",
     "load_tasks_file",
+    "load_workspace",
     "run_annotate_cli",
+    "run_diff_cli",
     "run_eval_cli",
+    "run_metrics_cli",
     "run_review_cli",
     "seal_copy",
 ]
