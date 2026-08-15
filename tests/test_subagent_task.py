@@ -224,6 +224,54 @@ async def test_task_validation(tmp_path) -> None:
     assert create_tool.validate_input({"type": "t", "task": "d"}) == []
 
 
+@pytest.mark.asyncio
+async def test_set_telemetry_forwards_to_runner(tmp_path) -> None:
+    """10 §5 342（D78）：TaskManager.set_telemetry 转发 runner（装配后注入）。"""
+    from kdagent.obs.telemetry import Telemetry
+
+    runner = SubAgentRunner(
+        llm=FakeLLM([done("x")]),
+        tools=build_default_registry(),
+        config=Config(),
+        work_dir=tmp_path,
+    )
+    mgr = TaskManager(runner)
+    assert runner._telemetry is None  # 初始无 telemetry（cli 构造早于 KDApp）
+    telemetry = Telemetry(tmp_path / "obs")
+    mgr.set_telemetry(telemetry)
+    assert runner._telemetry is telemetry  # 转发生效
+
+
+@pytest.mark.asyncio
+async def test_background_task_trace_links_to_parent(tmp_path) -> None:
+    """10 §5 342（D78）：后台任务 create_task 快照父上下文 → 子 Agent trace 挂父。"""
+    import json
+
+    from kdagent.obs.telemetry import Telemetry
+
+    obs_dir = tmp_path / "obs"
+    telemetry = Telemetry(obs_dir)
+    telemetry.begin_trace("main", "父输入")
+    with telemetry.span("trace.run", "session"):
+        parent_trace_id = telemetry.current_context()[0]
+        mgr = _manager(tmp_path)
+        mgr.set_telemetry(telemetry)
+        task = mgr.launch(EXPLORE, "后台任务")
+        await _wait_until(lambda: task.status in ("completed", "failed"))
+        assert task.status == "completed"
+    telemetry.end_trace()
+
+    headers: list[dict[str, object]] = []
+    for f in (obs_dir / "traces").glob("**/*.jsonl"):
+        for line in f.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if row["_type"] == "trace":
+                headers.append(row)
+    assert len(headers) == 2  # 父 + 后台子
+    child = next(h for h in headers if h["parent_trace_id"] == parent_trace_id)
+    assert child["trace_id"] != parent_trace_id
+
+
 class _Ctx:
     """最小 ToolContext（仅 tool_use_id 有用）。"""
 

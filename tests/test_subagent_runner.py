@@ -149,6 +149,53 @@ async def test_fork_run_to_completion_inherits_and_runs(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_to_completion_child_trace_links_to_parent(tmp_path) -> None:
+    """10 §5 342（D78）：set_telemetry 注入后子 Agent 产 trace 并挂父（header 带父 id）。"""
+    import json
+
+    from kdagent.obs.telemetry import Telemetry
+
+    obs_dir = tmp_path / "obs"
+    telemetry = Telemetry(obs_dir)
+    telemetry.begin_trace("main-session", "父输入")
+    with telemetry.span("trace.run", "session") as root:
+        root_id = root.span_id if root else ""
+        parent_trace_id = telemetry.current_context()[0]
+
+        llm = FakeLLM([done("子结果")])
+        runner = _runner(tmp_path, llm)
+        runner.set_telemetry(telemetry)
+        result = await runner.run_to_completion(EXPLORE, "子任务")
+        assert result.text == "子结果"
+    telemetry.end_trace()
+
+    # 读取落盘 trace headers：父 + 子两条，子带 parent 引用
+    headers: list[dict[str, object]] = []
+    for f in (obs_dir / "traces").glob("**/*.jsonl"):
+        for line in f.read_text(encoding="utf-8").splitlines():
+            row = json.loads(line)
+            if row["_type"] == "trace":
+                headers.append(row)
+    assert len(headers) == 2
+    child = next(h for h in headers if h["parent_trace_id"] == parent_trace_id)
+    assert child["trace_id"] != parent_trace_id  # 子 trace 独立 id
+    assert child["parent_span_id"] == root_id  # 挂委派点当前 span
+    assert child["session_id"] == "main-session"  # 继承父会话归属
+    root_h = next(h for h in headers if h["trace_id"] == parent_trace_id)
+    assert root_h["parent_trace_id"] == ""  # 父自身是根 trace
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_no_telemetry_keeps_no_obs(tmp_path) -> None:
+    """未 set_telemetry（无 obs 环境）→ 子 Agent 不产 trace，行为与 D78 前一致。"""
+    llm = FakeLLM([done("ok")])
+    runner = _runner(tmp_path, llm)
+    result = await runner.run_to_completion(EXPLORE, "任务")
+    assert result.text == "ok"
+    assert not (tmp_path / "obs").exists()
+
+
+@pytest.mark.asyncio
 async def test_run_to_completion_max_turns_returns_partial(tmp_path) -> None:
     """maxTurns 耗尽（不断要工具）→ 返回已收文本不崩溃（10 §3.5 停止条件 2）。"""
     llm = FakeLLM([tool_call("ReadFile", {"path": "x"}, id_="t1")] * 3)

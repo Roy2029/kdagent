@@ -25,6 +25,7 @@ from typing import Any, Literal
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import Usage
 from kdagent.engine.messages import TextBlock
+from kdagent.obs.telemetry import Telemetry
 from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.runner import SubAgentResult, SubAgentRunner
@@ -78,6 +79,10 @@ class TaskManager:
     def set_parent_conversation(self, conversation: ConversationManager) -> None:
         """延迟绑定主对话（KDApp 构造 Agent 后注入）：完成通知的注入目标。"""
         self._parent_conversation = conversation
+
+    def set_telemetry(self, telemetry: Telemetry) -> None:
+        """延迟注入 telemetry（KDApp 装配后）：转发 runner——子 Agent trace 挂父链。"""
+        self._runner.set_telemetry(telemetry)
 
     def launch(
         self,

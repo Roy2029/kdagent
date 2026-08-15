@@ -190,6 +190,7 @@ class SubAgentRunner:
         permission_checker: PermissionChecker | None = None,
         make_client: Callable[[str], LLMClient] | None = None,
         hooks: HookEngine | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
@@ -200,6 +201,14 @@ class SubAgentRunner:
         # 10 §3.3 Hook 引擎共享：cli 传主引擎同一实例，pre/post/生命周期 hook 子 Agent 同生效。
         # 注意 prompt_inject 全库暂无接线（cli 构造 HookEngine 未传），共享不会注入错通道。
         self._hooks = hooks
+        # 10 §5 342（D78）：子 Agent 挂父 trace。cli 构造早于 KDApp 内部 _build_telemetry，
+        # 运行时靠 KDApp 装配后 set_telemetry 注入（对齐 ContextManager.set_telemetry 模式）；
+        # run_to_completion 显式 telemetry 参数（eval）优先于实例属性。
+        self._telemetry = telemetry
+
+    def set_telemetry(self, telemetry: Telemetry) -> None:
+        """装配后注入 telemetry（KDApp 构建完成 _build_telemetry 后调用）。"""
+        self._telemetry = telemetry
 
     async def run_to_completion(
         self,
@@ -224,6 +233,16 @@ class SubAgentRunner:
         None = 无 obs 环境（保持默认，不落盘）。
         """
         background = background or fork  # Fork 无条件后台（10 §3.2）
+        # 10 §5 342（D78）：子 Agent 挂父 trace。active = 显式参数（eval）优先，setter
+        # 注入（主 Agent 前台/后台）兜底；在构造子 Agent 前读调用方当前 trace 上下文
+        # （contextvar 任务局部——create_task 快照当前上下文，后台子 Agent 同样可读），
+        # 子 Agent begin_trace 记录父 id + 继承父 session_id（落父会话目录），落盘可重建
+        # 「父 trace → 子 trace」调用链。无父 → 空串（子自建根 trace，行为与 D78 前一致）。
+        active_telemetry = telemetry or self._telemetry
+        if active_telemetry is not None:
+            parent_trace_id, parent_span_id, parent_session_id = active_telemetry.current_context()
+        else:
+            parent_trace_id = parent_span_id = parent_session_id = ""
         registry = filter_tools(self._tools, definition, background=background, fork=fork)
         conversation = ConversationManager()
         if fork and parent_conversation is not None:
@@ -245,7 +264,10 @@ class SubAgentRunner:
             ),
             max_iterations=definition.max_turns,
             permission_checker=self._permission_checker,
-            telemetry=telemetry,
+            telemetry=active_telemetry,  # 10 §5 342：setter 注入后子 Agent 也产 trace
+            session_id=parent_session_id,  # 10 §5 342：继承父会话（trace 归属落父目录）
+            parent_trace_id=parent_trace_id,
+            parent_span_id=parent_span_id,
             hooks=self._hooks,  # 10 §3.3：共享主 HookEngine，子 Agent hook 同生效
         )
         await agent.run(task if not fork else "")

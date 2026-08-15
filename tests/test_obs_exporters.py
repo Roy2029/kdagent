@@ -50,6 +50,9 @@ def test_jsonl_exporter_layout(tmp_path: Path) -> None:
     assert header["_type"] == "trace"
     assert header["user_input_snapshot"] == "原始输入摘要"
     assert header["session_id"] == "s1"
+    # 10 §5 342（D78）：默认无父 → header 带空串 parent 字段（根 trace）。
+    assert header["parent_trace_id"] == ""
+    assert header["parent_span_id"] == ""
     assert span_row["_type"] == "span"
     assert span_row["name"] == "llm.call"
     assert span_row["status"] == "ok"

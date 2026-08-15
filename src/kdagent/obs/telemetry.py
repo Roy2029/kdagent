@@ -73,8 +73,14 @@ class Telemetry:
         session_id: str,
         user_input_snapshot: str,
         attributes: dict[str, Any] | None = None,
+        parent_trace_id: str = "",
+        parent_span_id: str = "",
     ) -> Trace | None:
-        """02 Agent.run() 进入时调用：创建 Trace 并设为当前，落头行。"""
+        """02 Agent.run() 进入时调用：创建 Trace 并设为当前，落头行。
+
+        `parent_trace_id`/`parent_span_id`（10 §5 342 D78）：子 Agent 委派点读父
+        上下文传入——子 trace 记录调用方 id，落盘可重建「父 trace → 子 trace」调用链。
+        """
         if not self._enabled:
             return None
         merged = {**(_trace_attrs.get() or {}), **(attributes or {})}
@@ -84,11 +90,27 @@ class Telemetry:
             user_input_snapshot=user_input_snapshot,
             root_span_id="",
             ts=now_ms(),
+            parent_trace_id=parent_trace_id,
+            parent_span_id=parent_span_id,
             attributes=merged,
         )
         self._trace_token = _current_trace.set(trace)
         self._exporter.export_trace_header(trace)
         return trace
+
+    def current_context(self) -> tuple[str, str, str]:
+        """读取调用方当前 trace 上下文（10 §5 342 D78）：返回 (trace_id, span_id, session_id)。
+
+        委派点（SubAgentRunner 构造子 Agent 前）读父 trace 挂链 + 会话归属；无活动
+        trace / 未启用 → ("", "", "") 表示无父。contextvar 任务局部：asyncio.create_task
+        快照当前上下文，后台子 Agent 同样能读到父 trace。
+        """
+        if not self._enabled:
+            return ("", "", "")
+        trace = _current_trace.get()
+        if trace is None:
+            return ("", "", "")
+        return (trace.trace_id, _current_span_id.get() or "", trace.session_id)
 
     def end_trace(self) -> None:
         """02 Agent.run() 退出时调用：恢复 trace 上下文。"""

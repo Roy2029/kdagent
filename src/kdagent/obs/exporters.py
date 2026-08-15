@@ -45,6 +45,9 @@ class JsonlExporter:
             )["v"],
             "ts": trace.ts,
             "attributes": trace.attributes,
+            # 10 §5 342（D78）：父子 trace 关联——子 Agent trace 记录父 id，重建调用链。
+            "parent_trace_id": trace.parent_trace_id,
+            "parent_span_id": trace.parent_span_id,
         }
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(header, ensure_ascii=False) + "\n")

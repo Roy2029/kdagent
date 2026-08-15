@@ -317,6 +317,10 @@ class KDApp(App[None]):
         self._worktree_manager = worktree_manager
         if task_manager is not None:
             task_manager.set_parent_conversation(self._agent.conversation)
+            # 10 §5 342（D78）：子 Agent 挂父 trace——runner 装配后注入主 telemetry。
+            # obs_dir None = 未启用可观测性，不注入（子 Agent 保持无 trace 行为）。
+            if self._telemetry is not None:
+                task_manager.set_telemetry(self._telemetry)
         agent_tool = self._tools.get("Agent")
         if isinstance(agent_tool, SubAgentTool):
             agent_tool.set_parent_conversation(self._agent.conversation)

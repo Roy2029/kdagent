@@ -137,6 +137,10 @@ class Agent:
         session_id: str = "",
         model_name: str = "",
         telemetry: Telemetry | None = None,
+        # 10 §5 342（D78）：子 Agent 挂父 trace——begin_trace 时关联调用方 id。
+        # 主 Agent 构造不传（默认空=根 trace）；SubAgentRunner 委派点读父上下文传入。
+        parent_trace_id: str = "",
+        parent_span_id: str = "",
         context_manager: ContextManager | None = None,
         permission_checker: PermissionChecker | None = None,
         hooks: HookEngine | None = None,
@@ -161,6 +165,8 @@ class Agent:
         self._session_id = session_id  # 07 trace 关联（04 sid，/session 切换时更新）
         self._model_name = model_name or config.model  # llm.call span 记录 model（D9）
         self._telemetry = telemetry  # 07 埋点 sink，None = 无 obs 环境
+        self._parent_trace_id = parent_trace_id  # 10 §5 342：子 Agent trace 挂父
+        self._parent_span_id = parent_span_id
         self._context_manager = context_manager  # 01 工具结果入口分发（M2-a L1 落盘）
         # 06 M3 可控档：五层裁决器 + Hook 引擎。checker 存在时接管 require_confirm
         # （升级为完整裁决系统，规格 06 §1）；hooks None = 无自动化（M1/M2 行为不变）。
@@ -249,7 +255,12 @@ class Agent:
         # 07：一次 Agent.run() = 一条 Trace（根 span=trace.run，记停止原因）。
         root_cm: AbstractContextManager[Span | None] = nullcontext(None)
         if telemetry is not None:
-            telemetry.begin_trace(self._session_id, user_input[:200])
+            telemetry.begin_trace(
+                self._session_id,
+                user_input[:200],
+                parent_trace_id=self._parent_trace_id,
+                parent_span_id=self._parent_span_id,
+            )
             root_cm = telemetry.span(
                 "trace.run", "session", {"user_input_snapshot": user_input[:200]}
             )

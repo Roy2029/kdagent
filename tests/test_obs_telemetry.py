@@ -89,3 +89,55 @@ def test_sanitize_applied_at_export(tmp_path: Path) -> None:
     span_row = next(r for r in _read_spans(tmp_path) if r["_type"] == "span")
     assert "***" in header["user_input_snapshot"]  # type: ignore[operator]
     assert span_row["attributes"]["prompt"] == "a *** here"
+
+
+# ---- 10 §5 342（D78）：子 Agent trace 挂父 ----
+
+def test_begin_trace_parent_records_header(tmp_path: Path) -> None:
+    """begin_trace 传 parent → header 落 parent_trace_id/parent_span_id（挂父链）。"""
+    telemetry = Telemetry(tmp_path)
+    telemetry.begin_trace(
+        "s1", "child", parent_trace_id="parent-123", parent_span_id="parent-span-1"
+    )
+    telemetry.end_trace()
+
+    header = next(r for r in _read_spans(tmp_path) if r["_type"] == "trace")
+    assert header["parent_trace_id"] == "parent-123"
+    assert header["parent_span_id"] == "parent-span-1"
+    assert header["trace_id"]  # 子 trace 自身 id 仍独立
+
+
+def test_begin_trace_default_parent_empty(tmp_path: Path) -> None:
+    """未传 parent → 空串（根 trace，无父）。"""
+    telemetry = Telemetry(tmp_path)
+    telemetry.begin_trace("s1", "root")
+    telemetry.end_trace()
+
+    header = next(r for r in _read_spans(tmp_path) if r["_type"] == "trace")
+    assert header["parent_trace_id"] == ""
+    assert header["parent_span_id"] == ""
+
+
+def test_current_context_reads_active_trace(tmp_path: Path) -> None:
+    """current_context 返回当前 (trace_id, span_id)——委派点读父 trace 的入口。"""
+    telemetry = Telemetry(tmp_path)
+    # 无活动 trace → ("", "", "")
+    assert telemetry.current_context() == ("", "", "")
+
+    telemetry.begin_trace("s1", "parent")
+    with telemetry.span("trace.run", "session") as root:
+        assert root is not None
+        trace_id, span_id, session_id = telemetry.current_context()
+        assert trace_id  # 读到父 trace_id
+        assert span_id == root.span_id  # 读到当前 span
+        assert session_id == "s1"  # 会话归属（子 trace 落父会话目录）
+    telemetry.end_trace()
+
+    # end_trace 后上下文恢复 → 空（防跨 trace 残留）
+    assert telemetry.current_context() == ("", "", "")
+
+
+def test_current_context_disabled_returns_empty(tmp_path: Path) -> None:
+    """未启用 telemetry → current_context 恒空（no-op 零开销）。"""
+    telemetry = Telemetry(tmp_path, enabled=False)
+    assert telemetry.current_context() == ("", "", "")

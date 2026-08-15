@@ -63,4 +63,8 @@ class Trace:
     root_span_id: str
     spans: list[Span] = field(default_factory=list)  # 以 parent_span_id 恢复树
     ts: int = 0
+    # 10 §5 342（D78）：子 Agent trace 挂父——记录调用方（主 Agent/eval）的 trace。
+    # 空串 = 根 trace（无父）；落盘 header 带这两个字段可重建跨 trace 调用链。
+    parent_trace_id: str = ""
+    parent_span_id: str = ""
     attributes: dict[str, Any] = field(default_factory=dict)  # 版本指纹 / eval 关联（§3.8）
