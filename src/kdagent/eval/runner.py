@@ -30,6 +30,7 @@ from kdagent.eval.model import (
     FailureCase,
     FailureKind,
 )
+from kdagent.eval.trace_store import backfill_verdict
 from kdagent.obs.telemetry import Telemetry
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.runner import SubAgentRunner
@@ -184,6 +185,8 @@ class EvalRunner:
         # 07 trace 数据层：子 Agent 全程产 trace，带 eval.run_id/task_id 标记，
         # 供失败定位（11 §3.4/§3.5，trace_store.load_traces / failed_events）。
         self._telemetry = Telemetry(obs_dir) if obs_dir is not None else None
+        # 07 §3.8 验收 276：判分后回填 trace 判定（passed/kind/reason）。
+        self._obs_dir = obs_dir
 
     async def run(self, run_id: str, max_workers: int = 1) -> EvalReport:
         """跑批（§3.2 第 2 步）：`max_workers=1` 顺序，>1 并发（§3.7 可并行）。
@@ -268,6 +271,7 @@ class EvalRunner:
         ):
             report.resolved.append(task.instance_id)
             report.metrics.resolved += 1
+            self._backfill(report, task, True)  # 07 §3.8：判分通过回填 passed
             return
         kind, reason = classify(task, model_patch, test_passed, result.error)
         report.failed.append(
@@ -276,6 +280,24 @@ class EvalRunner:
             )
         )
         report.metrics.passed_to_passed += 0  # PASS_TO_PASS 无损坏（MVP 无 p2p 实测）
+        self._backfill(report, task, False, kind, reason)  # 07 §3.8：失败归类回填
+
+    def _backfill(
+        self,
+        report: EvalReport,
+        task: EvalTask,
+        passed: bool,
+        kind: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """打分后回填 trace 判定（07 §3.8 验收 276）；obs 未启用时 no-op。
+
+        回填失败不阻断判分（backfill_verdict 内部已防御 OSError/脏行跳过）——
+        判定结果已由 report.json 承载，trace 回填是让 trace 自包含的加分项。
+        """
+        if self._obs_dir is None:
+            return
+        backfill_verdict(self._obs_dir, report.run_id, task.instance_id, passed, kind, reason)
 
     @staticmethod
     def _build_prompt(task: EvalTask) -> str:
