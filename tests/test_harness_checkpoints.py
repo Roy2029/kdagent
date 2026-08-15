@@ -14,10 +14,15 @@ from kdagent.engine.llm.base import LLMStreamEvent, Payload
 from kdagent.engine.messages import TextBlock, ToolUseBlock
 from kdagent.harness.checkpoints import (
     CheckpointEvent,
+    VerificationKind,
     build_checkpoint_reminder,
     build_large_change_warning,
+    build_mismatch_reminder,
     build_replan_reminder,
     build_stale_todo_reminder,
+    classify_criteria,
+    file_target,
+    has_test_evidence,
     todo_progress,
 )
 from kdagent.tools import build_default_registry
@@ -230,6 +235,60 @@ def test_replan_reminder_contains_rewrite_instruction() -> None:
     assert "目标" in text  # 快照保真（废弃旧列表前先对表）
 
 
+# --- 行为观察①（D58）：判据分类 / 证据检测 / 不一致警告 ---
+
+
+def test_classify_criteria_test_kind() -> None:
+    assert classify_criteria("测试全绿") == VerificationKind.TEST
+    assert classify_criteria("pytest 通过") == VerificationKind.TEST
+    assert classify_criteria("跑通单测") == VerificationKind.TEST
+    assert classify_criteria("用例通过") == VerificationKind.TEST
+
+
+def test_classify_criteria_file_kind() -> None:
+    assert classify_criteria("文件 config.yaml 存在") == VerificationKind.FILE
+    assert classify_criteria("创建 src/a.py") == VerificationKind.FILE
+
+
+def test_classify_criteria_soft() -> None:
+    assert classify_criteria("调研清楚") == VerificationKind.SOFT
+    assert classify_criteria("") == VerificationKind.SOFT
+    # 含文件路径但无「存在/创建」语义 → 软判据（不自动核验）
+    assert classify_criteria("改 config.py 文件") == VerificationKind.SOFT
+
+
+def test_file_target_extracts_path() -> None:
+    assert file_target("文件 config.yaml 存在") == "config.yaml"
+    assert file_target("创建 src/kdagent/a.py") == "src/kdagent/a.py"
+
+
+def test_file_target_none_without_path() -> None:
+    assert file_target("创建配置文件") is None  # 无类路径 token
+
+
+def test_has_test_evidence() -> None:
+    assert has_test_evidence(["TestRunner"], [])  # 12 §3.1 测试工具
+    assert has_test_evidence(["Bash"], ["uv run pytest -q"])
+    assert has_test_evidence(["Bash"], ["tox -e py"])
+    assert not has_test_evidence(["ReadFile"], [])
+    assert not has_test_evidence(["Bash"], ["ls -la"])  # 非测试命令不算
+
+
+def test_mismatch_reminder_contains_reason_and_snapshot() -> None:
+    ev = CheckpointEvent(
+        todo_content="目标", task_content="A", step_description="", accept_criteria="测试全绿"
+    )
+    todos = [
+        {"content": "目标", "tasks": [{"content": "A", "status": "completed", "steps": []}]}
+    ]
+    text = build_mismatch_reminder(ev, todos, "判据要求测试通过，但本会话未跑过测试")
+    assert "<system-reminder>" in text and "</system-reminder>" in text
+    assert "声明与行为不一致" in text
+    assert "「A」" in text and "测试全绿" in text
+    assert "未跑过测试" in text
+    assert "目标" in text  # 快照保真
+
+
 # --- agent 接线：第一层声明驱动 ---
 
 
@@ -241,7 +300,7 @@ async def test_todo_boundary_injects_checkpoint_reminder(tmp_path: Path) -> None
                 {
                     "content": "A",
                     "status": "in_progress",
-                    "steps": [{"description": "改代码", "accept_criteria": "测试全绿"}],
+                    "steps": [{"description": "改代码", "accept_criteria": "功能完成"}],
                 }
             ],
         }
@@ -253,7 +312,7 @@ async def test_todo_boundary_injects_checkpoint_reminder(tmp_path: Path) -> None
                 {
                     "content": "A",
                     "status": "completed",
-                    "steps": [{"description": "改代码", "accept_criteria": "测试全绿"}],
+                    "steps": [{"description": "改代码", "accept_criteria": "功能完成"}],
                 }
             ],
         }
@@ -267,7 +326,7 @@ async def test_todo_boundary_injects_checkpoint_reminder(tmp_path: Path) -> None
     await agent.run("任务")
     joined = "\n".join(_text_blocks(conv))
     assert "步骤边界检查点" in joined
-    assert "完成判据：测试全绿" in joined
+    assert "完成判据：功能完成" in joined
 
 
 async def test_todo_no_boundary_no_inject(tmp_path: Path) -> None:
@@ -417,3 +476,96 @@ async def test_replan_injected_in_full_run_after_repeated_breaks(tmp_path: Path)
     assert "已连续失败 3 次" in joined
     assert "路径反复受阻" in joined
     assert "整体重写" in joined
+
+
+# --- 行为观察①（D58）：agent 接线——声明 vs 行为不一致拦截 ---
+
+
+def _step_todos(accept_criteria: str, status: str) -> list[dict[str, Any]]:
+    """单 task 步骤边界 todo（in_progress → completed 触发检查点）。"""
+    return [
+        {
+            "content": "目标",
+            "tasks": [
+                {
+                    "content": "A",
+                    "status": status,
+                    "steps": [{"description": "干一步", "accept_criteria": accept_criteria}],
+                }
+            ],
+        }
+    ]
+
+
+async def test_mismatch_warning_when_test_criteria_but_no_test_run(tmp_path: Path) -> None:
+    """判据要求测试通过，但会话未跑过测试 → 声明 vs 行为不一致拦截。"""
+    responses = [
+        _tool("TodoWrite", {"todos": _step_todos("测试全绿", "in_progress")}, id_="t1"),
+        _tool("TodoWrite", {"todos": _step_todos("测试全绿", "completed")}, id_="t2"),
+        _done(),
+    ]
+    agent, conv, _ = _make_agent(responses, tmp_path)
+    await agent.run("任务")
+    joined = "\n".join(_text_blocks(conv))
+    assert "声明与行为不一致" in joined
+    assert "未跑过测试" in joined
+    assert "步骤边界检查点" not in joined  # 拦截替代自检
+
+
+async def test_no_mismatch_when_test_was_run(tmp_path: Path) -> None:
+    """判据要求测试通过且会话跑过 pytest → 正常检查点（无拦截）。"""
+    responses = [
+        _tool("TodoWrite", {"todos": _step_todos("测试全绿", "in_progress")}, id_="t1"),
+        _tool("Bash", {"command": "pytest -q"}, id_="b1"),
+        _tool("TodoWrite", {"todos": _step_todos("测试全绿", "completed")}, id_="t2"),
+        _done(),
+    ]
+    agent, conv, _ = _make_agent(responses, tmp_path)
+    await agent.run("任务")
+    joined = "\n".join(_text_blocks(conv))
+    assert "声明与行为不一致" not in joined
+    assert "步骤边界检查点" in joined
+
+
+async def test_mismatch_warning_when_file_criteria_missing(tmp_path: Path) -> None:
+    """判据要求文件存在但目标文件不在 work_dir → 拦截警告（含路径）。"""
+    responses = [
+        _tool("TodoWrite", {"todos": _step_todos("文件 config.yaml 存在", "in_progress")}, id_="t1"),
+        _tool("TodoWrite", {"todos": _step_todos("文件 config.yaml 存在", "completed")}, id_="t2"),
+        _done(),
+    ]
+    agent, conv, _ = _make_agent(responses, tmp_path)
+    await agent.run("任务")
+    joined = "\n".join(_text_blocks(conv))
+    assert "声明与行为不一致" in joined
+    assert "config.yaml" in joined
+
+
+async def test_no_mismatch_when_file_exists(tmp_path: Path) -> None:
+    """判据要求文件存在且文件确实在 → 正常检查点。"""
+    (tmp_path / "config.yaml").write_text("x: 1", encoding="utf-8")
+    responses = [
+        _tool("TodoWrite", {"todos": _step_todos("文件 config.yaml 存在", "in_progress")}, id_="t1"),
+        _tool("TodoWrite", {"todos": _step_todos("文件 config.yaml 存在", "completed")}, id_="t2"),
+        _done(),
+    ]
+    agent, conv, _ = _make_agent(responses, tmp_path)
+    await agent.run("任务")
+    joined = "\n".join(_text_blocks(conv))
+    assert "声明与行为不一致" not in joined
+    assert "步骤边界检查点" in joined
+
+
+async def test_soft_criteria_uses_self_assess(tmp_path: Path) -> None:
+    """软判据不自动核验 → 走 D54 既有自评路径（无机械判据）。"""
+    responses = [
+        _tool("TodoWrite", {"todos": _step_todos("调研清楚", "in_progress")}, id_="t1"),
+        _tool("TodoWrite", {"todos": _step_todos("调研清楚", "completed")}, id_="t2"),
+        _done(),
+    ]
+    agent, conv, _ = _make_agent(responses, tmp_path)
+    await agent.run("任务")
+    joined = "\n".join(_text_blocks(conv))
+    assert "声明与行为不一致" not in joined  # 软判据不自动核验
+    assert "步骤边界检查点" in joined  # 走 D54 既有自评路径
+    assert "完成判据：调研清楚" in joined

@@ -3,8 +3,9 @@
 M5 遗留补齐（v0.5.0 之后）：TestRunner 工具 + TestingEvent（tools/test_runner.py +
 engine/events.py）实现 §3.1 自测闭环；rules.py 实现 §3.6 规则量化；detect.py 实现
 §3.1 激活条件 2 的测试基建探测；checkpoints.py 实现 §3.3 双层检查点（声明驱动 +
-行为观察兜底）+ Replan 接入（D57：断路器反复触发 → 整体重写 todo）。错误模式
-沉淀（08）标注遗留。
+行为观察兜底）+ Replan 接入（D57：断路器反复触发 → 整体重写 todo）+ 行为观察①
+自动核验（D58：机械判据证据缺失 → 拦截「声明 vs 行为不一致」）。错误模式沉淀
+（08）标注遗留。
 """
 
 from kdagent.harness.checkpoints import (
@@ -13,10 +14,15 @@ from kdagent.harness.checkpoints import (
     REPLAN_TRIGGER_COUNT,
     STALE_TODO_THRESHOLD,
     CheckpointEvent,
+    VerificationKind,
     build_checkpoint_reminder,
     build_large_change_warning,
+    build_mismatch_reminder,
     build_replan_reminder,
     build_stale_todo_reminder,
+    classify_criteria,
+    file_target,
+    has_test_evidence,
     todo_progress,
 )
 from kdagent.harness.detect import detect_test_infra
@@ -38,12 +44,17 @@ __all__ = [
     "REINJECT_COOLDOWN",
     "REPLAN_TRIGGER_COUNT",
     "STALE_TODO_THRESHOLD",
+    "VerificationKind",
     "CheckpointEvent",
     "RuleStats",
     "build_checkpoint_reminder",
     "build_large_change_warning",
+    "build_mismatch_reminder",
     "build_replan_reminder",
     "build_stale_todo_reminder",
+    "classify_criteria",
+    "file_target",
+    "has_test_evidence",
     "todo_progress",
     "accept_criteria_written",
     "ToolCallRecord",

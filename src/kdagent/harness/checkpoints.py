@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from kdagent.tools.todo import format_todos
@@ -29,6 +31,55 @@ REINJECT_COOLDOWN = 3
 # Replan 判定信号（§3.3 Replan 机制，D57）：断路器连续触发 ≥ N 次 =
 # 路径反复受阻不可行 → 注入 Replan 引导（整体重写 todo 而非硬着头皮）
 REPLAN_TRIGGER_COUNT = 2
+
+# ---- 行为观察①：声明 vs 行为不一致的自动核验（§3.3 第二层①，D58） ----
+
+# 机械判据类型（§3.2 引导的「可机械验证」判据形式）
+class VerificationKind(StrEnum):
+    TEST = "test"  # 判据要求测试通过 → 证据 = 会话跑过测试
+    FILE = "file"  # 判据要求文件存在 → 证据 = 文件系统当前状态
+    SOFT = "soft"  # 软判据 → 不自动核验，靠自评（D54 既有路径）
+
+
+# 测试类判据关键词（小写匹配；英文不取裸 test——「改 test_x.py」会误判）
+_TEST_KEYWORDS = ("测试", "用例", "单测", "pytest", "tox", "nosetests", "跑通")
+# file 类判据提取目标文件路径：判据里第一个类路径 token（容忍 ./ 与 \ 分隔）
+_FILE_PATTERN = re.compile(r"[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,8}")
+
+
+def classify_criteria(criteria: str) -> VerificationKind:
+    """判据文本 → 自动核验类型。
+
+    test：含测试关键词（「测试全绿」/「pytest 通过」）→ 证据 = 会话跑过测试。
+    file：要求文件存在/创建且含路径 → 证据 = 文件系统当前状态。
+    其余（探索型自评判据）→ soft，不自动核验。
+    """
+    text = criteria.lower()
+    if any(k in text for k in _TEST_KEYWORDS):
+        return VerificationKind.TEST
+    if ("存在" in text or "创建" in text) and _FILE_PATTERN.search(criteria):
+        return VerificationKind.FILE
+    return VerificationKind.SOFT
+
+
+def file_target(criteria: str) -> str | None:
+    """file 类判据 → 目标文件路径（判据里第一个类路径 token，无则 None）。"""
+    m = _FILE_PATTERN.search(criteria)
+    return m.group(0) if m else None
+
+
+def has_test_evidence(tool_names: list[str], bash_commands: list[str]) -> bool:
+    """行为证据（第二层① test 类）：会话是否跑过测试。
+
+    TestRunner 工具调用（12 §3.1）直接算证据；Bash 命令含 pytest/tox/nosetests
+    也算。其余（只 ReadFile / 没跑过测试）→ 无证据 = 声明与行为不一致。
+    """
+    if "TestRunner" in tool_names:
+        return True
+    return any(
+        re.search(r"\b(pytest|tox|nosetests)\b", cmd, re.IGNORECASE)
+        for cmd in bash_commands
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +182,25 @@ def build_replan_reminder(todos: list[dict[str, Any]]) -> str:
         f"路径反复受阻：工具已连续 {REPLAN_TRIGGER_COUNT} 次触发失败熔断，当前做法走不通。"
         "请 Replan——整体重写 todo（废弃旧列表，不修补），重新拆解步骤换路径，"
         "不要在同一方向上硬着头皮重试。当前 todo 快照：\n"
+        + format_todos(todos)
+        + "\n</system-reminder>"
+    )
+
+
+def build_mismatch_reminder(
+    event: CheckpointEvent, todos: list[dict[str, Any]], reason: str
+) -> str:
+    """行为观察①：声明 vs 行为不一致 → 拦截警告（§3.3 第二层①，D58）。
+
+    步骤边界 agent 声称完成（task 标 completed），但机械判据的证据缺失——
+    判据要求测试通过却未跑测试 / 判据要求文件存在却不存在。比自检 reminder
+    更尖锐：拦截完成声明，要求补证据后重新报站；含完整 todo 快照对表。
+    """
+    return (
+        "<system-reminder>\n"
+        f"声明与行为不一致：刚标记完成「{event.task_content}」（目标：{event.todo_content}），"
+        f"完成判据「{event.accept_criteria}」的证据缺失——{reason}。"
+        "请补足证据后重新核验，再在 todo 中报站。当前快照：\n"
         + format_todos(todos)
         + "\n</system-reminder>"
     )

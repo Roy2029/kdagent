@@ -48,10 +48,16 @@ from kdagent.harness.checkpoints import (
     REINJECT_COOLDOWN,
     REPLAN_TRIGGER_COUNT,
     STALE_TODO_THRESHOLD,
+    CheckpointEvent,
+    VerificationKind,
     build_checkpoint_reminder,
     build_large_change_warning,
+    build_mismatch_reminder,
     build_replan_reminder,
     build_stale_todo_reminder,
+    classify_criteria,
+    file_target,
+    has_test_evidence,
     todo_progress,
 )
 from kdagent.hooks.engine import HookEngine
@@ -756,7 +762,13 @@ class Agent:
                 self._last_todos = todos
                 self._turns_since_todo_update = 0
                 if event is not None:
-                    reminder = build_checkpoint_reminder(event, todos)
+                    # 行为观察①（D58）：机械判据自动核验——证据缺失则声明 vs 行为
+                    # 不一致，拦截警告替代自检；软判据走 D54 既有自评路径。
+                    mismatch = self._verify_step_boundary(event)
+                    if mismatch is not None:
+                        reminder = mismatch
+                    else:
+                        reminder = build_checkpoint_reminder(event, todos)
                     self._conversation.add_user_message("", extra_blocks=[TextBlock(reminder)])
                     self._notify_conversation_change()
         else:
@@ -801,3 +813,45 @@ class Agent:
                     if isinstance(todos, list):
                         return todos
         return None
+
+    def _verify_step_boundary(self, event: CheckpointEvent) -> str | None:
+        """行为观察①（D58）：机械判据自动核验步骤边界产出。
+
+        classify_criteria 定类型 → 收集本会话行为证据 → 证据缺失返回拦截警告
+        （声明 vs 行为不一致，替代 D54 自检）；证据齐全/软判据 → None 走既有路径。
+        """
+        kind = classify_criteria(event.accept_criteria)
+        if kind == VerificationKind.TEST:
+            tool_names, bash_commands = self._evidence_from_conversation()
+            if not has_test_evidence(tool_names, bash_commands):
+                return build_mismatch_reminder(
+                    event,
+                    self._last_todos or [],
+                    "判据要求测试通过，但本会话未跑过测试",
+                )
+        elif kind == VerificationKind.FILE:
+            target = file_target(event.accept_criteria)
+            if target is not None and not (self._work_dir / target).exists():
+                return build_mismatch_reminder(
+                    event,
+                    self._last_todos or [],
+                    f"判据要求文件 {target} 存在，但该文件不存在",
+                )
+        return None
+
+    def _evidence_from_conversation(self) -> tuple[list[str], list[str]]:
+        """收集本会话工具调用名 + Bash 命令（行为观察① 的证据源，读会话）。"""
+        tool_names: list[str] = []
+        bash_commands: list[str] = []
+        for msg in self._conversation.messages:
+            if msg.role != "assistant":
+                continue
+            for block in msg.content:
+                if not isinstance(block, ToolUseBlock):
+                    continue
+                tool_names.append(block.name)
+                if block.name == "Bash":
+                    cmd = block.input.get("command")
+                    if isinstance(cmd, str):
+                        bash_commands.append(cmd)
+        return tool_names, bash_commands
