@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, TypeAlias
+from typing import Any, ClassVar, Literal, TypeAlias
 
 from kdagent.engine.llm.base import Usage
 
@@ -89,6 +89,22 @@ class MaxIterationsReachedEvent(AgentEvent):
     """迭代上限强制停止。"""
 
     limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class TestingEvent(AgentEvent):
+    """12 测试闭环：一次 TestRunner 执行的结构化结果（05 可渲染「正在跑测试…」）。
+
+    status：passed / failed / regression_detected（主测试过但回归挂 = Pass2Pass 被碰坏）；
+    failed_tests：从输出解析的失败测试名（归因起点）；summary：结构化摘要。
+    """
+
+    status: Literal["passed", "failed", "regression_detected"]
+    test_cmd: str
+    failed_tests: tuple[str, ...]
+    summary: str
+
+    __test__: ClassVar[bool] = False  # 抑制 pytest 误收集（类名以 Testing 开头）
 
 
 @dataclass(frozen=True, slots=True)

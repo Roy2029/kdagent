@@ -10,7 +10,8 @@ M1-c 能跑档范围：
   工具不存在→errorResult 不终止
 - 断路器（§3.5 工具失败部分）：连续 3 次失败注入 system-reminder
 
-后续接入：01 ContextManager（M2，payload 组装与压缩）、06 权限确认（M3）、12 TestingEvent（M5）。
+后续接入：01 ContextManager（M2，payload 组装与压缩）、06 权限确认（M3）、
+12 TestingEvent（M5 遗留补齐）。
 """
 
 from __future__ import annotations
@@ -63,7 +64,12 @@ CONCURRENCY_LIMIT = 5  # T11：并发批上限初值，待实测校准
 CIRCUIT_BREAK_LIMIT = 3  # 连续失败挂起阈值（规格 02 §3.5）
 
 # M1-c 用默认 system prompt；`01` assemble_system_prompt 组装管线 M2 接入
-DEFAULT_SYSTEM_PROMPT = "你是 KDAgent，一个终端编码助手。自主完成任务，按需调用工具。"
+# 12 §3.4 常驻核心铁律（便宜，每轮在）：测试自测与修复规矩，防「看起来干完」。
+DEFAULT_SYSTEM_PROMPT = (
+    "你是 KDAgent，一个终端编码助手。自主完成任务，按需调用工具。"
+    "修改代码后应运行测试自测（TestRunner 工具）；测试失败必须基于失败信息"
+    "修复后重跑，不得绕开测试或伪造通过。"
+)
 
 _CIRCUIT_REMINDER = "[system-reminder] 已连续失败 3 次，需重新评估策略再继续"
 
@@ -535,6 +541,7 @@ class Agent:
             tool_use_id=tool_use.id,
             confirm=self._confirm,
             todos=self._todos,
+            events=self._events,  # 12 测试闭环：TestRunner 结构化结果 → 事件流
         )
         telemetry = self._telemetry
         # 06 M3 可控档：五层裁决。checker 存在时接管 require_confirm（升级为完整

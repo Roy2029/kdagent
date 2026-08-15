@@ -4,6 +4,7 @@ from kdagent.tools.base import Tool, ToolContext, ToolResult
 from kdagent.tools.filesystem import EditFile, Glob, Grep, ReadFile, WriteFile
 from kdagent.tools.registry import ToolRegistry
 from kdagent.tools.shell import Bash
+from kdagent.tools.test_runner import TestRunner, parse_failed_tests
 from kdagent.tools.todo import TodoWrite
 
 
@@ -21,6 +22,7 @@ __all__ = [
     "Glob",
     "Grep",
     "ReadFile",
+    "TestRunner",
     "Tool",
     "ToolContext",
     "ToolRegistry",
@@ -28,4 +30,5 @@ __all__ = [
     "TodoWrite",
     "WriteFile",
     "build_default_registry",
+    "parse_failed_tests",
 ]

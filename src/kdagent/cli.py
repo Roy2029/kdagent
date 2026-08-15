@@ -20,6 +20,7 @@ from kdagent.engine.agent import DEFAULT_SYSTEM_PROMPT
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, LLMStreamEvent, Payload, ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
+from kdagent.harness import detect_test_infra
 from kdagent.hooks.engine import HookEngine
 from kdagent.mcp.manager import MCPManager
 from kdagent.mcp.search import ToolSearch
@@ -44,7 +45,7 @@ from kdagent.subagent import (
 from kdagent.subagent import (
     Agent as AgentTool,
 )
-from kdagent.tools import build_default_registry
+from kdagent.tools import TestRunner, build_default_registry
 from kdagent.ui.app import KDApp
 
 
@@ -167,6 +168,9 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     # 10 M5-b Worktree：空间隔离工作目录（§3.10-3.13）。目录在仓库内
     # `.kdagent/worktrees/`（已 .gitignore）；过期清理 fail-closed 不丢成果。
     worktree_manager = WorktreeManager(work_dir, kd_dir / "worktrees")
+    # 12 Harness 测试闭环：TestRunner 工具（隔离沙箱跑测试 + 结构化 TestingEvent）。
+    # resolve_worktree 注入 worktree_manager.path（解耦 tools→subagent 包循环）。
+    registry.register(TestRunner(worktree_manager.path))
     # 10 M5-d SendMessage：命名 Agent 注册表 + 消息投递工具。命名 Agent 存活到
     # 会话结束（注册即常驻），SendMessage 投递新任务唤醒继续。
     named_manager = NamedAgentManager(subagent_runner)
@@ -184,6 +188,12 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     registry.register(TaskCreate(task_manager, agent_manager))
     registry.register(TaskUpdate(task_manager))
     registry.register(SendMessage(named_manager))
+    # 12 §3.1 激活条件 2：探测到测试基建 → 启动注入「改后自测」提醒（T32 提示词
+    # 引导，非强制门禁）。启动探测一次，低频变化不进 system 字段（前缀缓存友好）。
+    infra_reminder = detect_test_infra(work_dir)
+    system_prompt = DEFAULT_SYSTEM_PROMPT
+    if infra_reminder:
+        system_prompt = f"{system_prompt}\n\n{infra_reminder}"
     return KDApp(
         config=config,
         llm=llm,
@@ -191,6 +201,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         tools=registry,
         work_dir=work_dir,
         sessions_dir=kd_dir / "sessions",
+        system_prompt=system_prompt,
         model_name=model,
         obs_dir=kd_dir / "obs",
         context_manager=ContextManager(

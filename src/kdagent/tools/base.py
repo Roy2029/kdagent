@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from kdagent.config import Config
+from kdagent.engine.events import AgentEventSink
 
 # 05 UI 提供的确认钩子：工具名 + 参数 → 是否放行。async，因为确认对话框要等用户输入。
 AsyncConfirm: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[bool]]
@@ -42,6 +43,9 @@ class ToolContext:
     tool_use_id: str = ""
     confirm: AsyncConfirm | None = None
     todos: TodosCallback | None = None
+    # 12 测试闭环：TestRunner 结构化结果 → 事件流（05 可渲染「正在跑测试」）。
+    # 由 02 `_exec_one` 注入 agent 的 events sink；None = 未接线（纯工具测试）。
+    events: AgentEventSink | None = None
     # 01 §5.2 L1 落盘目录（{sessions_dir}/{sid}/tool-results/），ReadFile 读回豁免用
     persist_dir: Path | None = None
 
