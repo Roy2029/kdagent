@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -80,6 +82,15 @@ def _agent_tool(repo: Path, llm: FakeLLM) -> tuple[AgentTool, WorktreeManager]:
 
 class _Ctx:
     tool_use_id = "c1"
+
+
+async def _wait_until(pred: Callable[[], bool], timeout: float = 2.0) -> None:
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if pred():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("超时")
 
 
 # ---- slug 验证 ----
@@ -243,6 +254,32 @@ def test_session_load_drops_missing_dir(repo: Path) -> None:
     assert _manager(repo).get("agent-abc") is None  # 孤儿丢弃
 
 
+# ---- 创建后设置（§3.11，M5-c） ----
+
+def test_post_create_copies_worktreeinclude(repo: Path) -> None:
+    """.worktreeinclude 声明的文件复制进 worktree（.env 最典型，A 项）。"""
+    (repo / ".worktreeinclude").write_text(".env\n# 注释行\n", encoding="utf-8")
+    (repo / ".env").write_text("KEY=value\n", encoding="utf-8")
+    wt = _manager(repo).create("agent-abc")
+    assert (Path(wt.path) / ".env").read_text(encoding="utf-8") == "KEY=value\n"
+    assert not (Path(wt.path) / "missing.txt").exists()  # 未声明不复制
+
+
+def test_post_create_symlinks_best_effort(repo: Path) -> None:
+    """symlink_directories（C 项）：软链大依赖目录；失败仅跳过不中断创建。"""
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "pkg").write_text("x\n", encoding="utf-8")
+    wm = WorktreeManager(
+        repo, repo / ".kdagent" / "worktrees", symlink_directories=("node_modules",)
+    )
+    wt = wm.create("agent-abc")  # 不抛
+    dst = Path(wt.path) / "node_modules"
+    if dst.exists():
+        # Windows 权限允许时软链成功 → 内容指向主仓库；否则 best-effort 跳过
+        assert (dst / "pkg").read_text(encoding="utf-8") == "x\n"
+    wm.remove("agent-abc")
+
+
 # ---- 与 SubAgent 配合（§3.12） ----
 
 @pytest.mark.asyncio
@@ -283,14 +320,46 @@ async def test_worktree_isolation_keeps_on_write(repo: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_worktree_isolation_background_rejected(repo: Path) -> None:
-    tool, _ = _agent_tool(repo, FakeLLM([done("x")]))
+async def test_worktree_isolation_background_cleans_after_done(repo: Path) -> None:
+    """后台 + worktree（M5-c）：启动返回 task id + worktree 信息，终态钩子自动清理。"""
+    tool, wm = _agent_tool(repo, FakeLLM([done("后台独立目录完成")]))
     r = await tool.execute(
         _Ctx(), {"prompt": "p", "description": "d", "subagent_type": "explore",
                  "isolation": "worktree", "run_in_background": True}
     )
-    assert r.is_error
-    assert "M5-c" in r.content
+    assert not r.is_error
+    assert "task-1" in r.content
+    assert "已后台启动（独立 worktree）" in r.content
+    assert "worktree-agent-" in r.content  # 分支名提示
+    assert len(wm.list()) == 1  # worktree 创建了
+    task = tool._task_manager.get("task-1")
+    assert task is not None
+    await _wait_until(lambda: task.status in ("completed", "failed"))
+    assert task.status == "completed"
+    assert wm.list() == []  # 无变更，终态钩子自动清理
+
+
+@pytest.mark.asyncio
+async def test_worktree_background_keeps_on_write(repo: Path) -> None:
+    """后台 + worktree 有变更 → 保留 + 保留信息追加进任务结果。"""
+    tool, wm = _agent_tool(
+        repo,
+        FakeLLM([tool_call("Bash", {"command": "touch new.txt"}), done("改完了")]),
+    )
+    r = await tool.execute(
+        _Ctx(), {"prompt": "改", "description": "d", "subagent_type": "general-purpose",
+                 "isolation": "worktree", "run_in_background": True}
+    )
+    assert not r.is_error
+    task = tool._task_manager.get("task-1")
+    assert task is not None
+    await _wait_until(lambda: task.status in ("completed", "failed"))
+    assert task.status == "completed"
+    assert len(wm.list()) == 1  # 保留
+    assert "Worktree 保留于" in task.result  # 保留信息已追加进任务结果
+    wt = wm.list()[0]
+    assert (Path(wt.path) / "new.txt").exists()
+    wm.remove(wt.name, force=True)
 
 
 @pytest.mark.asyncio

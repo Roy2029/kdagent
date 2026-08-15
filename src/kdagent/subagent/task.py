@@ -15,14 +15,17 @@ Task 工具（4 个内置）：TaskList / TaskGet / TaskCreate（给 Hook 用）
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import Usage
 from kdagent.engine.messages import TextBlock
+from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.runner import SubAgentResult, SubAgentRunner
 from kdagent.tools.base import ToolContext, ToolResult
@@ -45,6 +48,8 @@ class BackgroundTask:
     start_time: float = 0.0
     end_time: float = 0.0
     cancel: Callable[[], None] = lambda: None
+    work_dir: str | None = None  # worktree 隔离时子 Agent 的 cwd（10 §3.12，M5-c）
+    on_complete: Callable[[BackgroundTask], None] | None = None  # 完成/失败/取消后回调
 
     @property
     def duration_s(self) -> float:
@@ -81,50 +86,75 @@ class TaskManager:
         *,
         model: str = "",
         background: bool = True,
+        work_dir: Path | None = None,
+        on_complete: Callable[[BackgroundTask], None] | None = None,
     ) -> BackgroundTask:
         """在后台协程跑 RunToCompletion；立即返回 task 供轮询。
 
         `cancel` 绑定到 asyncio.Task.cancel——用户/主 Agent 可随时中断。
+        `work_dir` 覆盖子 Agent cwd（worktree 隔离，10 §3.12 M5-c）；`on_complete`
+        在任务终态（完成/失败/取消）回调——Worktree 清理钩子，可往 bt.result 追加信息。
         """
         self._counter += 1
         task_id = f"task-{self._counter}"
         bt = BackgroundTask(
-            id=task_id, definition=definition, task=task, start_time=time.perf_counter()
+            id=task_id,
+            definition=definition,
+            task=task,
+            start_time=time.perf_counter(),
+            work_dir=str(work_dir) if work_dir is not None else None,
+            on_complete=on_complete,
         )
         self._tasks[task_id] = bt
 
+        started = False  # 哨兵：协程体是否已开始执行（取消竞态判定基准）
+
         async def _run() -> None:
+            nonlocal started
+            started = True
             try:
                 result: SubAgentResult = await self._runner.run_to_completion(
                     definition,
                     task,
                     model=model,
                     background=background,
+                    work_dir=Path(bt.work_dir) if bt.work_dir else None,
                 )
+                bt.status = "completed" if not result.is_error else "failed"
+                bt.result = result.error or result.text
+                bt.is_error = result.is_error
+                bt.usage = result.usage
+                bt.turns = result.turns
             except asyncio.CancelledError:
                 bt.status = "failed"
                 bt.result = "（任务被取消）"
-                bt.end_time = time.perf_counter()
-                return
+                bt.is_error = True
             except Exception as exc:
                 bt.status = "failed"
                 bt.result = f"执行异常：{exc}"
                 bt.is_error = True
+            finally:
                 bt.end_time = time.perf_counter()
+                if bt.on_complete is not None:
+                    with contextlib.suppress(Exception):
+                        bt.on_complete(bt)  # 清理钩子失败不阻断任务终态
                 self._notify(bt)
-                return
-            bt.status = "completed" if not result.is_error else "failed"
-            bt.result = result.error or result.text
-            bt.is_error = result.is_error
-            bt.usage = result.usage
-            bt.turns = result.turns
-            bt.end_time = time.perf_counter()
-            self._notify(bt)
 
         runner_task = asyncio.create_task(_run())
 
         def _cancel() -> None:
             runner_task.cancel()
+            if not started:
+                # 协程体尚未开始即被取消：_run 的 finally 不会执行（M5-c 竞态），
+                # 同步补终态 + 钩子 + 通知，避免 status 永久卡在 running。
+                bt.end_time = time.perf_counter()
+                bt.status = "failed"
+                bt.result = "（任务被取消）"
+                bt.is_error = True
+                if bt.on_complete is not None:
+                    with contextlib.suppress(Exception):
+                        bt.on_complete(bt)
+                self._notify(bt)
 
         bt.cancel = _cancel
         return bt
@@ -257,8 +287,9 @@ class TaskCreate:
     category = "system"
     require_confirm = False
 
-    def __init__(self, manager: TaskManager) -> None:
+    def __init__(self, manager: TaskManager, agent_manager: AgentManager | None = None) -> None:
         self._manager = manager
+        self._agent_manager = agent_manager
 
     def is_read_only(self) -> bool:
         return False
@@ -281,12 +312,19 @@ class TaskCreate:
         manager = self._manager
         manager._counter += 1
         task_id = f"task-{manager._counter}"
+        type_name = str(input.get("type", ""))
+        # type 若匹配已注册 Agent 类型 → 用其定义（description/system_prompt 有意义）；
+        # 否则通用外部任务条目（M5-c：definition 校验落在 agent_manager.validate_type）。
         definition = AgentDef(
-            name=str(input.get("type", "")),
+            name=type_name,
             description="外部登记任务",
             system_prompt="",
             max_turns=1,
         )
+        if self._agent_manager is not None and self._agent_manager.validate_type(type_name):
+            registered = self._agent_manager.get(type_name)
+            if registered is not None:
+                definition = registered
         bt = BackgroundTask(
             id=task_id,
             definition=definition,

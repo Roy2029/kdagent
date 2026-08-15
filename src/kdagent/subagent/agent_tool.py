@@ -22,7 +22,7 @@ from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.runner import FORK_SYSTEM_PROMPT, SubAgentRunner
 from kdagent.subagent.task import TaskManager
-from kdagent.subagent.worktree import WorktreeError, WorktreeManager
+from kdagent.subagent.worktree import Worktree, WorktreeError, WorktreeManager
 from kdagent.tools.base import ToolContext, ToolResult
 
 # Fork 定义（不落盘、运行时构造）：继承对话 + Boilerplate 覆盖父默认行为。
@@ -194,8 +194,8 @@ class Agent:
     ) -> ToolResult:
         """§3.12 execute_with_worktree：创建 → 注入通知 → 子 Agent 独立目录跑 → 自动清理。
 
-        后台 + worktree 隔离留 M5-c（任务完成回调里再清理，避免执行中被删）——
-        后台模式的隔离语义与前台不同，先明确拒绝不静默降级。
+        后台模式（M5-c）：创建后交 TaskManager 后台执行，`on_complete` 钩子在任务
+        终态清理——有变更保留并把保留信息追加进任务结果（经 TaskGet/通知可见）。
         """
         wm = self._worktree_manager
         if wm is None:
@@ -203,13 +203,6 @@ class Agent:
                 tool_use_id=ctx.tool_use_id,
                 name=self.name,
                 content="worktree 隔离不可用：WorktreeManager 未接线",
-                is_error=True,
-            )
-        if background:
-            return ToolResult(
-                tool_use_id=ctx.tool_use_id,
-                name=self.name,
-                content="后台 + worktree 隔离留 M5-c；本次请用前台执行或去掉 isolation",
                 is_error=True,
             )
         wt_name = "agent-" + uuid.uuid4().hex[:8]
@@ -221,6 +214,10 @@ class Agent:
                 name=self.name,
                 content=f"worktree 创建失败：{exc}",
                 is_error=True,
+            )
+        if background:
+            return self._start_worktree_background(
+                ctx, definition, prompt, model=model, wt=wt, wt_name=wt_name
             )
         result = await self._runner.run_to_completion(
             definition, _WORKTREE_NOTICE + "\n\n" + prompt, model=model, work_dir=Path(wt.path)
@@ -248,6 +245,47 @@ class Agent:
             content=content,
             is_error=result.is_error,
             duration_ms=duration_ms,
+        )
+
+    def _start_worktree_background(
+        self,
+        ctx: ToolContext,
+        definition: AgentDef,
+        prompt: str,
+        *,
+        model: str,
+        wt: Worktree,
+        wt_name: str,
+    ) -> ToolResult:
+        """后台 + worktree（M5-c）：TaskManager 后台执行，终态钩子清理 worktree。"""
+        wm = self._worktree_manager
+        assert wm is not None
+
+        def _cleanup(bt: Any) -> None:
+            try:
+                kept = wm.auto_cleanup(wt_name)
+            except WorktreeError:
+                kept = True  # 清理失败保守保留
+            if kept:
+                bt.result = (bt.result or "") + (
+                    f"\n[Worktree 保留于 {wt.path}，分支 {wt.branch}]"
+                )
+
+        task = self._task_manager.launch(
+            definition,
+            _WORKTREE_NOTICE + "\n\n" + prompt,
+            model=model,
+            work_dir=Path(wt.path),
+            on_complete=_cleanup,
+        )
+        return ToolResult(
+            tool_use_id=ctx.tool_use_id,
+            name=self.name,
+            content=(
+                f"[Agent {definition.name} 已后台启动（独立 worktree），task id={task.id}]\n"
+                f"worktree：{wt.path}（分支 {wt.branch}）\n"
+                "用 TaskList/TaskGet 查询状态与结果；完成后有变更则保留供 review。"
+            ),
         )
 
     def _started_result(

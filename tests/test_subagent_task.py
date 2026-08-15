@@ -10,6 +10,8 @@ from conftest import FakeLLM, done
 
 from kdagent.config import Config
 from kdagent.engine.conversation import ConversationManager
+from kdagent.subagent import BUILTIN_AGENTS_DIR
+from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.runner import SubAgentRunner
 from kdagent.subagent.task import (
@@ -146,6 +148,65 @@ async def test_task_create_and_update(tmp_path) -> None:
 
     r = await update_tool.execute(ctx, {"id": "task-999", "status": "completed"})
     assert r.is_error
+
+
+@pytest.mark.asyncio
+async def test_task_create_uses_registered_definition(tmp_path) -> None:
+    """TaskCreate type 匹配已注册 Agent → 用其真实定义（M5-c）。"""
+    manager = AgentManager([BUILTIN_AGENTS_DIR])
+    manager.scan()
+    mgr = _manager(tmp_path)
+    create_tool = TaskCreate(mgr, agent_manager=manager)
+    r = await create_tool.execute(_Ctx(), {"type": "explore", "task": "探索"})
+    assert "task-1" in r.content
+    task = mgr.get("task-1")
+    assert task is not None
+    assert task.definition.name == "explore"
+    assert task.definition.system_prompt != ""  # 真实定义（非空占位）
+
+
+@pytest.mark.asyncio
+async def test_task_create_unknown_type_falls_back(tmp_path) -> None:
+    """TaskCreate type 未匹配 → 通用外部任务条目占位定义。"""
+    manager = AgentManager([BUILTIN_AGENTS_DIR])
+    manager.scan()
+    mgr = _manager(tmp_path)
+    create_tool = TaskCreate(mgr, agent_manager=manager)
+    await create_tool.execute(_Ctx(), {"type": "build", "task": "跑构建"})
+    task = mgr.get("task-1")
+    assert task is not None
+    assert task.definition.name == "build"
+    assert task.definition.system_prompt == ""  # 占位
+
+
+@pytest.mark.asyncio
+async def test_launch_on_complete_called(tmp_path) -> None:
+    """on_complete 钩子在任务终态（完成/失败/取消）都会触发（M5-c）。"""
+    mgr = _manager(tmp_path)
+    called: list[str] = []
+
+    def _hook(bt) -> None:
+        called.append(bt.status)
+
+    task = mgr.launch(EXPLORE, "任务", on_complete=_hook)
+    await _wait_until(lambda: task.status in ("completed", "failed"))
+    assert called == ["completed"]
+
+
+@pytest.mark.asyncio
+async def test_launch_on_complete_called_on_cancel(tmp_path) -> None:
+    """取消路径：on_complete 依然触发（终态钩子统一在 finally）。"""
+    mgr = _manager(tmp_path)
+    called: list[str] = []
+
+    def _hook(bt) -> None:
+        called.append(bt.status)
+
+    task = mgr.launch(EXPLORE, "任务", on_complete=_hook)
+    task.cancel()
+    await _wait_until(lambda: task.status in ("completed", "failed"))
+    assert called == ["failed"]
+    assert task.is_error
 
 
 @pytest.mark.asyncio

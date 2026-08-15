@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -94,6 +95,7 @@ class WorktreeManager:
         *,
         max_age: float = 3600.0,
         temp_prefix: str = DEFAULT_TEMP_PREFIX,
+        symlink_directories: tuple[str, ...] = (),
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
         self.worktree_dir = (
@@ -103,6 +105,9 @@ class WorktreeManager:
         )
         self.max_age = max_age  # 过期清理：临时命名 + 超过此秒数才进入候选
         self.temp_prefix = temp_prefix
+        # 创建后设置 C（10 §3.11）：软链大依赖目录（node_modules/.venv）到 worktree。
+        # Windows 软链需管理员/开发者模式 → best-effort，失败仅警告不中断。
+        self.symlink_directories = symlink_directories
         self._session_file = self.worktree_dir / "worktree_session.json"
         self._active: dict[str, Worktree] = {}
         self._load()
@@ -137,8 +142,51 @@ class WorktreeManager:
             created=time.time(),
         )
         self._active[name] = wt
+        self._apply_post_create(path)
         self._save()
         return wt
+
+    # ---- 创建后设置（§3.11，只对新建） ----
+
+    def _apply_post_create(self, wt_path: Path) -> None:
+        """A 复制被忽略但需要的文件（.worktreeinclude 声明）+ C 软链大依赖目录。
+
+        best-effort：任何一项失败不阻断 worktree 使用（隔离执行不受影响）。
+        `.worktreeinclude` 语义 = gitignore 语法的路径清单（.env 最典型）；复制的
+        文件必须是主仓库已 ignore 的，否则会让 worktree 永久「有变更」（status 脏）。
+        """
+        self._copy_included(wt_path)
+        for rel in self.symlink_directories:
+            src = self.repo_root / rel
+            dst = wt_path / rel
+            if not src.is_dir() or dst.exists():
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(src, dst, target_is_directory=True)
+            except OSError:
+                continue  # Windows 权限不足 → best-effort 跳过
+
+    def _copy_included(self, wt_path: Path) -> None:
+        inc = self.repo_root / ".worktreeinclude"
+        if not inc.is_file():
+            return
+        for raw in inc.read_text(encoding="utf-8").splitlines():
+            rel = raw.strip()
+            if not rel or rel.startswith("#"):
+                continue
+            src = self.repo_root / rel
+            dst = wt_path / rel
+            if not src.exists() or dst.exists():
+                continue
+            try:
+                if src.is_dir():
+                    shutil.copytree(src, dst)
+                else:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, dst)
+            except OSError:
+                continue
 
     # ---- 查询 ----
 

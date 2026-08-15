@@ -167,7 +167,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     )
     registry.register(TaskList(task_manager))
     registry.register(TaskGet(task_manager))
-    registry.register(TaskCreate(task_manager))
+    registry.register(TaskCreate(task_manager, agent_manager))
     registry.register(TaskUpdate(task_manager))
     return KDApp(
         config=config,
