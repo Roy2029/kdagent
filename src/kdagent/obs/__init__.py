@@ -4,15 +4,20 @@ M2 范围：日志/trace 落盘（§3.1-3.4/3.9）；metrics 聚合与可视化�
 """
 
 from kdagent.obs.exporters import JsonlExporter, OTLPSpanExporter, SpanExporter
+from kdagent.obs.metrics import SessionMetrics, ToolStat, aggregate_metrics, session_metrics
 from kdagent.obs.model import Span, SpanLog, Trace
 from kdagent.obs.telemetry import Telemetry
 
 __all__ = [
     "JsonlExporter",
     "OTLPSpanExporter",
+    "SessionMetrics",
     "Span",
     "SpanExporter",
     "SpanLog",
     "Telemetry",
+    "ToolStat",
     "Trace",
+    "aggregate_metrics",
+    "session_metrics",
 ]

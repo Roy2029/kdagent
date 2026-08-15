@@ -24,7 +24,7 @@ import re
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from kdagent.context.history import PersistedOutput, ProcessedToolResult
 from kdagent.engine.conversation import ConversationManager
@@ -37,10 +37,15 @@ from kdagent.engine.messages import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from kdagent.obs.model import Span
-from kdagent.obs.telemetry import Telemetry
 from kdagent.sessions.records import TodoItemRecord
 from kdagent.tools.base import ToolResult
+
+# 运行时零 obs 依赖（D69 曾直接 import 触发 obs→compactor→obs 循环：obs/metrics 聚合
+# 消费 estimate_token_cost，compactor 又反向 import obs/telemetry）。类型注解经
+# `from __future__ import annotations` 惰性求值，TYPE_CHECKING 足够，span 走 duck type。
+if TYPE_CHECKING:
+    from kdagent.obs.model import Span
+    from kdagent.obs.telemetry import Telemetry
 
 _CHARS_PER_TOKEN = 4  # 字符/token 启发式（对齐 L1 的 50K 字符 ≈ 12.5K token 注释）
 
