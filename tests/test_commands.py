@@ -45,6 +45,7 @@ TEST_COMMAND_NAMES = [
     "tasks",  # 10 M5-a：后台任务便捷列表
     "worktree",  # 10 M5-b：隔离工作目录 list/remove/cleanup
     "eval",  # 11 §3.4 TUI 版：/eval report <run_id> 打开评测报告屏
+    "metrics",  # 07 §3.7 T9：/metrics 打开聚合指标面板
 ]
 
 

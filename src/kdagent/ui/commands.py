@@ -45,6 +45,8 @@ class UIController(Protocol):
     def get_permission_mode(self) -> str: ...
     # 11 §3.4 TUI 版：/eval report <run_id> 打开评测报告屏（Textual Screen）。
     def open_eval_report(self, run_id: str) -> None: ...
+    # 07 §3.7 T9：/metrics 打开聚合指标面板（Textual Screen，只读）。
+    def open_metrics(self) -> None: ...
 
 
 @dataclass
@@ -502,6 +504,15 @@ def _cmd_eval(ctx: CommandContext) -> None:
     ctx.ui.open_eval_report(parts[1])
 
 
+def _cmd_metrics(ctx: CommandContext) -> None:
+    """07 §3.7 T9：/metrics 打开聚合指标面板（方案 A，只读查看）。
+
+    token/LLM/工具/压缩/权限/Hook/成本，数据层 D70 聚合（obs_dir 未启用时由
+    App 提示不叠屏）。
+    """
+    ctx.ui.open_metrics()
+
+
 def _cmd_permissions(ctx: CommandContext) -> None:
     mode = ctx.ui.get_permission_mode()
     if not ctx.args:
@@ -604,6 +615,15 @@ def build_default_commands() -> CommandRegistry:
             usage="/eval report <run_id>",
             type="local",
             handler=_cmd_eval,
+        )
+    )
+    registry.register(
+        Command(
+            name="metrics",
+            description="可观测性指标（07 §3.7）：token/LLM/工具/压缩/权限/Hook/成本",
+            usage="/metrics",
+            type="local",
+            handler=_cmd_metrics,
         )
     )
     registry.register(

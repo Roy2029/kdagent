@@ -71,6 +71,7 @@ from kdagent.ui.commands import (
 )
 from kdagent.ui.confirm import ConfirmDialog, ExitDialog, PermissionDialog
 from kdagent.ui.evalreport import EvalReportScreen
+from kdagent.ui.metricsscreen import MetricsScreen
 from kdagent.ui.statusbar import StatusBar
 from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
@@ -262,6 +263,8 @@ class KDApp(App[None]):
         self._session = self._session_manager.create(conversation)
         # 07 埋点 sink（M2-d）：trace 落盘 {kdagent_dir}/obs/traces/{sid}/。
         self._telemetry = _build_telemetry(config, obs_dir)
+        # 07 §3.7 T9：/metrics 面板聚合源（obs_dir None = 未启用可观测性）。
+        self._obs_dir = obs_dir
         # 属性名不用 `_registry`：Textual 内部也有 `_registry`（其 CommandRegistry），
         # 同名会覆盖冲突（启动即崩）。
         self._commands = build_default_commands()
@@ -585,6 +588,14 @@ class KDApp(App[None]):
     def open_eval_report(self, run_id: str) -> None:
         """11 §3.4 TUI 版：`/eval report` 打开内嵌评测报告屏（只读浏览 + 批注）。"""
         self.push_screen(EvalReportScreen(run_id, self._work_dir))
+
+    def open_metrics(self) -> None:
+        """07 §3.7 T9：`/metrics` 打开聚合指标面板（obs 未启用时提示不叠屏）。"""
+        obs_dir = self._obs_dir
+        if obs_dir is None:
+            self.add_system_message("可观测性未启用（未指定 obs 目录），无法打开 /metrics 面板。")
+            return
+        self.push_screen(MetricsScreen(obs_dir, self._session.id))
 
     def set_permission_mode(self, mode: str) -> None:
         """切换五层裁决器模式（/permissions 命令；无 checker 时静默忽略）。"""
