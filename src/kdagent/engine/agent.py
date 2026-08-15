@@ -418,10 +418,21 @@ class Agent:
             index = self._memory_store.index_markdown()
             if index:
                 system = f"{system}\n\n{index}\n\n{MEMORY_USAGE_INSTRUCTION}"
+        # 09 §3.5 延迟加载：MCP 工具不进 tools 字段（数量不可控、token 省 ~85%），
+        # 名字进 system-reminder 提示用 ToolSearch 加载。改 reminder 不改 system
+        # → 前缀缓存不受影响。
+        tools, deferred_names = self._tools.payload_schemas()
+        if deferred_names:
+            listing = "\n".join(deferred_names)
+            reminder = (
+                "<system-reminder>\n以下工具可通过 ToolSearch 加载（名称精确指定 "
+                "或关键词搜索）：\n" + listing + "\n</system-reminder>"
+            )
+            system = f"{system}\n\n{reminder}"
         return Payload(
             system=system,
             messages=self._conversation.messages,
-            tools=self._tools.schemas(),
+            tools=tools,
             max_tokens=max_tokens,
         )
 

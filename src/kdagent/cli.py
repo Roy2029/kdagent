@@ -21,6 +21,8 @@ from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, LLMStreamEvent, Payload, ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
 from kdagent.hooks.engine import HookEngine
+from kdagent.mcp.manager import MCPManager
+from kdagent.mcp.search import ToolSearch
 from kdagent.memory.consolidator import MemoryConsolidator
 from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.store import build_memory_store
@@ -102,11 +104,17 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         llm,
         sessions_dir=kd_dir / "sessions",
     )
+    # 09 M4-c 工具生态：ToolSearch（延迟工具拉取）注册进 registry；
+    # MCP Server 连接在 KDApp on_mount 后台异步发起（启动即连接，失败隔离）。
+    registry = build_default_registry()
+    registry.register(ToolSearch(registry))
+    mcp_manager = MCPManager(registry)
+    mcp_manager.load_configs(config.mcp_servers if isinstance(config.mcp_servers, dict) else {})
     return KDApp(
         config=config,
         llm=llm,
         conversation=ConversationManager(),
-        tools=build_default_registry(),
+        tools=registry,
         work_dir=work_dir,
         sessions_dir=kd_dir / "sessions",
         model_name=model,
@@ -119,6 +127,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         memory_store=memory_store,
         memory_extractor=memory_extractor,
         memory_consolidator=memory_consolidator,
+        mcp_manager=mcp_manager,
     )
 
 

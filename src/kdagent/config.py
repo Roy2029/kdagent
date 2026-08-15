@@ -38,6 +38,9 @@ class Config:
     # （06 §3.10，HookEngine.load 的 `hooks:` 节）。
     permissions: dict[str, object] = field(default_factory=dict)
     hooks: list[object] = field(default_factory=list)
+    # 09 M4-c 工具生态：mcp_servers 段（server 名 → {command, args, env}），
+    # 三源合并 + 项目级覆盖用户级同名 Server（09 §3.2）。
+    mcp_servers: dict[str, object] = field(default_factory=dict)
 
 
 def load_config() -> Config:
@@ -68,6 +71,7 @@ def load_config() -> Config:
         obs=_dict("obs"),
         permissions=_dict("permissions"),
         hooks=_list("hooks"),
+        mcp_servers=_dict("mcp_servers"),
     )
 
 

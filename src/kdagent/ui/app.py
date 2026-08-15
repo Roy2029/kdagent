@@ -46,6 +46,7 @@ from kdagent.engine.events import (
 from kdagent.engine.llm.base import LLMClient, Usage
 from kdagent.hooks.engine import HookEngine
 from kdagent.hooks.engine_types import HookContext
+from kdagent.mcp.manager import MCPManager
 from kdagent.memory.consolidator import MemoryConsolidator
 from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.store import MemoryStore
@@ -238,6 +239,7 @@ class KDApp(App[None]):
         memory_store: MemoryStore | None = None,
         memory_extractor: MemoryExtractor | None = None,
         memory_consolidator: MemoryConsolidator | None = None,
+        mcp_manager: MCPManager | None = None,
     ) -> None:
         super().__init__()
         self._config = config
@@ -279,6 +281,8 @@ class KDApp(App[None]):
         # 06 M3 可控档：五层裁决器 + Hook 引擎（cli 装配传入，/permissions 切换模式）。
         self._permission_checker = permission_checker
         self._hooks = hooks
+        # 09 M4-c 工具生态：MCP Manager（启动即后台连接，on_unmount 关闭）。
+        self._mcp_manager = mcp_manager
         self._default_prompt = system_prompt
         self._agent_worker: Worker[Any] | None = None
         self._total_usage = Usage()
@@ -309,9 +313,15 @@ class KDApp(App[None]):
         self._input.focus()
         self._run_app_hook("startup")  # 06 §3.10：应用生命周期 hook
         self.refresh_status()
+        # 09 §3.3 启动即后台连接 MCP Server（失败隔离不阻止启动；懒连会造成
+        # 「不知道工具存在 → 不调用 → 永不连接」死循环）。
+        if self._mcp_manager is not None:
+            asyncio.create_task(self._mcp_manager.connect_all())
 
-    def on_unmount(self) -> None:
+    async def on_unmount(self) -> None:
         self._run_app_hook("shutdown")
+        if self._mcp_manager is not None:
+            await self._mcp_manager.aclose()
 
     # ---- 系统剪贴板（Textual 默认是进程内 _clipboard，不接系统剪贴板） -------
 
