@@ -38,6 +38,7 @@ from kdagent.engine.events import (
     PermissionRequestEvent,
     PermissionVerdict,
     StreamTextEvent,
+    TestingEvent,
     ToolResultEvent,
     ToolUseEvent,
     TurnCompleteEvent,
@@ -410,6 +411,10 @@ class KDApp(App[None]):
         elif isinstance(ev, MaxIterationsReachedEvent):
             chat.finish_stream()
             chat.append_error(f"达到迭代上限（{ev.limit} 轮），已强制停止。")
+        elif isinstance(ev, TestingEvent):
+            # 05 §5 239 / 02 §5 346：TestRunner 结构化结果三态渲染。
+            chat.finish_stream()
+            chat.append_testing(ev.status, ev.test_cmd, ev.failed_tests, ev.summary)
         elif isinstance(ev, PermissionRequestEvent):
             self._request_permission(ev)
 

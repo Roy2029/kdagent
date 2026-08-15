@@ -71,6 +71,34 @@ class ChatView(VerticalScroll):
         self.mount(Static(f"[bold red]✗ {escape(text)}[/bold red]", classes="chat-error"))
         self.scroll_end(animate=False)
 
+    def append_testing(
+        self,
+        status: str,
+        test_cmd: str,
+        failed_tests: tuple[str, ...],
+        summary: str,
+    ) -> None:
+        """TestRunner 结构化结果三态渲染（05 §5 239 / 02 §5 346）。
+
+        状态徽标 + 命令 + 失败测试名 + 输出尾一行。markup 一律 escape。
+        """
+        marker, label = {
+            "passed": ("✓", "测试通过"),
+            "failed": ("✗", "测试失败"),
+            "regression_detected": ("⚠", "回归检测"),
+        }.get(status, ("·", "测试"))
+        color = "green" if status == "passed" else "red" if status == "failed" else "yellow"
+        lines = [f"[bold {color}]{marker} {label}[/bold {color}] · {escape(test_cmd)}"]
+        if failed_tests:
+            lines.append("失败用例：" + "、".join(escape(t) for t in failed_tests))
+        tail = summary.splitlines()[-1] if summary else ""
+        if tail:
+            lines.append(f"[dim]{escape(tail)}[/dim]")
+        text = "\n".join(lines)
+        self.messages.append(text)
+        self.mount(Static(text, classes="chat-test"))
+        self.scroll_end(animate=False)
+
     def clear_messages(self) -> None:
         for widget in list(self.children):
             widget.remove()
