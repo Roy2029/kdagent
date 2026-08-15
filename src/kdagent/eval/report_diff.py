@@ -4,7 +4,8 @@
 / fail2fail / pass2pass——11 §3.5 迭代闭环：「只换一处，重跑，看那个具体现象还在不在」。
 数据源 = 跑批落盘的 report.json（D61 起 run_eval_cli 持久化），纯函数可单测。
 
-也承载单版本报表 `metrics_by_run`（§3.8：通过率/token/耗时；成本需计价表，MVP 不含）。
+也承载单版本报表 `metrics_by_run`（§3.8：通过率/token/耗时/估算成本——成本 D67 起按
+`CostParams` 计价，入/出/缓存命中分列）。
 """
 
 from __future__ import annotations
@@ -58,6 +59,11 @@ def load_report(work_dir: Path, run_id: str) -> EvalReport | None:
         total_turns=int(metrics_raw.get("total_turns", 0)),
         total_tokens=int(metrics_raw.get("total_tokens", 0)),
         wall_s=float(metrics_raw.get("wall_s", 0.0)),
+        # D67 计价明细：旧报告缺字段 → 默认 0（向后兼容）
+        input_tokens=int(metrics_raw.get("input_tokens", 0)),
+        output_tokens=int(metrics_raw.get("output_tokens", 0)),
+        cache_tokens=int(metrics_raw.get("cache_tokens", 0)),
+        cost_cny=float(metrics_raw.get("cost_cny", 0.0)),
     )
     return EvalReport(
         run_id=str(data.get("run_id", run_id)),
@@ -127,7 +133,7 @@ def render_run_diff(diff: RunDiff) -> str:
 
 
 def metrics_by_run(work_dir: Path, run_id: str) -> EvalReport:
-    """读单版本报告（§3.8 metrics_by_run；成本需计价表，MVP 不含）。"""
+    """读单版本报告（§3.8 metrics_by_run：通过率/token/耗时/成本——成本 D67 已含）。"""
     report = load_report(work_dir, run_id)
     if report is None:
         raise FileNotFoundError(f"找不到 run {run_id} 的报告：{report_path(work_dir, run_id)}")

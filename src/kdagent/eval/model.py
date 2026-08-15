@@ -52,8 +52,12 @@ class RunMetrics:
     resolved: int = 0
     passed_to_passed: int = 0  # PASS_TO_PASS 无损坏的题数
     total_turns: int = 0
-    total_tokens: int = 0
+    total_tokens: int = 0  # 输入+输出合计（向后兼容：旧报告只读它）
     wall_s: float = 0.0
+    input_tokens: int = 0  # 计价明细：输入
+    output_tokens: int = 0  # 计价明细：输出
+    cache_tokens: int = 0  # 计价明细：缓存命中（前缀缓存，D67）
+    cost_cny: float = 0.0  # 估算成本（元；CostParams 计价，D67 补齐 §3.8「成本需计价表」）
 
     @property
     def resolve_rate(self) -> float:
@@ -78,6 +82,12 @@ class EvalReport:
             f"轮次 {self.metrics.total_turns} · token {self.metrics.total_tokens} · "
             f"耗时 {self.metrics.wall_s:.1f}s",
         ]
+        if self.metrics.cost_cny > 0:
+            lines.append(
+                f"估算成本 {self.metrics.cost_cny:.4f} 元"
+                f"（入 {self.metrics.input_tokens} · 出 {self.metrics.output_tokens} · "
+                f"缓存 {self.metrics.cache_tokens}）"
+            )
         if self.resolved:
             lines.append("\n通过：" + "、".join(self.resolved))
         if self.failed:

@@ -96,6 +96,23 @@ class CostParams:
 DEFAULT_COST = CostParams()
 
 
+def estimate_token_cost(
+    input_tokens: int,
+    output_tokens: int,
+    cache_tokens: int,
+    cost: CostParams | None = None,
+) -> float:
+    """token → 估算成本（元）：输入×c_in + 输出×c_out + 缓存命中×c_hit，除百万。
+
+    纯函数、取 int 不依赖 Usage 类型（解耦）；01 T5-1 标定前用 DEFAULT_COST 典型区间。
+    评测 `metrics_by_run` 补成本（11 §3.8，D67）与 L2 压缩决策共用同一计价模型。
+    """
+    c = DEFAULT_COST if cost is None else cost
+    return (
+        input_tokens * c.c_in + output_tokens * c.c_out + cache_tokens * c.c_hit
+    ) / 1_000_000
+
+
 @dataclass(frozen=True, slots=True)
 class CompressedOutput:
     """L2 在线摘要结果（01 §8）：语义摘要 + 原文落盘路径 + 分类元信息。"""

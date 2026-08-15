@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from dataclasses import dataclass
@@ -14,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
+from kdagent.context.compactor import estimate_token_cost
 from kdagent.eval import EvalReport, EvalRunner, EvalTask, FailureCase, RunMetrics
+from kdagent.eval.report_diff import load_report, report_path
 from kdagent.eval.runner import sort_report_by_task_order
 from kdagent.subagent.model import AgentDef
 
@@ -57,6 +60,7 @@ def _base_commit(repo: Path) -> str:
 class _Usage:
     input_tokens: int = 10
     output_tokens: int = 5
+    cache_read_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -238,3 +242,77 @@ def test_sort_report_unknown_id_appends_last() -> None:
     report = EvalReport(run_id="r", tasks=tasks, resolved=["ghost", "t0"])
     sort_report_by_task_order(report, tasks)
     assert report.resolved == ["t0", "ghost"]
+
+
+# ---- 估算成本（D67，11 §3.8「成本需计价表」） ----
+
+def test_estimate_token_cost() -> None:
+    """纯函数：入×2 + 出×8 + 缓存×0.2（元/百万 token）。"""
+    # 1M 入 + 0.5M 出 + 0.25M 缓存 = 2.0 + 4.0 + 0.05 = 6.05 元
+    assert estimate_token_cost(1_000_000, 500_000, 250_000) == pytest.approx(6.05)
+
+
+class _CostRunner:
+    """鸭子类型 SubAgentRunner：固定 usage 供成本累积断言。"""
+
+    async def run_to_completion(
+        self, definition: object, task: str, *, work_dir: Path | None = None, **kw: object
+    ) -> _Result:
+        ((work_dir or Path(".")) / "flag.txt").write_text("fixed\n", encoding="utf-8")
+        return _Result(
+            usage=_Usage(input_tokens=1_000_000, output_tokens=500_000, cache_read_tokens=250_000)
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_accumulates_cost_metrics(repo: Path, tmp_path: Path) -> None:
+    """跑批累积计价明细：入/出/缓存分列 + 成本按 CostParams 计价。"""
+    ev = _make_ev(repo, tmp_path, _CostRunner(), _tasks(repo, 2))
+    report = await ev.run("run-cost", max_workers=2)
+    m = report.metrics
+    assert m.total_tokens == 3_000_000  # (1M+0.5M) × 2 题
+    assert m.input_tokens == 2_000_000
+    assert m.output_tokens == 1_000_000
+    assert m.cache_tokens == 500_000
+    assert m.cost_cny == pytest.approx(12.10)  # 6.05 × 2 题
+
+
+def test_summary_includes_cost() -> None:
+    report = EvalReport(
+        run_id="r",
+        metrics=RunMetrics(
+            total=1, resolved=1, total_tokens=1_500_000,
+            input_tokens=1_000_000, output_tokens=500_000, cost_cny=6.05,
+        ),
+    )
+    s = report.summary()
+    assert "估算成本 6.0500 元" in s
+    assert "缓存 0" in s
+
+
+def test_summary_omits_zero_cost() -> None:
+    """旧报告无 cost → 不显示成本行（向后兼容）。"""
+    s = EvalReport(run_id="r", metrics=RunMetrics(total=1, resolved=1)).summary()
+    assert "估算成本" not in s
+
+
+def test_load_report_backcompat(tmp_path: Path) -> None:
+    """旧 report.json 无计价字段 → 读入默认 0，不崩。"""
+    run_id = "old-run"
+    path = report_path(tmp_path, run_id)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "resolved": ["t0"],
+                "metrics": {"total": 1, "resolved": 1, "total_tokens": 100},
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = load_report(tmp_path, run_id)
+    assert report is not None
+    assert report.metrics.total_tokens == 100
+    assert report.metrics.input_tokens == 0
+    assert report.metrics.cost_cny == 0.0

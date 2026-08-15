@@ -23,6 +23,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
+from kdagent.context.compactor import estimate_token_cost
 from kdagent.eval.model import (
     EvalReport,
     EvalTask,
@@ -248,9 +249,15 @@ class EvalRunner:
             if token is not None and self._telemetry is not None:
                 self._telemetry.reset_trace_attributes(token)
         model_patch = extract_patch(sealed)
+        usage = result.usage
         report.metrics.total_turns += result.turns
-        report.metrics.total_tokens += (
-            result.usage.input_tokens + result.usage.output_tokens
+        report.metrics.total_tokens += usage.input_tokens + usage.output_tokens
+        # 计价明细（D67）：输入/输出/缓存命中分开累积，成本按 CostParams 计价
+        report.metrics.input_tokens += usage.input_tokens
+        report.metrics.output_tokens += usage.output_tokens
+        report.metrics.cache_tokens += usage.cache_read_tokens
+        report.metrics.cost_cny += estimate_token_cost(
+            usage.input_tokens, usage.output_tokens, usage.cache_read_tokens
         )
         test_passed: bool | None = None
         if task.test_cmd:
