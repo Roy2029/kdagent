@@ -157,10 +157,11 @@ def list_rules() -> list[str]:
 
 
 def records_from_spans(spans: Iterable[Span]) -> list[ToolCallRecord]:
-    """从 07 tool.exec span 序列投影工具调用记录（input 未埋点，留空 dict）。
+    """从 07 tool.exec span 序列投影工具调用记录。
 
-    用于只需时序 + 成败的规则（read_before_edit / test_failed_rerun）；
-    需要目标路径的规则（no_test_file_edits）请用 records_from_blocks。
+    07 埋点已带 `input`（agent 07 span attributes，12 §3.6 数据源）——需要目标
+    路径的规则（no_test_file_edits / accept_criteria_written）可直接消费真实
+     trace；无 input 的旧 span 兜底空 dict（只需时序+成败的规则不受影响）。
     """
     records: list[ToolCallRecord] = []
     order = 0
@@ -168,10 +169,11 @@ def records_from_spans(spans: Iterable[Span]) -> list[ToolCallRecord]:
         if span.name != "tool.exec":
             continue
         order += 1
+        raw = span.attributes.get("input")
         records.append(
             ToolCallRecord(
                 name=str(span.attributes.get("tool", "")),
-                input={},
+                input=dict(raw) if isinstance(raw, dict) else {},
                 is_error=span.status == "error",
                 order=order,
             )

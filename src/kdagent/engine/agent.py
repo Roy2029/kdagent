@@ -613,9 +613,12 @@ class Agent:
             if reject is not None:
                 return self._denied_result(tool_use, reject.reason)
         # 07：一次工具执行 = 一个 tool.exec span（复用 ToolResult.duration_ms/is_error）。
+        # input 入 attributes（12 §3.6 规则量化数据源；本地完整内容，exporter 出口脱敏）。
         tool_cm: AbstractContextManager[Span | None] = nullcontext(None)
         if telemetry is not None:
-            tool_cm = telemetry.span("tool.exec", "tool", {"tool": tool_use.name})
+            tool_cm = telemetry.span(
+                "tool.exec", "tool", {"tool": tool_use.name, "input": tool_use.input}
+            )
         with tool_cm as tool_span:
             try:
                 result = await tool.execute(ctx, tool_use.input)

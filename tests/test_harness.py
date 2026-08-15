@@ -23,11 +23,13 @@ from kdagent.harness.rules import (
     no_test_file_edits,
     read_before_edit,
     records_from_blocks,
+    records_from_spans,
     rule_adherence,
 )
 
 # 别名避免 pytest 误收集：rules.test_failed_rerun 以 test_ 开头会被当测试函数
 from kdagent.harness.rules import test_failed_rerun as rules_test_failed_rerun
+from kdagent.obs.model import Span
 from kdagent.tools import TestRunner, parse_failed_tests
 from kdagent.tools.base import ToolContext
 
@@ -270,6 +272,64 @@ def test_no_test_file_edits() -> None:
     stats = no_test_file_edits(records)
     assert stats.total == 3
     assert stats.adhered == 2
+
+
+def test_records_from_spans_uses_input_for_path_rules() -> None:
+    spans = [
+        Span(
+            span_id="s1",
+            trace_id="t",
+            parent_span_id=None,
+            name="tool.exec",
+            kind="tool",
+            status="ok",
+            attributes={"tool": "WriteFile", "input": {"path": "src/a.py"}},
+        ),
+        Span(
+            span_id="s2",
+            trace_id="t",
+            parent_span_id=None,
+            name="tool.exec",
+            kind="tool",
+            status="ok",
+            attributes={"tool": "EditFile", "input": {"path": "tests/test_a.py"}},
+        ),
+        Span(
+            span_id="s3",
+            trace_id="t",
+            parent_span_id=None,
+            name="tool.exec",
+            kind="tool",
+            status="error",
+            attributes={"tool": "EditFile", "input": {"path": "src/b.py"}, "is_error": True},
+        ),
+    ]
+    records = records_from_spans(spans)
+    assert [r.name for r in records] == ["WriteFile", "EditFile", "EditFile"]
+    assert records[1].input == {"path": "tests/test_a.py"}
+    assert records[2].is_error is True
+    # 路径判定规则直接消费真实 trace（不再依赖 records_from_blocks）
+    stats = no_test_file_edits(records)
+    assert stats.total == 3
+    assert stats.adhered == 2
+
+
+def test_records_from_spans_skips_non_tool_and_missing_input() -> None:
+    spans = [
+        Span(span_id="s1", trace_id="t", parent_span_id=None, name="llm.call", kind="client"),
+        Span(
+            span_id="s2",
+            trace_id="t",
+            parent_span_id=None,
+            name="tool.exec",
+            kind="tool",
+            attributes={"tool": "ReadFile"},  # 旧 span 无 input → 兜底空 dict
+        ),
+    ]
+    records = records_from_spans(spans)
+    assert len(records) == 1
+    assert records[0].name == "ReadFile"
+    assert records[0].input == {}
 
 
 def test_accept_criteria_written() -> None:
