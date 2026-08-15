@@ -3,4 +3,4 @@
 技术规格：docs/技术规格/00-总览与路线图.md
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"  # M5 生产级闭合（SubAgent + Worktree + SendMessage + 评估 MVP）

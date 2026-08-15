@@ -74,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--dir",
         help="工作目录（默认当前目录）",
     )
+    sub = parser.add_subparsers(dest="command")
+    eval_p = sub.add_parser("eval", help="跑一轮评测（11 评估体系）")
+    eval_p.add_argument("tasks", help="评测配置 JSON 文件（tasks.json 结构见 kdagent.eval.cli）")
     return parser
 
 
@@ -224,6 +227,11 @@ def _make_client(api_key: str) -> Callable[[str], LLMClient]:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    # eval 子命令：长任务后台执行（11 §3.9），不走 TUI/IME 补丁。
+    if args.command == "eval":
+        from kdagent.eval import run_eval_cli
+
+        raise SystemExit(run_eval_cli(Path(args.tasks)))
     work_dir = Path(args.dir) if args.dir else None
     # 方案 A：Windows 终端不支持 Kitty 时禁用（对齐 Claude Code 回退传统流），
     # 恢复中文 IME；非 win32 为 no-op（compat.patch_windows_input）。
