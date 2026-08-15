@@ -60,6 +60,7 @@ from kdagent.harness.checkpoints import (
     has_test_evidence,
     todo_progress,
 )
+from kdagent.harness.error_patterns import diagnose_failure, pattern_memory
 from kdagent.hooks.engine import HookEngine
 from kdagent.hooks.engine_types import HookContext
 from kdagent.memory.consolidator import MemoryConsolidator
@@ -188,6 +189,8 @@ class Agent:
         self._round_write_paths: list[str] = []  # 本轮 write/edit 目标（跨批累计）
         # 12 §3.3 Replan（D57）：断路器触发累计次数；达阈值=路径反复受阻不可行。
         self._circuit_breaker_triggers = 0
+        # 08 §3.3 错误模式沉淀（T33-3）：本会话已沉淀的根因 name（防同轮重复写）。
+        self._seen_patterns: set[str] = set()
 
     def set_session_id(self, sid: str) -> None:
         """切换会话时更新 trace 关联的 session_id + 上下文落盘目录（04 /session new/resume）。"""
@@ -361,6 +364,7 @@ class Agent:
                 self._notify_conversation_change()
                 self._update_circuit_breaker(results)
                 self._observe_todos(batch, results)
+                self._observe_error_patterns(batch, results)
             self._checkpoint_round_end()
             self._events(TurnCompleteEvent(turn=self._turn))
             return "CONTINUE"
@@ -801,6 +805,28 @@ class Agent:
                 "", extra_blocks=[TextBlock(build_large_change_warning(self._round_write_paths))]
             )
             self._notify_conversation_change()
+
+    def _observe_error_patterns(self, batch: Batch, results: list[ToolResult]) -> None:
+        """错误模式沉淀（08 §3.3 feedback 消费方，T33-3）：写工具失败 → 诊断 → 沉淀。
+
+        事件驱动的客观事实记录（`diagnose_failure` 纯函数归类，不依赖 LLM）——
+        失败是硬事实，不等静默写（08 §3.4 LLM 提炼）稀释。沉淀到用户级 feedback
+        记忆，新会话经 MEMORY.md 索引自动加载（08 §3.3 静默读）。无 memory_store
+        （08 未启用）→ 静默跳过。
+        """
+        if self._memory_store is None:
+            return
+        for tc, r in zip(batch.calls, results, strict=True):
+            if tc.name not in ("EditFile", "WriteFile") or not r.is_error:
+                continue
+            pattern = diagnose_failure(tc.name, r.content)
+            if pattern is None:
+                continue
+            mf = pattern_memory(pattern)
+            if mf.name in self._seen_patterns:
+                continue  # 本会话已沉淀过同类根因
+            if self._memory_store.create(mf):
+                self._seen_patterns.add(mf.name)
 
     def _latest_todo_input(self) -> list[dict[str, Any]] | None:
         """从会话找最近一次 TodoWrite 的结构化 input（读会话，不改工具路径）。"""

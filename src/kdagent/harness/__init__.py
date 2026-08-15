@@ -4,8 +4,8 @@ M5 遗留补齐（v0.5.0 之后）：TestRunner 工具 + TestingEvent（tools/te
 engine/events.py）实现 §3.1 自测闭环；rules.py 实现 §3.6 规则量化；detect.py 实现
 §3.1 激活条件 2 的测试基建探测；checkpoints.py 实现 §3.3 双层检查点（声明驱动 +
 行为观察兜底）+ Replan 接入（D57：断路器反复触发 → 整体重写 todo）+ 行为观察①
-自动核验（D58：机械判据证据缺失 → 拦截「声明 vs 行为不一致」）。错误模式沉淀
-（08）标注遗留。
+自动核验（D58：机械判据证据缺失 → 拦截「声明 vs 行为不一致」）；error_patterns.py
+实现错误模式沉淀（D59：写工具失败 → 诊断 → feedback 记忆）。
 """
 
 from kdagent.harness.checkpoints import (
@@ -26,6 +26,13 @@ from kdagent.harness.checkpoints import (
     todo_progress,
 )
 from kdagent.harness.detect import detect_test_infra
+from kdagent.harness.error_patterns import (
+    ErrorPattern,
+    ErrorPatternKind,
+    diagnose_failure,
+    pattern_dedup_key,
+    pattern_memory,
+)
 from kdagent.harness.rules import (
     RuleStats,
     ToolCallRecord,
@@ -56,6 +63,11 @@ __all__ = [
     "file_target",
     "has_test_evidence",
     "todo_progress",
+    "ErrorPattern",
+    "ErrorPatternKind",
+    "diagnose_failure",
+    "pattern_dedup_key",
+    "pattern_memory",
     "accept_criteria_written",
     "ToolCallRecord",
     "accept_criteria_written",
