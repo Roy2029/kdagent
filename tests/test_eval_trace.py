@@ -156,6 +156,8 @@ async def test_run_to_completion_emits_eval_trace(tmp_path: Path) -> None:
     assert len(traces) == 1
     names = {s.name for s in traces[0].spans}
     assert "tool.exec" in names  # TodoWrite 执行进了 trace
+    tool_spans = [s for s in traces[0].spans if s.name == "tool.exec"]
+    assert tool_spans and "output" in tool_spans[0].attributes  # 11 §3.4 阅读：返回进 span
 
 
 async def test_run_to_completion_without_telemetry_no_trace(tmp_path: Path) -> None:

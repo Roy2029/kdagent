@@ -80,6 +80,8 @@ AgentStatus = Literal["CONTINUE", "TERMINAL"]
 MAX_ITERATIONS = 50  # T11：安全网，正常编码任务很少超过
 CONCURRENCY_LIMIT = 5  # T11：并发批上限初值，待实测校准
 CIRCUIT_BREAK_LIMIT = 3  # 连续失败挂起阈值（规格 02 §3.5）
+# 07 tool.exec span 工具返回截断上限（11 §3.4 复核界面「阅读」返回；防大输出撑爆 span）
+_TRACE_OUTPUT_CAP = 1000
 
 # M1-c 用默认 system prompt；`01` assemble_system_prompt 组装管线 M2 接入
 # 12 §3.4 常驻核心铁律（便宜，每轮在）：测试自测与修复规矩，防「看起来干完」。
@@ -643,6 +645,8 @@ class Agent:
             if tool_span is not None:
                 tool_span.attributes["is_error"] = result.is_error
                 tool_span.attributes["duration_ms"] = result.duration_ms
+                # 11 §3.4 复核「阅读」返回：output 进 span（截断），供 span_detail 逐事件挑出
+                tool_span.attributes["output"] = result.content[: _TRACE_OUTPUT_CAP]
                 if result.is_error:
                     tool_span.status = "error"
         if self._hooks is not None:

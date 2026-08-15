@@ -78,6 +78,22 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     eval_p = sub.add_parser("eval", help="跑一轮评测（11 评估体系）")
     eval_p.add_argument("tasks", help="评测配置 JSON 文件（tasks.json 结构见 kdagent.eval.cli）")
+    eval_p.add_argument(
+        "--report",
+        metavar="RUN_ID",
+        help="只读复核（11 §3.4）：失败题 → span 树 → 事件流阅读，不需要 api_key",
+    )
+    eval_p.add_argument(
+        "--annotate",
+        nargs=3,
+        metavar=("RUN_ID", "TASK_ID", "KIND"),
+        help="批注：人工修正失败归类（not_located/wrong_fix/regression/harness_fault/constraint_conflict）",
+    )
+    eval_p.add_argument(
+        "--note",
+        default="",
+        help="--annotate 的备注文本",
+    )
     return parser
 
 
@@ -240,8 +256,15 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     # eval 子命令：长任务后台执行（11 §3.9），不走 TUI/IME 补丁。
     if args.command == "eval":
-        from kdagent.eval import run_eval_cli
+        from kdagent.eval import run_annotate_cli, run_eval_cli, run_review_cli
 
+        if args.report:
+            raise SystemExit(run_review_cli(Path(args.tasks), args.report))
+        if args.annotate:
+            run_id, task_id, kind = args.annotate
+            raise SystemExit(
+                run_annotate_cli(Path(args.tasks), run_id, task_id, kind, args.note)
+            )
         raise SystemExit(run_eval_cli(Path(args.tasks)))
     work_dir = Path(args.dir) if args.dir else None
     # 方案 A：Windows 终端不支持 Kitty 时禁用（对齐 Claude Code 回退传统流），
