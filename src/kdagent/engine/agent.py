@@ -379,20 +379,32 @@ class Agent:
 
         FORCE_COMPACT 走 force 预算，失败（含预算耗尽 → ContextFullError）必须终止；
         AUTO_COMPACT 尽力而为，失败只熔断自动路径，不终止。
+        每次压缩产出 context.compact span（07 §3.6 T7 标定数据源）。
         """
         cm = self._context_manager
         assert cm is not None
         check = cm.check_before_call(self._estimate_context_tokens())
         if check == "FORCE_COMPACT":
-            try:
-                await cm.force_compact(self._conversation, prefix=self._assemble_payload())
-            except Exception as exc:
-                self._stop_reason = "context-full" if isinstance(exc, ContextFullError) else "error"
-                self._events(ErrorEvent(error=str(exc)))
-                return "TERMINAL"
+            with self._compact_span("force") as span:
+                try:
+                    await cm.force_compact(self._conversation, prefix=self._assemble_payload())
+                except Exception as exc:
+                    self._mark_span_error(span, exc)
+                    self._stop_reason = (
+                        "context-full" if isinstance(exc, ContextFullError) else "error"
+                    )
+                    self._events(ErrorEvent(error=str(exc)))
+                    return "TERMINAL"
+                self._record_after_tokens(span)
             self._run_hook("compact", HookContext(event="compact", message="force"))
         elif check == "AUTO_COMPACT":
-            await cm.auto_compact(self._conversation, prefix=self._assemble_payload())
+            with self._compact_span("auto") as span:
+                try:
+                    await cm.auto_compact(self._conversation, prefix=self._assemble_payload())
+                except Exception as exc:
+                    self._mark_span_error(span, exc)
+                    raise
+                self._record_after_tokens(span)
             self._run_hook("compact", HookContext(event="compact", message="auto"))
         return "CONTINUE"
 
@@ -400,12 +412,15 @@ class Agent:
         """阶段 B（01 §6 ③）：prompt_too_long 撞墙后走 force 预算压一次再重试。"""
         cm = self._context_manager
         assert cm is not None
-        try:
-            await cm.emergency_compact(self._conversation, prefix=prefix)
-        except Exception as exc:
-            self._stop_reason = "context-full" if isinstance(exc, ContextFullError) else "error"
-            self._events(ErrorEvent(error=str(exc)))
-            return "TERMINAL"
+        with self._compact_span("emergency") as span:
+            try:
+                await cm.emergency_compact(self._conversation, prefix=prefix)
+            except Exception as exc:
+                self._mark_span_error(span, exc)
+                self._stop_reason = "context-full" if isinstance(exc, ContextFullError) else "error"
+                self._events(ErrorEvent(error=str(exc)))
+                return "TERMINAL"
+            self._record_after_tokens(span)
         self._run_hook("compact", HookContext(event="compact", message="emergency"))
         return "CONTINUE"
 
@@ -466,6 +481,33 @@ class Agent:
         return estimate_messages_tokens(self._conversation.messages) + estimate_tokens(
             self._system_prompt
         )
+
+    def _compact_span(self, trigger: str) -> AbstractContextManager[Span | None]:
+        """context.compact trace span（07 §3.6 T7 标定数据源：触发类型/压缩前 token）。
+
+        telemetry 未开启返回 nullcontext——不改变任何压缩行为。before_tokens 在
+        span 创建时估算（尚未压缩），after_tokens 由 `_record_after_tokens` 压缩后回填。
+        """
+        telemetry = self._telemetry
+        if telemetry is None:
+            return nullcontext(None)
+        return telemetry.span(
+            "context.compact",
+            "compact",
+            {"trigger": trigger, "before_tokens": self._estimate_context_tokens()},
+        )
+
+    def _record_after_tokens(self, span: Span | None) -> None:
+        """压缩成功后回填 after_tokens——与 before_tokens 齐，渲染层可算压缩比（T7）。"""
+        if span is not None:
+            span.attributes["after_tokens"] = self._estimate_context_tokens()
+
+    def _mark_span_error(self, span: Span | None, exc: Exception) -> None:
+        """压缩失败标记 span error + 落错误日志（对齐 _stream_llm 风格）。"""
+        if span is None or self._telemetry is None:
+            return
+        span.status = "error"
+        self._telemetry.add_log(span.span_id, "error", f"{type(exc).__name__}: {exc}")
 
     def _assemble_payload(self) -> Payload:
         max_tokens = self._config.extra.get("max_tokens")
