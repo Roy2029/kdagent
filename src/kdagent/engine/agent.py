@@ -44,6 +44,8 @@ from kdagent.engine.llm.base import LLMClient, Payload, PromptTooLongError, Usag
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
 from kdagent.hooks.engine import HookEngine
 from kdagent.hooks.engine_types import HookContext
+from kdagent.memory.extractor import MemoryExtractor
+from kdagent.memory.store import MemoryStore
 from kdagent.obs.log import payload_text, snapshot
 from kdagent.obs.model import Span
 from kdagent.obs.telemetry import Telemetry
@@ -109,6 +111,8 @@ class Agent:
         context_manager: ContextManager | None = None,
         permission_checker: PermissionChecker | None = None,
         hooks: HookEngine | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_extractor: MemoryExtractor | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -128,6 +132,9 @@ class Agent:
         # （升级为完整裁决系统，规格 06 §1）；hooks None = 无自动化（M1/M2 行为不变）。
         self._permission_checker = permission_checker
         self._hooks = hooks
+        # 08 M4 好用档：静默读注入（memory_store） + 静默写提取（memory_extractor）。
+        self._memory_store = memory_store
+        self._memory_extractor = memory_extractor
         self._stop_reason = "completed"
         self._usage: Usage | None = None
         self._consecutive_failures = 0
@@ -198,6 +205,15 @@ class Agent:
                 if telemetry is not None:
                     telemetry.end_trace()
                 self._run_hook("session_end", HookContext(event="session_end"))
+        # 08 §3.4 静默写：每轮 run 结束提取（双门槛节流，多数直接返回零 LLM 调用）。
+        # 辅助机制故障不打断主流程（与 hook 同一哲学：尾巴摇狗反向禁止）。
+        if self._memory_extractor is not None:
+            try:
+                await self._memory_extractor.maybe_extract(self._conversation)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
 
     async def _run_loop(self) -> None:
         """ReAct 主循环（从 run 提取，供 trace.run span 包住）。"""
@@ -385,8 +401,15 @@ class Agent:
         max_tokens = self._config.extra.get("max_tokens")
         if not isinstance(max_tokens, int):
             max_tokens = 4096
+        # 08 §3.3 静默读：记忆索引随 CLAUDE.md 走同一管线注入（此处挂在 system，
+        # 索引是动态增长的——build 时注入会过期，payload 组装时现取）。
+        system = self._system_prompt
+        if self._memory_store is not None:
+            index = self._memory_store.index_markdown()
+            if index:
+                system = f"{system}\n\n{index}"
         return Payload(
-            system=self._system_prompt,
+            system=system,
             messages=self._conversation.messages,
             tools=self._tools.schemas(),
             max_tokens=max_tokens,

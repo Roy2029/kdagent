@@ -46,6 +46,8 @@ from kdagent.engine.events import (
 from kdagent.engine.llm.base import LLMClient, Usage
 from kdagent.hooks.engine import HookEngine
 from kdagent.hooks.engine_types import HookContext
+from kdagent.memory.extractor import MemoryExtractor
+from kdagent.memory.store import MemoryStore
 from kdagent.obs import OTLPSpanExporter, SpanExporter, Telemetry
 from kdagent.permission.checker import PermissionChecker
 from kdagent.permission.modes import Mode
@@ -232,6 +234,8 @@ class KDApp(App[None]):
         context_manager: ContextManager | None = None,
         permission_checker: PermissionChecker | None = None,
         hooks: HookEngine | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_extractor: MemoryExtractor | None = None,
     ) -> None:
         super().__init__()
         self._config = config
@@ -263,6 +267,8 @@ class KDApp(App[None]):
             context_manager=context_manager,
             permission_checker=permission_checker,
             hooks=hooks,
+            memory_store=memory_store,
+            memory_extractor=memory_extractor,
         )
         if context_manager is not None:
             context_manager.set_session_id(self._session.id)  # 01：落盘目录随初始 sid

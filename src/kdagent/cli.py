@@ -14,12 +14,15 @@ from pathlib import Path
 from kdagent import __version__
 from kdagent.compat import patch_windows_input
 from kdagent.config import load_api_key, load_config
+from kdagent.context.compactor import estimate_messages_tokens, estimate_tokens
 from kdagent.context.context_manager import ContextManager
 from kdagent.engine.agent import DEFAULT_SYSTEM_PROMPT
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, LLMStreamEvent, Payload, ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
 from kdagent.hooks.engine import HookEngine
+from kdagent.memory.extractor import MemoryExtractor
+from kdagent.memory.store import build_memory_store
 from kdagent.permission.checker import build_permission_checker
 from kdagent.tools import build_default_registry
 from kdagent.ui.app import KDApp
@@ -83,6 +86,15 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     hooks = HookEngine()
     if config.hooks:
         hooks.load({"hooks": config.hooks}, source="config.yaml")
+    # 08 M4 好用档：记忆（静默读注入 + 静默写提取，双门槛节流）。提取用同主对话
+    # 模型；token 估算口径与 agent 一致（消息 + system）。
+    memory_store = build_memory_store(work_dir, kdagent_dir=config.kdagent_dir or ".kdagent")
+    memory_extractor = MemoryExtractor(
+        memory_store,
+        llm,
+        estimate=lambda conv: estimate_messages_tokens(conv.messages)
+        + estimate_tokens(DEFAULT_SYSTEM_PROMPT),
+    )
     return KDApp(
         config=config,
         llm=llm,
@@ -97,6 +109,8 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         ),
         permission_checker=permission_checker,
         hooks=hooks,
+        memory_store=memory_store,
+        memory_extractor=memory_extractor,
     )
 
 
