@@ -197,6 +197,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         work_dir=work_dir,
         permission_checker=permission_checker,
         make_client=_make_client(api_key),
+        hooks=hooks,  # 10 §3.3：共享主 HookEngine，子 Agent hook 同生效
     )
     task_manager = TaskManager(subagent_runner)
     # 10 M5-b Worktree：空间隔离工作目录（§3.10-3.13）。目录在仓库内

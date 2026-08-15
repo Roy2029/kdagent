@@ -37,6 +37,7 @@ from kdagent.engine.events import (
 )
 from kdagent.engine.llm.base import LLMClient, Usage
 from kdagent.engine.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock
+from kdagent.hooks.engine import HookEngine
 from kdagent.obs.telemetry import Telemetry
 from kdagent.permission.checker import PermissionChecker
 from kdagent.subagent.model import AgentDef
@@ -188,6 +189,7 @@ class SubAgentRunner:
         work_dir: Path,
         permission_checker: PermissionChecker | None = None,
         make_client: Callable[[str], LLMClient] | None = None,
+        hooks: HookEngine | None = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
@@ -195,6 +197,9 @@ class SubAgentRunner:
         self._work_dir = work_dir
         self._permission_checker = permission_checker
         self._make_client = make_client  # model 覆盖时新建 client（换模型不破坏主缓存）
+        # 10 §3.3 Hook 引擎共享：cli 传主引擎同一实例，pre/post/生命周期 hook 子 Agent 同生效。
+        # 注意 prompt_inject 全库暂无接线（cli 构造 HookEngine 未传），共享不会注入错通道。
+        self._hooks = hooks
 
     async def run_to_completion(
         self,
@@ -241,6 +246,7 @@ class SubAgentRunner:
             max_iterations=definition.max_turns,
             permission_checker=self._permission_checker,
             telemetry=telemetry,
+            hooks=self._hooks,  # 10 §3.3：共享主 HookEngine，子 Agent hook 同生效
         )
         await agent.run(task if not fork else "")
         return self._extract_result(agent, conversation, sink)
