@@ -16,10 +16,12 @@ from kdagent.harness.checkpoints import (
     CheckpointEvent,
     build_checkpoint_reminder,
     build_large_change_warning,
+    build_replan_reminder,
     build_stale_todo_reminder,
     todo_progress,
 )
 from kdagent.tools import build_default_registry
+from kdagent.tools.base import ToolResult
 
 
 class FakeLLM:
@@ -217,6 +219,17 @@ def test_large_change_warning_over_limit_truncates() -> None:
     assert "等 12 个" in text
 
 
+def test_replan_reminder_contains_rewrite_instruction() -> None:
+    todos = [
+        {"content": "目标", "tasks": [{"content": "A", "status": "in_progress", "steps": []}]}
+    ]
+    text = build_replan_reminder(todos)
+    assert "<system-reminder>" in text and "</system-reminder>" in text
+    assert "路径反复受阻" in text
+    assert "整体重写" in text and "不修补" in text
+    assert "目标" in text  # 快照保真（废弃旧列表前先对表）
+
+
 # --- agent 接线：第一层声明驱动 ---
 
 
@@ -336,3 +349,71 @@ async def test_large_change_below_threshold_no_warning(tmp_path: Path) -> None:
     await agent.run("任务")
     joined = "\n".join(_text_blocks(conv))
     assert "跨文件大改" not in joined
+
+
+# --- Replan 接入（D57，12 §3.3）：断路器反复触发 = 路径不可行 → 整体重写 todo ---
+
+
+def _fail_batch(n: int) -> list[LLMStreamEvent]:
+    """一批 3 个失败 Bash（→ 触发一次断路器，规格 02 §3.5）。"""
+    return [_tool("Bash", {"command": "exit 1"}, id_=f"b{n}_{i}") for i in range(3)]
+
+
+def test_circuit_breaker_second_trigger_injects_replan(tmp_path: Path) -> None:
+    """断路器第 2 次触发（有 todo 快照）→ 注入 Replan 引导；第 1 次只注入熔断。"""
+    agent, conv, _ = _make_agent([_done()], tmp_path)
+    agent._last_todos = [
+        {"content": "目标", "tasks": [{"content": "A", "status": "in_progress", "steps": []}]}
+    ]
+    fail = [ToolResult(tool_use_id="t", name="Bash", content="失败", is_error=True)]
+    agent._update_circuit_breaker(fail * 3)  # 第 1 次触发：仅熔断
+    assert "已连续失败 3 次" in "\n".join(_text_blocks(conv))
+    assert "路径反复受阻" not in "\n".join(_text_blocks(conv))
+    agent._update_circuit_breaker(fail * 3)  # 第 2 次触发：路径反复受阻 → Replan
+    joined = "\n".join(_text_blocks(conv))
+    assert "路径反复受阻" in joined
+    assert "整体重写" in joined
+
+
+def test_circuit_breaker_success_resets_replan_counter(tmp_path: Path) -> None:
+    """一批全成功 = 路径有进展 → Replan 计数复位，不误判持续不可行。"""
+    agent, conv, _ = _make_agent([_done()], tmp_path)
+    agent._last_todos = [{"content": "目标", "tasks": []}]
+    fail = [ToolResult(tool_use_id="t", name="Bash", content="失败", is_error=True)]
+    ok = [ToolResult(tool_use_id="t", name="Bash", content="成功", is_error=False)]
+    agent._update_circuit_breaker(fail * 3)  # 触发 #1
+    agent._update_circuit_breaker(ok)  # 全成功 → 复位
+    agent._update_circuit_breaker(fail * 3)  # 重新触发（第 1 次，非第 2 次）
+    joined = "\n".join(_text_blocks(conv))
+    assert "路径反复受阻" not in joined
+    assert "已连续失败 3 次" in joined  # 熔断 reminder 本身仍在
+
+
+def test_replan_skipped_without_todo_snapshot(tmp_path: Path) -> None:
+    """无 todo 快照（_last_todos 为空）→ 不注入 Replan（无从对表重写）。"""
+    agent, conv, _ = _make_agent([_done()], tmp_path)
+    fail = [ToolResult(tool_use_id="t", name="Bash", content="失败", is_error=True)]
+    agent._update_circuit_breaker(fail * 3)
+    agent._update_circuit_breaker(fail * 3)
+    joined = "\n".join(_text_blocks(conv))
+    assert "已连续失败 3 次" in joined
+    assert "路径反复受阻" not in joined
+
+
+async def test_replan_injected_in_full_run_after_repeated_breaks(tmp_path: Path) -> None:
+    """端到端：TodoWrite 建快照 → 两轮各触发一次断路器 → Replan 引导注入对话。"""
+    todos = [
+        {"content": "目标", "tasks": [{"content": "A", "status": "in_progress", "steps": []}]}
+    ]
+    responses = [
+        _tool("TodoWrite", {"todos": todos}, id_="t0"),
+        *_fail_batch(0),
+        *_fail_batch(1),
+        _done(),
+    ]
+    agent, conv, _ = _make_agent(responses, tmp_path)
+    await agent.run("任务")
+    joined = "\n".join(_text_blocks(conv))
+    assert "已连续失败 3 次" in joined
+    assert "路径反复受阻" in joined
+    assert "整体重写" in joined

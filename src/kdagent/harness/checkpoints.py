@@ -26,6 +26,9 @@ STALE_TODO_THRESHOLD = 5
 LARGE_CHANGE_THRESHOLD = 5
 # 告警冷却：同类 reminder 距上次注入至少 N 轮才再注入（防刷屏）
 REINJECT_COOLDOWN = 3
+# Replan 判定信号（§3.3 Replan 机制，D57）：断路器连续触发 ≥ N 次 =
+# 路径反复受阻不可行 → 注入 Replan 引导（整体重写 todo 而非硬着头皮）
+REPLAN_TRIGGER_COUNT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,4 +117,20 @@ def build_large_change_warning(paths: list[str]) -> str:
         "<system-reminder>\n"
         f"检测到单轮跨文件大改（{len(paths)} 个文件），请确认变更范围、评估破坏风险，"
         f"并在 todo 中反映进展：\n{shown}{more}\n</system-reminder>"
+    )
+
+
+def build_replan_reminder(todos: list[dict[str, Any]]) -> str:
+    """Replan 引导（§3.3 Replan 机制，D57）：路径反复受阻 → 整体重写 todo。
+
+    断路器已连续 REPLAN_TRIGGER_COUNT 次触发 = 当前路径不可行。引导模型 Replan：
+    废弃旧列表整体重写（不修补），重新拆步骤；含最新 todo 快照对表。
+    """
+    return (
+        "<system-reminder>\n"
+        f"路径反复受阻：工具已连续 {REPLAN_TRIGGER_COUNT} 次触发失败熔断，当前做法走不通。"
+        "请 Replan——整体重写 todo（废弃旧列表，不修补），重新拆解步骤换路径，"
+        "不要在同一方向上硬着头皮重试。当前 todo 快照：\n"
+        + format_todos(todos)
+        + "\n</system-reminder>"
     )

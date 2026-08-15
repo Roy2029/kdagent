@@ -46,9 +46,11 @@ from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
 from kdagent.harness.checkpoints import (
     LARGE_CHANGE_THRESHOLD,
     REINJECT_COOLDOWN,
+    REPLAN_TRIGGER_COUNT,
     STALE_TODO_THRESHOLD,
     build_checkpoint_reminder,
     build_large_change_warning,
+    build_replan_reminder,
     build_stale_todo_reminder,
     todo_progress,
 )
@@ -176,7 +178,10 @@ class Agent:
         self._turns_since_todo_update = 0
         self._stale_inject_turn = -REINJECT_COOLDOWN - 1
         self._large_inject_turn = -REINJECT_COOLDOWN - 1
+        self._replan_inject_turn = -REINJECT_COOLDOWN - 1
         self._round_write_paths: list[str] = []  # 本轮 write/edit 目标（跨批累计）
+        # 12 §3.3 Replan（D57）：断路器触发累计次数；达阈值=路径反复受阻不可行。
+        self._circuit_breaker_triggers = 0
 
     def set_session_id(self, sid: str) -> None:
         """切换会话时更新 trace 关联的 session_id + 上下文落盘目录（04 /session new/resume）。"""
@@ -708,15 +713,31 @@ class Agent:
         """连续失败计数；达阈值注入 system-reminder 后复位（规格 02 §3.5）。
 
         TestingEvent（12）触发部分留 M5；此处只覆盖工具执行失败。
+        Replan（12 §3.3，D57）：一批全部成功 = 路径有进展 → Replan 触发计数复位；
+        断路器反复触发 ≥ REPLAN_TRIGGER_COUNT = 路径反复受阻 → 注入 Replan 引导
+        （整体重写 todo，废弃旧列表，冷却防刷屏）。
         """
         if results and all(not r.is_error for r in results):
             self._consecutive_failures = 0
+            self._circuit_breaker_triggers = 0  # 有进展，受阻不是持续不可行
         else:
             self._consecutive_failures += sum(1 for r in results if r.is_error)
         if self._consecutive_failures >= CIRCUIT_BREAK_LIMIT:
             self._consecutive_failures = 0
+            self._circuit_breaker_triggers += 1
             self._conversation.add_user_message("", extra_blocks=[TextBlock(_CIRCUIT_REMINDER)])
             self._notify_conversation_change()
+            if (
+                self._circuit_breaker_triggers >= REPLAN_TRIGGER_COUNT
+                and self._turn - self._replan_inject_turn >= REINJECT_COOLDOWN
+                and self._last_todos is not None
+            ):
+                self._replan_inject_turn = self._turn
+                self._circuit_breaker_triggers = 0  # 注入后复位，防 Replan 后连发
+                self._conversation.add_user_message(
+                    "", extra_blocks=[TextBlock(build_replan_reminder(self._last_todos))]
+                )
+                self._notify_conversation_change()
 
     def _observe_todos(self, batch: Batch, results: list[ToolResult]) -> None:
         """12 §3.3 双层检查点：声明驱动主检查点 + 行为观察兜底（每批工具结果后）。
