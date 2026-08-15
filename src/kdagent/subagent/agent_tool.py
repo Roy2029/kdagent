@@ -20,6 +20,7 @@ from typing import Any
 from kdagent.engine.conversation import ConversationManager
 from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.model import AgentDef
+from kdagent.subagent.named import NamedAgentError, NamedAgentManager
 from kdagent.subagent.runner import FORK_SYSTEM_PROMPT, SubAgentRunner
 from kdagent.subagent.task import TaskManager
 from kdagent.subagent.worktree import Worktree, WorktreeError, WorktreeManager
@@ -79,7 +80,10 @@ class Agent:
             },
             "name": {
                 "type": "string",
-                "description": "命名该 Agent 以便引用（M5 后续 SendMessage 接线）",
+                "description": (
+                    "命名该 Agent 以便 SendMessage 引用（M5-d 接线；给 name 即注册"
+                    "命名 Agent，存活到会话结束，可反复投递新任务）"
+                ),
             },
             "isolation": {"type": "string", "description": "worktree（独立工作目录，M5-b 落地）"},
         },
@@ -94,11 +98,13 @@ class Agent:
         manager: AgentManager,
         task_manager: TaskManager,
         worktree_manager: WorktreeManager | None = None,
+        named_manager: NamedAgentManager | None = None,
     ) -> None:
         self._runner = runner
         self._manager = manager
         self._task_manager = task_manager
         self._worktree_manager = worktree_manager
+        self._named_manager = named_manager
         self._parent_conversation: ConversationManager | None = None
 
     def set_parent_conversation(self, conversation: ConversationManager) -> None:
@@ -128,7 +134,15 @@ class Agent:
         model = str(input.get("model", "") or "")
         background = bool(input.get("run_in_background", False))
         isolation = str(input.get("isolation", "") or "")
+        name = str(input.get("name", "") or "")
         start = time.perf_counter()
+
+        # 命名 Agent（M5-d）：给 name 即注册，存活到会话结束，SendMessage 可反复投递。
+        if name:
+            return await self._execute_named(
+                ctx, name, prompt, subagent_type=subagent_type, model=model,
+                isolation=isolation,
+            )
 
         # 不指定 subagent_type → Fork（10 §3.2）：继承父对话，无条件后台。
         if not subagent_type:
@@ -285,6 +299,108 @@ class Agent:
                 f"[Agent {definition.name} 已后台启动（独立 worktree），task id={task.id}]\n"
                 f"worktree：{wt.path}（分支 {wt.branch}）\n"
                 "用 TaskList/TaskGet 查询状态与结果；完成后有变更则保留供 review。"
+            ),
+        )
+
+    async def _execute_named(
+        self,
+        ctx: ToolContext,
+        name: str,
+        prompt: str,
+        *,
+        subagent_type: Any,
+        model: str,
+        isolation: str,
+    ) -> ToolResult:
+        """命名 Agent 注册（10 §3.15 M5-d）：给 name 即注册，消息循环后台常驻。
+
+        命名 Agent 无视 run_in_background（语义上恒为后台）；worktree 隔离时创建
+        worktree 但**不自动清理**——命名 Agent 与会话同生命周期，worktree 由用户
+        `/worktree` 管理。
+        """
+        nm = self._named_manager
+        if nm is None:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content="命名 Agent 不可用：NamedAgentManager 未接线",
+                is_error=True,
+            )
+        work_dir: Path | None = None
+        suffix = ""
+        if isolation == "worktree":
+            wm = self._worktree_manager
+            if wm is None:
+                return ToolResult(
+                    tool_use_id=ctx.tool_use_id,
+                    name=self.name,
+                    content="worktree 隔离不可用：WorktreeManager 未接线",
+                    is_error=True,
+                )
+            wt_name = "agent-" + uuid.uuid4().hex[:8]
+            try:
+                wt = wm.create(wt_name, "HEAD")
+            except WorktreeError as exc:
+                return ToolResult(
+                    tool_use_id=ctx.tool_use_id,
+                    name=self.name,
+                    content=f"worktree 创建失败：{exc}",
+                    is_error=True,
+                )
+            work_dir = Path(wt.path)
+            suffix = (
+                f"\nworktree：{wt.path}（分支 {wt.branch}，命名 Agent 生命周期内保留）"
+            )
+        elif isolation:
+            prompt += "\n[note] isolation 值未知，本次在共享目录执行。"
+
+        try:
+            if not subagent_type:
+                # Fork 命名：继承父对话，SendMessage 在继承基础上继续。
+                if self._parent_conversation is None:
+                    return ToolResult(
+                        tool_use_id=ctx.tool_use_id,
+                        name=self.name,
+                        content="Fork 模式不可用：父对话未接线（无主 Agent 上下文可继承）",
+                        is_error=True,
+                    )
+                agent = nm.register(
+                    _FORK_DEF,
+                    name,
+                    prompt,
+                    fork=True,
+                    parent_conversation=self._parent_conversation,
+                )
+            else:
+                type_name = str(subagent_type)
+                if not self._manager.validate_type(type_name):
+                    return ToolResult(
+                        tool_use_id=ctx.tool_use_id,
+                        name=self.name,
+                        content=(
+                            f"未知 Agent 类型：{type_name}\n"
+                            f"可用类型：\n{self._manager.types_markdown()}"
+                        ),
+                        is_error=True,
+                    )
+                definition = self._manager.get(type_name)
+                assert definition is not None
+                agent = nm.register(
+                    definition, name, prompt, model=model, work_dir=work_dir
+                )
+        except NamedAgentError as exc:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content=str(exc),
+                is_error=True,
+            )
+        return ToolResult(
+            tool_use_id=ctx.tool_use_id,
+            name=self.name,
+            content=(
+                f"[命名 Agent {name} 已注册并后台启动，type={agent.definition.name}]\n"
+                f"用 SendMessage 投递新任务给 {name}（to={name}）。{suffix}"
             ),
         )
 

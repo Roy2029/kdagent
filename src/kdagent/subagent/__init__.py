@@ -11,6 +11,12 @@ from kdagent.subagent.model import (
     parse_agent_file,
     parse_agent_text,
 )
+from kdagent.subagent.named import (
+    NamedAgent,
+    NamedAgentError,
+    NamedAgentManager,
+    SendMessage,
+)
 from kdagent.subagent.runner import (
     ALL_AGENT_DISALLOWED_TOOLS,
     ASYNC_AGENT_ALLOWED_TOOLS,
@@ -52,6 +58,10 @@ __all__ = [
     "DEFAULT_TEMP_PREFIX",
     "FORK_BOILERPLATE",
     "FORK_SYSTEM_PROMPT",
+    "NamedAgent",
+    "NamedAgentError",
+    "NamedAgentManager",
+    "SendMessage",
     "SubAgentResult",
     "SubAgentRunner",
     "TaskCreate",

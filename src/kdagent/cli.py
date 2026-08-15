@@ -31,6 +31,8 @@ from kdagent.skill import BUILTIN_SKILLS_DIR, LoadSkill, SkillCreator, SkillMana
 from kdagent.subagent import (
     BUILTIN_AGENTS_DIR,
     AgentManager,
+    NamedAgentManager,
+    SendMessage,
     SubAgentRunner,
     TaskCreate,
     TaskGet,
@@ -162,13 +164,23 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     # 10 M5-b Worktree：空间隔离工作目录（§3.10-3.13）。目录在仓库内
     # `.kdagent/worktrees/`（已 .gitignore）；过期清理 fail-closed 不丢成果。
     worktree_manager = WorktreeManager(work_dir, kd_dir / "worktrees")
+    # 10 M5-d SendMessage：命名 Agent 注册表 + 消息投递工具。命名 Agent 存活到
+    # 会话结束（注册即常驻），SendMessage 投递新任务唤醒继续。
+    named_manager = NamedAgentManager(subagent_runner)
     registry.register(
-        AgentTool(subagent_runner, agent_manager, task_manager, worktree_manager)
+        AgentTool(
+            subagent_runner,
+            agent_manager,
+            task_manager,
+            worktree_manager,
+            named_manager,
+        )
     )
     registry.register(TaskList(task_manager))
     registry.register(TaskGet(task_manager))
     registry.register(TaskCreate(task_manager, agent_manager))
     registry.register(TaskUpdate(task_manager))
+    registry.register(SendMessage(named_manager))
     return KDApp(
         config=config,
         llm=llm,
