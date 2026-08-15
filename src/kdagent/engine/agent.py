@@ -43,6 +43,15 @@ from kdagent.engine.events import (
 )
 from kdagent.engine.llm.base import LLMClient, Payload, PromptTooLongError, Usage
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
+from kdagent.harness.checkpoints import (
+    LARGE_CHANGE_THRESHOLD,
+    REINJECT_COOLDOWN,
+    STALE_TODO_THRESHOLD,
+    build_checkpoint_reminder,
+    build_large_change_warning,
+    build_stale_todo_reminder,
+    todo_progress,
+)
 from kdagent.hooks.engine import HookEngine
 from kdagent.hooks.engine_types import HookContext
 from kdagent.memory.consolidator import MemoryConsolidator
@@ -162,6 +171,12 @@ class Agent:
         self._turn = 0
         self._pending_text: list[str] = []
         self._pending_tool_uses: list[ToolUseBlock] = []
+        # 12 §3.3 双层检查点（M5 遗留第二块）：todo 前后快照 + 行为观察冷却计数。
+        self._last_todos: list[dict[str, Any]] | None = None
+        self._turns_since_todo_update = 0
+        self._stale_inject_turn = -REINJECT_COOLDOWN - 1
+        self._large_inject_turn = -REINJECT_COOLDOWN - 1
+        self._round_write_paths: list[str] = []  # 本轮 write/edit 目标（跨批累计）
 
     def set_session_id(self, sid: str) -> None:
         """切换会话时更新 trace 关联的 session_id + 上下文落盘目录（04 /session new/resume）。"""
@@ -326,6 +341,7 @@ class Agent:
         self._notify_conversation_change()
 
         if tool_uses:
+            self._round_write_paths = []
             batches = partition_tool_calls(tool_uses, self._tools)
             for batch in batches:
                 results = await self._execute_batch(batch)
@@ -333,6 +349,8 @@ class Agent:
                 self._conversation.add_tool_results(results)
                 self._notify_conversation_change()
                 self._update_circuit_breaker(results)
+                self._observe_todos(batch, results)
+            self._checkpoint_round_end()
             self._events(TurnCompleteEvent(turn=self._turn))
             return "CONTINUE"
         # 停止条件 1：模型主动完成（无 tool_use）。
@@ -696,3 +714,66 @@ class Agent:
             self._consecutive_failures = 0
             self._conversation.add_user_message("", extra_blocks=[TextBlock(_CIRCUIT_REMINDER)])
             self._notify_conversation_change()
+
+    def _observe_todos(self, batch: Batch, results: list[ToolResult]) -> None:
+        """12 §3.3 双层检查点：声明驱动主检查点 + 行为观察兜底（每批工具结果后）。
+
+        第一层：TodoWrite 更新到步骤边界（task 标 completed 且有判据）→ 注入
+        「产出 vs 判据」自检 reminder（含完整 todo 快照，§3.2 时点①）。
+        第二层②：todo 长期滞后于行为（工具活跃但未更新规划）→ 强制刷新快照。
+        第二层③：单轮跨文件大改（安全类信号，始终生效）→ 变更范围警告。
+        注入走 user 消息 extra_blocks（§3.2 硬约束：todo 不进 system prompt 常驻区）。
+        """
+        todo_names = {r.name for r in results}
+        if "TodoWrite" in todo_names:
+            todos = self._latest_todo_input()
+            if todos is not None:
+                event = todo_progress(self._last_todos, todos)
+                self._last_todos = todos
+                self._turns_since_todo_update = 0
+                if event is not None:
+                    reminder = build_checkpoint_reminder(event, todos)
+                    self._conversation.add_user_message("", extra_blocks=[TextBlock(reminder)])
+                    self._notify_conversation_change()
+        else:
+            self._turns_since_todo_update += 1
+        if (
+            self._last_todos is not None
+            and self._turns_since_todo_update >= STALE_TODO_THRESHOLD
+            and self._turn - self._stale_inject_turn >= REINJECT_COOLDOWN
+        ):
+            self._stale_inject_turn = self._turn
+            self._conversation.add_user_message(
+                "", extra_blocks=[TextBlock(build_stale_todo_reminder(self._last_todos))]
+            )
+            self._notify_conversation_change()
+        # 行为观察③：累计本轮 write/edit 目标，轮末统一检查（§3.3 第二层③）。
+        self._round_write_paths.extend(
+            str(tc.input.get("path", ""))
+            for tc in batch.calls
+            if tc.name in ("WriteFile", "EditFile") and tc.input.get("path")
+        )
+
+    def _checkpoint_round_end(self) -> None:
+        """本轮汇总的跨文件大改检查（§3.3 第二层③，单轮口径跨批累计）。"""
+        if (
+            len(self._round_write_paths) >= LARGE_CHANGE_THRESHOLD
+            and self._turn - self._large_inject_turn >= REINJECT_COOLDOWN
+        ):
+            self._large_inject_turn = self._turn
+            self._conversation.add_user_message(
+                "", extra_blocks=[TextBlock(build_large_change_warning(self._round_write_paths))]
+            )
+            self._notify_conversation_change()
+
+    def _latest_todo_input(self) -> list[dict[str, Any]] | None:
+        """从会话找最近一次 TodoWrite 的结构化 input（读会话，不改工具路径）。"""
+        for msg in reversed(self._conversation.messages):
+            if msg.role != "assistant":
+                continue
+            for block in reversed(msg.content):
+                if isinstance(block, ToolUseBlock) and block.name == "TodoWrite":
+                    todos = block.input.get("todos")
+                    if isinstance(todos, list):
+                        return todos
+        return None
