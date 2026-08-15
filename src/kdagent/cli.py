@@ -14,7 +14,11 @@ from pathlib import Path
 from kdagent import __version__
 from kdagent.compat import patch_windows_input
 from kdagent.config import load_api_key, load_config
-from kdagent.context.compactor import estimate_messages_tokens, estimate_tokens
+from kdagent.context.compactor import (
+    cost_params_from_table,
+    estimate_messages_tokens,
+    estimate_tokens,
+)
 from kdagent.context.context_manager import ContextManager
 from kdagent.engine.agent import DEFAULT_SYSTEM_PROMPT
 from kdagent.engine.conversation import ConversationManager
@@ -246,7 +250,11 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         model_name=model,
         obs_dir=kd_dir / "obs",
         context_manager=ContextManager(
-            kd_dir / "sessions", llm=llm, system_prompt=DEFAULT_SYSTEM_PROMPT
+            kd_dir / "sessions",
+            llm=llm,
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            # T5-1：计价表按 provider 配置化（D83，None = DEFAULT_COST；数值待实测标定）
+            cost=cost_params_from_table(config.get_cost_table(), config.provider),
         ),
         permission_checker=permission_checker,
         hooks=hooks,

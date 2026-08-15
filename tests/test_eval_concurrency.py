@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from kdagent.context.compactor import estimate_token_cost
+from kdagent.context.compactor import CostParams, cost_params_from_table, estimate_token_cost
 from kdagent.eval import EvalReport, EvalRunner, EvalTask, FailureCase, RunMetrics
 from kdagent.eval.report_diff import load_report, report_path
 from kdagent.eval.runner import sort_report_by_task_order
@@ -316,3 +316,76 @@ def test_load_report_backcompat(tmp_path: Path) -> None:
     assert report.metrics.total_tokens == 100
     assert report.metrics.input_tokens == 0
     assert report.metrics.cost_cny == 0.0
+
+
+# ---- 计价表按 provider 配置化（01 T5-1 机制部分，D83） ----
+
+def test_cost_params_from_table_provider_entry() -> None:
+    """按 provider 嵌套：provider 精确匹配取对应价目。"""
+    table: dict[str, object] = {
+        "deepseek": {"c_in": 2.0, "c_out": 8.0, "c_hit": 0.2},
+        "openai": {"c_in": 15.0, "c_out": 60.0, "c_hit": 1.5},
+    }
+    p = cost_params_from_table(table, "openai")
+    assert p.c_in == 15.0
+    assert p.c_out == 60.0
+    assert p.c_hit == 1.5
+
+
+def test_cost_params_from_table_flat() -> None:
+    """单一价目形态（无 provider 嵌套）→ 直接作用当前 provider。"""
+    table: dict[str, object] = {"c_in": 1.0, "c_out": 1.0, "c_hit": 1.0}
+    p = cost_params_from_table(table, "deepseek")
+    assert p.c_in == 1.0
+
+
+def test_cost_params_from_table_unmatched_defaults() -> None:
+    """provider 未配 / 空表 → 回退 DEFAULT_COST（多 provider 未配不猜）。"""
+    table: dict[str, object] = {"openai": {"c_in": 1.0, "c_out": 2.0, "c_hit": 0.1}}
+    p = cost_params_from_table(table, "deepseek")
+    assert p == CostParams()
+    assert cost_params_from_table({}, "deepseek") == CostParams()
+
+
+def test_cost_params_from_table_invalid_defaults() -> None:
+    """非法值（非数字）→ 容错回退默认。"""
+    table: dict[str, object] = {"c_in": "x", "c_out": 8.0, "c_hit": 0.2}
+    assert cost_params_from_table(table, "deepseek") == CostParams()
+
+
+@pytest.mark.asyncio
+async def test_runner_cost_injected_from_config(repo: Path, tmp_path: Path) -> None:
+    """EvalRunner 注入配置计价（cost 参数）→ 跑批成本按注入价目计，默认价目不变。"""
+    ev = EvalRunner(
+        _CostRunner(),  # 鸭子类型 SubAgentRunner
+        definition=AgentDef(name="test", description="test"),
+        source_repo=repo,
+        work_dir=tmp_path / "eval",
+        task_loader=lambda: _tasks(repo, 1),
+        cost=cost_params_from_table(
+            {"openai": {"c_in": 1.0, "c_out": 1.0, "c_hit": 1.0}},
+            "openai",
+        ),
+    )
+    report = await ev.run("run-cost-cfg")
+    # 1M 入×1 + 0.5M 出×1 + 0.25M 缓存×1 = 1.75 元（默认 6.05 元 → 配置生效）
+    assert report.metrics.cost_cny == pytest.approx(1.75)
+
+
+def test_config_parses_cost_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """load_config 解析 cost 段 → get_cost_table + cost_params_from_table 按 provider 取。"""
+    cfg = tmp_path / ".kdagent" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "cost:\n"
+        "  deepseek: {c_in: 2.0, c_out: 8.0, c_hit: 0.2}\n"
+        "  openai: {c_in: 15.0, c_out: 60.0, c_hit: 1.5}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    from kdagent.config import load_config
+
+    config = load_config()
+    table = config.get_cost_table()
+    assert "deepseek" in table and "openai" in table
+    assert cost_params_from_table(table, config.provider).c_in == 2.0  # provider 默认 deepseek

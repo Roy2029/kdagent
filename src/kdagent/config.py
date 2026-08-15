@@ -44,6 +44,13 @@ class Config:
     # 10 M5-a SubAgent：agents 段（enable_verification_agent 开关，Verification 默认关
     # T27；auto_background_ms 前台超时自动转后台阈值，D79 落地 10 §3.7 ②）。
     agents: dict[str, object] = field(default_factory=dict)
+    # 01 T5-1 计价表：cost 段（按 provider 嵌套 {deepseek: {c_in..}} 或单一价目
+    # {c_in, c_out, c_hit}，D83 机制就绪，数值待实测标定）。零配置回退 DEFAULT_COST。
+    cost: dict[str, object] = field(default_factory=dict)
+
+    def get_cost_table(self) -> dict[str, object]:
+        """01 T5-1：`cost:` 计价表（cost_params_from_table 消费，按 provider 取价目）。"""
+        return self.cost
 
     def get_auto_background_ms(self) -> int:
         """10 §3.7 ②：前台 Agent 工具超时自动转后台的阈值 ms（`agents.auto_background_ms`）。
@@ -84,6 +91,7 @@ def load_config() -> Config:
         hooks=_list("hooks"),
         mcp_servers=_dict("mcp_servers"),
         agents=_dict("agents"),
+        cost=_dict("cost"),
     )
 
 

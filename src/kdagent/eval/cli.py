@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import cast
 
 from kdagent.config import load_api_key, load_config
+from kdagent.context.compactor import cost_params_from_table
 from kdagent.engine.llm.base import ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
 from kdagent.eval.model import EvalReport, EvalTask, FailureCase, FailureKind
@@ -145,6 +146,8 @@ def run_eval_cli(tasks_file: Path, workers: int = 1) -> int:
         work_dir=work_dir,
         task_loader=lambda: tasks,
         obs_dir=obs_dir,
+        # T5-1：计价表按 provider 配置化（D83，None = DEFAULT_COST；数值待实测标定）
+        cost=cost_params_from_table(config.get_cost_table(), config.provider),
     )
     report: EvalReport = asyncio.run(eval_runner.run(run_id, max_workers=workers))
     persist_report(work_dir, run_id, report)

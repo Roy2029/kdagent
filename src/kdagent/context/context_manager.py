@@ -23,6 +23,7 @@ from kdagent.context.compactor import (
     Compactor,
     CompactResult,
     ContextFullError,
+    CostParams,
     L2Compressor,
 )
 from kdagent.context.history import ProcessedToolResult
@@ -51,6 +52,7 @@ class ContextManager:
         todos_provider: Callable[[], list[TodoItemRecord] | None] | None = None,
         window_size: int = WINDOW_SIZE,
         telemetry: Telemetry | None = None,
+        cost: CostParams | None = None,
     ) -> None:
         self._sessions_dir = sessions_dir
         self._session_id = session_id
@@ -59,6 +61,7 @@ class ContextManager:
         self._todos_provider = todos_provider  # 04 Session.todos（12 时点② L3 重灌快照）
         self._window_size = window_size
         self._telemetry = telemetry  # 07 T8 标定：透传给 L2 压缩器产 span
+        self._cost = cost  # 01 T5-1 计价（D83：config cost 段按 provider 注入，None 用默认）
         # persist_dir 随会话切换而变（`04` /session new/resume），延迟到首次 use 时装配
         self._handler: ToolResultHandler | None = None
         self._handler_factory = handler  # 测试注入自定义 handler（含自定义阈值）
@@ -126,6 +129,7 @@ class ContextManager:
                         persist_dir=persist_dir,
                         system_prompt=self._system_prompt,
                         telemetry=self._telemetry,  # 07 T8：L2 压缩成本 span
+                        cost=self._cost,  # T5-1：配置计价表按 provider 注入（None = 默认）
                     )
                 self._handler = ToolResultHandler(persist_dir, l2=l2)
         return self._handler

@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
-from kdagent.context.compactor import estimate_token_cost
+from kdagent.context.compactor import CostParams, estimate_token_cost
 from kdagent.eval.model import (
     EvalReport,
     EvalTask,
@@ -220,6 +220,7 @@ class EvalRunner:
         task_loader: Callable[[], list[EvalTask]],
         similarity_threshold: float = _GOLD_SIM_THRESHOLD,
         obs_dir: Path | None = None,
+        cost: CostParams | None = None,
     ) -> None:
         self._runner = runner
         self._definition = definition
@@ -227,6 +228,7 @@ class EvalRunner:
         self._work_dir = work_dir
         self._task_loader = task_loader
         self._similarity_threshold = similarity_threshold
+        self._cost = cost  # 01 T5-1 计价（D83：config cost 段按 provider 注入，None 用默认）
         # 07 trace 数据层：子 Agent 全程产 trace，带 eval.run_id/task_id 标记，
         # 供失败定位（11 §3.4/§3.5，trace_store.load_traces / failed_events）。
         self._telemetry = Telemetry(obs_dir) if obs_dir is not None else None
@@ -326,7 +328,10 @@ class EvalRunner:
         report.metrics.output_tokens += usage.output_tokens
         report.metrics.cache_tokens += usage.cache_read_tokens
         report.metrics.cost_cny += estimate_token_cost(
-            usage.input_tokens, usage.output_tokens, usage.cache_read_tokens
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            cost=self._cost,  # T5-1：配置计价表按 provider 注入（None = DEFAULT_COST）
         )
         test_passed: bool | None = None
         if task.test_cmd:

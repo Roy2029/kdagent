@@ -104,6 +104,33 @@ class CostParams:
 DEFAULT_COST = CostParams()
 
 
+def cost_params_from_table(
+    table: dict[str, object], provider: str = ""
+) -> CostParams:
+    """按 provider 从配置计价表取 CostParams（01 T5-1 机制部分，D83）。
+
+    `cost:` 配置段两种形态：按 provider 嵌套 `{deepseek: {c_in..}}`（多 provider
+    各自价目）或单一价目 `{c_in, c_out, c_hit}`（作用于当前 provider）。provider
+    精确匹配优先，查不到回退 DEFAULT_COST（多 provider 未配不猜）。数值仍待实测
+    标定（T5-1，M2 收尾时校准）；非法值容错回退，零配置可用。
+    """
+    entry: object = table
+    if provider and provider in table and isinstance(table[provider], dict):
+        entry = table[provider]
+    if isinstance(entry, dict) and (
+        "c_in" in entry or "c_out" in entry or "c_hit" in entry
+    ):
+        try:
+            return CostParams(
+                c_in=float(entry.get("c_in", 2.0)),
+                c_out=float(entry.get("c_out", 8.0)),
+                c_hit=float(entry.get("c_hit", 0.2)),
+            )
+        except (TypeError, ValueError):
+            return DEFAULT_COST
+    return DEFAULT_COST
+
+
 def estimate_token_cost(
     input_tokens: int,
     output_tokens: int,
