@@ -29,6 +29,13 @@ from kdagent.subagent.task import (
     TaskManager,
     TaskUpdate,
 )
+from kdagent.subagent.worktree import (
+    DEFAULT_TEMP_PREFIX,
+    Worktree,
+    WorktreeError,
+    WorktreeManager,
+    validate_name,
+)
 
 BUILTIN_AGENTS_DIR = Path(__file__).parent / "builtin"
 
@@ -42,6 +49,7 @@ __all__ = [
     "BUILTIN_AGENTS_DIR",
     "BackgroundTask",
     "DEFAULT_MAX_TURNS",
+    "DEFAULT_TEMP_PREFIX",
     "FORK_BOILERPLATE",
     "FORK_SYSTEM_PROMPT",
     "SubAgentResult",
@@ -51,8 +59,12 @@ __all__ = [
     "TaskList",
     "TaskManager",
     "TaskUpdate",
+    "Worktree",
+    "WorktreeError",
+    "WorktreeManager",
     "build_forked_messages",
     "filter_tools",
     "parse_agent_file",
     "parse_agent_text",
+    "validate_name",
 ]

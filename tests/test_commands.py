@@ -43,6 +43,7 @@ TEST_COMMAND_NAMES = [
     "skills",  # 09 M4-d：查看已加载 Skill 清单
     "memory",  # 08 M4-e：查看/管理记忆
     "tasks",  # 10 M5-a：后台任务便捷列表
+    "worktree",  # 10 M5-b：隔离工作目录 list/remove/cleanup
 ]
 
 

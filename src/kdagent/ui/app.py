@@ -59,6 +59,7 @@ from kdagent.skill.manager import SkillManager
 from kdagent.subagent.agent_tool import Agent as SubAgentTool
 from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.task import TaskManager
+from kdagent.subagent.worktree import WorktreeManager
 from kdagent.tools.registry import ToolRegistry
 from kdagent.ui.chat import ChatView
 from kdagent.ui.commands import (
@@ -248,6 +249,7 @@ class KDApp(App[None]):
         skill_manager: SkillManager | None = None,
         task_manager: TaskManager | None = None,
         agent_manager: AgentManager | None = None,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         super().__init__()
         self._config = config
@@ -305,6 +307,7 @@ class KDApp(App[None]):
         # 唯一 Agent 实例，构造完成后在此接线（cli 阶段无 agent 可绑）。
         self._task_manager = task_manager
         self._agent_manager = agent_manager
+        self._worktree_manager = worktree_manager
         if task_manager is not None:
             task_manager.set_parent_conversation(self._agent.conversation)
         agent_tool = self._tools.get("Agent")
@@ -479,6 +482,7 @@ class KDApp(App[None]):
             skill_manager=self._skill_manager,
             memory_store=self._memory_store,
             task_manager=self._task_manager,
+            worktree_manager=self._worktree_manager,
         )
 
     def _schedule_resume_compact(self, conversation: ConversationManager) -> None:

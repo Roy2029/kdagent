@@ -204,12 +204,15 @@ class SubAgentRunner:
         fork: bool = False,
         model: str = "",
         background: bool = False,
+        work_dir: Path | None = None,
     ) -> SubAgentResult:
         """任务注入 → 独立 Agent 跑完 → 返回最后文本（10 §3.5）。
 
         `fork=True` 继承父对话历史（build_forked_messages）而非空白对话，且无条件后台
         （Fork 继承全部工具但叠加第 3 层后台白名单，只用基础读写/搜索/Bash）；
         `model` 非空且 ≠ 主模型时新建 LLMClient；`background` 套后台白名单。
+        `work_dir` 覆盖子 Agent 工作目录（explicit cwd 模式，10 §3.11：Worktree
+        隔离时工具显式取 worktree 路径作本次调用 cwd，无全局 chdir）。
         """
         background = background or fork  # Fork 无条件后台（10 §3.2）
         registry = filter_tools(self._tools, definition, background=background, fork=fork)
@@ -226,7 +229,7 @@ class SubAgentRunner:
             conversation=conversation,
             tools=registry,
             events=sink,
-            work_dir=self._work_dir,
+            work_dir=work_dir or self._work_dir,
             system_prompt=(
                 definition.system_prompt or FORK_SYSTEM_PROMPT if fork
                 else definition.system_prompt

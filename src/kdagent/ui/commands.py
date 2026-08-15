@@ -23,6 +23,7 @@ from kdagent.memory.store import MemoryStore
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.skill.manager import SkillManager
 from kdagent.subagent.task import TaskManager
+from kdagent.subagent.worktree import WorktreeManager
 
 CommandType = Literal["local", "local-ui", "prompt"]
 
@@ -67,6 +68,8 @@ class CommandContext:
     memory_store: MemoryStore | None = None
     # 10 M5-a：/tasks 后台任务便捷列表（Task 工具为主，/tasks 仅查看）。
     task_manager: TaskManager | None = None
+    # 10 M5-b：/worktree 查看/管理隔离工作目录（list/remove/cleanup）。
+    worktree_manager: WorktreeManager | None = None
 
 
 @dataclass
@@ -395,6 +398,42 @@ def _cmd_tasks(ctx: CommandContext) -> None:
     ctx.ui.add_system_message("\n".join(lines))
 
 
+def _cmd_worktree(ctx: CommandContext) -> None:
+    """10 §3.11：/worktree 查看/管理隔离工作目录（list / remove <name> / cleanup）。"""
+    wm = ctx.worktree_manager
+    if wm is None:
+        ctx.ui.add_system_message("worktree 系统不可用。")
+        return
+    args = ctx.args.strip().split()
+    if not args or args[0] == "list":
+        worktrees = wm.list()
+        if not worktrees:
+            ctx.ui.add_system_message(
+                "当前无 worktree。主 Agent 可用 Agent 工具（isolation=worktree）创建。"
+            )
+            return
+        lines = [f"worktree {len(worktrees)} 个："]
+        for wt in worktrees:
+            mark = " 变更" if wm.has_changes(wt.name) else " 干净"
+            lines.append(f"  {wt.name} ({wt.branch}){mark}\n    {wt.path}")
+        lines.append("有变更的会保留供 review；管理删除让主 Agent 或 /worktree remove。")
+        ctx.ui.add_system_message("\n".join(lines))
+        return
+    if args[0] == "cleanup":
+        removed = wm.cleanup_expired()
+        ctx.ui.add_system_message(f"过期清理完成，删除 {removed} 个（fail-closed：有变更的保留）。")
+        return
+    if args[0] == "remove" and len(args) == 2:
+        try:
+            wm.remove(args[1])
+        except Exception as exc:  # WorktreeError
+            ctx.ui.add_system_message(f"删除失败：{exc}")
+            return
+        ctx.ui.add_system_message(f"worktree {args[1]} 已删除。")
+        return
+    ctx.ui.add_system_message("用法：/worktree [list|remove <name>|cleanup]")
+
+
 def skill_command_handler(skill_name: str) -> Callable[[CommandContext], None]:
     """Skill 自动注册的 /name 命令 handler（09 §3.9 显式触发路径）。
 
@@ -575,6 +614,15 @@ def build_default_commands() -> CommandRegistry:
             usage="/tasks",
             type="local",
             handler=_cmd_tasks,
+        )
+    )
+    registry.register(
+        Command(
+            name="worktree",
+            description="隔离工作目录：list / remove <name> / cleanup",
+            usage="/worktree [list|remove <name>|cleanup]",
+            type="local",
+            handler=_cmd_worktree,
         )
     )
     return registry

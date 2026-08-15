@@ -13,6 +13,8 @@ Agent 类型动态加载（用户新建定义文件即用），工具列表保�
 from __future__ import annotations
 
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 from kdagent.engine.conversation import ConversationManager
@@ -20,6 +22,7 @@ from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.runner import FORK_SYSTEM_PROMPT, SubAgentRunner
 from kdagent.subagent.task import TaskManager
+from kdagent.subagent.worktree import WorktreeError, WorktreeManager
 from kdagent.tools.base import ToolContext, ToolResult
 
 # Fork 定义（不落盘、运行时构造）：继承对话 + Boilerplate 覆盖父默认行为。
@@ -31,9 +34,14 @@ _FORK_DEF = AgentDef(
     permission_mode="dontAsk",
 )
 
+# 上下文通知（10 §3.12）：告诉子 Agent 三件事——继承了父对话；当前在独立
+# Worktree；父传路径指向主目录、需翻译成本地路径并重新读文件（否则它读到
+# worktree 文件却按主目录版本来理解，产生认知偏差）。
 _WORKTREE_NOTICE = (
-    "\n[note] isolation=worktree 在 M5-b（WorktreeManager）落地；"
-    "本次在共享工作目录执行，改动会直接作用主目录。"
+    "\n[note] 你在独立 Git Worktree 中工作（隔离目录，不碰主工作区）。\n"
+    "1. 所有相对路径基于该 Worktree 目录。\n"
+    "2. 父对话传入的路径指向主目录——需翻译成本地路径并重新读文件。\n"
+    "3. 你的改动不会影响主目录；完成后有变更则保留供 review。"
 )
 
 
@@ -85,10 +93,12 @@ class Agent:
         runner: SubAgentRunner,
         manager: AgentManager,
         task_manager: TaskManager,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self._runner = runner
         self._manager = manager
         self._task_manager = task_manager
+        self._worktree_manager = worktree_manager
         self._parent_conversation: ConversationManager | None = None
 
     def set_parent_conversation(self, conversation: ConversationManager) -> None:
@@ -144,8 +154,14 @@ class Agent:
             )
         definition = self._manager.get(type_name)
         assert definition is not None
+
+        if isolation == "worktree":
+            return await self._execute_worktree(
+                ctx, definition, prompt, model=model, background=background, start=start
+            )
         if isolation:
-            prompt = prompt + _WORKTREE_NOTICE  # worktree 隔离 M5-b 落地，先提示不阻断
+            # 未知 isolation 值：安全默认回共享目录（不阻断委派），提示即可。
+            prompt = prompt + "\n[note] isolation 值未知，本次在共享目录执行。"
 
         if background:
             task = self._task_manager.launch(definition, prompt, model=model)
@@ -158,6 +174,74 @@ class Agent:
             content = f"[Agent {type_name} 完成，{result.turns} 轮]\n{result.text}"
         else:
             content = f"[Agent {type_name} 返回空结果]"
+        return ToolResult(
+            tool_use_id=ctx.tool_use_id,
+            name=self.name,
+            content=content,
+            is_error=result.is_error,
+            duration_ms=duration_ms,
+        )
+
+    async def _execute_worktree(
+        self,
+        ctx: ToolContext,
+        definition: AgentDef,
+        prompt: str,
+        *,
+        model: str,
+        background: bool,
+        start: float,
+    ) -> ToolResult:
+        """§3.12 execute_with_worktree：创建 → 注入通知 → 子 Agent 独立目录跑 → 自动清理。
+
+        后台 + worktree 隔离留 M5-c（任务完成回调里再清理，避免执行中被删）——
+        后台模式的隔离语义与前台不同，先明确拒绝不静默降级。
+        """
+        wm = self._worktree_manager
+        if wm is None:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content="worktree 隔离不可用：WorktreeManager 未接线",
+                is_error=True,
+            )
+        if background:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content="后台 + worktree 隔离留 M5-c；本次请用前台执行或去掉 isolation",
+                is_error=True,
+            )
+        wt_name = "agent-" + uuid.uuid4().hex[:8]
+        try:
+            wt = wm.create(wt_name, "HEAD")
+        except WorktreeError as exc:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content=f"worktree 创建失败：{exc}",
+                is_error=True,
+            )
+        result = await self._runner.run_to_completion(
+            definition, _WORKTREE_NOTICE + "\n\n" + prompt, model=model, work_dir=Path(wt.path)
+        )
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        kept = False
+        try:
+            kept = wm.auto_cleanup(wt_name)
+        except WorktreeError:
+            kept = True  # 清理失败保守保留，供主 Agent 处理
+        suffix = (
+            f"\n[Worktree 保留于 {wt.path}，分支 {wt.branch}]"
+            if kept
+            else f"\n[Worktree {wt_name} 无变更，已自动清理]"
+        )
+        if result.is_error:
+            content = f"[Agent {definition.name} 失败] {result.error or result.text}{suffix}"
+        elif result.text:
+            content = f"[Agent {definition.name} 完成，{result.turns} 轮]{suffix}\n{result.text}"
+        else:
+            content = f"[Agent {definition.name} 返回空结果]{suffix}"
         return ToolResult(
             tool_use_id=ctx.tool_use_id,
             name=self.name,

@@ -37,6 +37,7 @@ from kdagent.subagent import (
     TaskList,
     TaskManager,
     TaskUpdate,
+    WorktreeManager,
 )
 from kdagent.subagent import (
     Agent as AgentTool,
@@ -158,7 +159,12 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         make_client=_make_client(api_key),
     )
     task_manager = TaskManager(subagent_runner)
-    registry.register(AgentTool(subagent_runner, agent_manager, task_manager))
+    # 10 M5-b Worktree：空间隔离工作目录（§3.10-3.13）。目录在仓库内
+    # `.kdagent/worktrees/`（已 .gitignore）；过期清理 fail-closed 不丢成果。
+    worktree_manager = WorktreeManager(work_dir, kd_dir / "worktrees")
+    registry.register(
+        AgentTool(subagent_runner, agent_manager, task_manager, worktree_manager)
+    )
     registry.register(TaskList(task_manager))
     registry.register(TaskGet(task_manager))
     registry.register(TaskCreate(task_manager))
@@ -184,6 +190,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         skill_manager=skill_manager,
         task_manager=task_manager,
         agent_manager=agent_manager,
+        worktree_manager=worktree_manager,
     )
 
 
