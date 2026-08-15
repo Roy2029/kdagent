@@ -21,13 +21,14 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from kdagent.context.history import PersistedOutput, ProcessedToolResult
 from kdagent.engine.conversation import ConversationManager
-from kdagent.engine.llm.base import LLMClient, Payload
+from kdagent.engine.llm.base import LLMClient, Payload, Usage
 from kdagent.engine.messages import (
     ContentBlock,
     Message,
@@ -36,6 +37,8 @@ from kdagent.engine.messages import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from kdagent.obs.model import Span
+from kdagent.obs.telemetry import Telemetry
 from kdagent.sessions.records import TodoItemRecord
 from kdagent.tools.base import ToolResult
 
@@ -261,18 +264,22 @@ def should_online_compress(
 # ---- 落盘 + L2 摘要执行 ----------------------------------------------------
 
 
-async def _llm_text(llm: LLMClient, payload: Payload) -> str:
-    """流式调用，只收文本；error 事件抛错；tool_use 事件忽略（禁止工具调用）。
+async def _llm_text(llm: LLMClient, payload: Payload) -> tuple[str, Usage | None]:
+    """流式调用，只收文本（同时收 usage 供 T8 标定）；error 事件抛错。
 
     L2/L3 摘要共用（摘要调用保留 tools 参数命中缓存，但代码只读文本）。
+    返回 (文本, usage)——usage 由调用方决定是否消费。
     """
     parts: list[str] = []
+    usage: Usage | None = None
     async for ev in llm.stream_chat(payload):
         if ev.type == "text_delta" and ev.text:
             parts.append(ev.text)
+        elif ev.type == "usage" and ev.usage is not None:
+            usage = ev.usage
         elif ev.type == "error" and ev.error is not None:
             raise ev.error
-    return "".join(parts)
+    return "".join(parts), usage
 
 
 def write_persisted(
@@ -334,6 +341,7 @@ class L2Compressor:
         window_size: int = WINDOW_SIZE,
         avg_growth_per_turn: int = AVG_GROWTH_PER_TURN,
         preview_chars: int = PREVIEW_CHARS,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._llm = llm
         self._persist_dir = persist_dir
@@ -346,6 +354,7 @@ class L2Compressor:
         self._window_size = window_size
         self._avg_growth_per_turn = avg_growth_per_turn
         self._preview_chars = preview_chars
+        self._telemetry = telemetry  # 07 T8 标定：L2 压缩成本 span
 
     def should_online_compress(self, result: ToolResult, p_tokens: int) -> bool:
         """用本压缩器参数调用模块级决策函数（01 §5.3）。"""
@@ -367,22 +376,55 @@ class L2Compressor:
         """原文落盘（D6）→ 摘要调用 → 返回历史形态（<compressed-output> + 元信息）。
 
         摘要失败时抛异常，由调用方（ToolResultHandler）回退原文。
+        每次压缩产出 context.l2_compress span（07 §3.6 T8 标定数据源：X/S token +
+        usage；异常标 error，对齐 _stream_llm 风格）。
         """
         po = write_persisted(
             self._persist_dir, result.tool_use_id, result.content, self._preview_chars
         )
-        text = await self._call_llm_text(self._build_summary_payload(result, prefix))
-        summary = _two_phase_extract(text) or f"(在线摘要未生成，完整内容见 {po.path})"
-        co = CompressedOutput(
-            summary=summary,
-            path=po.path,
-            preview=po.preview,
-            original_type=classify_content(result),
-            info_density=info_density(result),
-        )
-        return ProcessedToolResult(
-            content=_compressed_text(co, po.full_size), persisted=po, compressed=co
-        )
+        telemetry = self._telemetry
+        span_cm: AbstractContextManager[Span | None] = nullcontext(None)
+        if telemetry is not None:
+            span_cm = telemetry.span(
+                "context.l2_compress", "context", {"tool_use_id": result.tool_use_id}
+            )
+        with span_cm as span:
+            try:
+                text, usage = await self._call_llm_text(
+                    self._build_summary_payload(result, prefix)
+                )
+            except Exception as exc:
+                if span is not None and telemetry is not None:
+                    span.status = "error"
+                    telemetry.add_log(
+                        span.span_id, "error", f"{type(exc).__name__}: {exc}"
+                    )
+                raise
+            summary = _two_phase_extract(text) or f"(在线摘要未生成，完整内容见 {po.path})"
+            co = CompressedOutput(
+                summary=summary,
+                path=po.path,
+                preview=po.preview,
+                original_type=classify_content(result),
+                info_density=info_density(result),
+            )
+            if span is not None:
+                span.attributes.update(
+                    original_type=classify_content(result),
+                    info_density=info_density(result),
+                    x_tokens=estimate_tokens(result.content),
+                    s_tokens=estimate_tokens(summary),
+                )
+                if usage is not None:
+                    span.attributes.update(
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cache_read_tokens=usage.cache_read_tokens,
+                        cache_creation_tokens=usage.cache_creation_tokens,
+                    )
+            return ProcessedToolResult(
+                content=_compressed_text(co, po.full_size), persisted=po, compressed=co
+            )
 
     def _build_summary_payload(self, result: ToolResult, prefix: Payload | None) -> Payload:
         """摘要调用载荷：主前缀（复用前缀缓存）+ 追加[原文 + 压缩指令]。
@@ -412,8 +454,8 @@ class L2Compressor:
             max_tokens=SUMMARY_MAX_TOKENS,
         )
 
-    async def _call_llm_text(self, payload: Payload) -> str:
-        """流式调用，只收文本；error 事件抛错；tool_use 事件忽略（禁止工具调用）。"""
+    async def _call_llm_text(self, payload: Payload) -> tuple[str, Usage | None]:
+        """流式调用，只收文本 + usage；error 事件抛错；tool_use 事件忽略。"""
         return await _llm_text(self._llm, payload)
 
 
@@ -664,7 +706,10 @@ class Compactor:
         src = summarize_src
         for attempt in range(SUMMARY_RETRY_LIMIT):
             try:
-                return await _llm_text(self._llm, self._build_summary_payload(src, prefix, focus))
+                text, _usage = await _llm_text(
+                    self._llm, self._build_summary_payload(src, prefix, focus)
+                )
+                return text
             except Exception:
                 if attempt == SUMMARY_RETRY_LIMIT - 1:
                     raise

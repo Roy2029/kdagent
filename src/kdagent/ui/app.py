@@ -290,6 +290,8 @@ class KDApp(App[None]):
         )
         if context_manager is not None:
             context_manager.set_session_id(self._session.id)  # 01：落盘目录随初始 sid
+            # 07 T8：CM 在 cli 装配（早于 Telemetry 构建），后补接线使 L2 压缩器产 span。
+            context_manager.set_telemetry(self._telemetry)
         self._context_manager = context_manager  # 04 §5 恢复③：/session resume 压缩接线
         # 06 M3 可控档：五层裁决器 + Hook 引擎（cli 装配传入，/permissions 切换模式）。
         self._permission_checker = permission_checker

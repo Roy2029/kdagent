@@ -29,6 +29,7 @@ from kdagent.context.history import ProcessedToolResult
 from kdagent.context.tool_result_handler import ToolResultHandler
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, Payload
+from kdagent.obs.telemetry import Telemetry
 from kdagent.sessions.records import SessionRecord, TodoItemRecord
 from kdagent.tools.base import ToolResult
 
@@ -49,6 +50,7 @@ class ContextManager:
         compactor: Compactor | None = None,
         todos_provider: Callable[[], list[TodoItemRecord] | None] | None = None,
         window_size: int = WINDOW_SIZE,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self._sessions_dir = sessions_dir
         self._session_id = session_id
@@ -56,6 +58,7 @@ class ContextManager:
         self._system_prompt = system_prompt
         self._todos_provider = todos_provider  # 04 Session.todos（12 时点② L3 重灌快照）
         self._window_size = window_size
+        self._telemetry = telemetry  # 07 T8 标定：透传给 L2 压缩器产 span
         # persist_dir 随会话切换而变（`04` /session new/resume），延迟到首次 use 时装配
         self._handler: ToolResultHandler | None = None
         self._handler_factory = handler  # 测试注入自定义 handler（含自定义阈值）
@@ -101,6 +104,15 @@ class ContextManager:
         self._session_id = sid
         self._handler = None  # 惰性重建（persist_dir 已变）
 
+    def set_telemetry(self, telemetry: Telemetry | None) -> None:
+        """运行时接线 telemetry（App 装配后调用）：惰性重建 L2 压缩器承接 span。
+
+        ContextManager 在 cli.py 装配、Telemetry 在 App 内部构建（时序后于 CM），
+        故用 setter 后补而非构造参数硬绑（07 T8）。
+        """
+        self._telemetry = telemetry
+        self._handler = None  # 惰性重建（L2Compressor 需携带 telemetry）
+
     def _tool_result_handler(self) -> ToolResultHandler:
         if self._handler is None:
             if self._handler_factory is not None:
@@ -110,7 +122,10 @@ class ContextManager:
                 l2 = None
                 if self._llm is not None:
                     l2 = L2Compressor(
-                        self._llm, persist_dir=persist_dir, system_prompt=self._system_prompt
+                        self._llm,
+                        persist_dir=persist_dir,
+                        system_prompt=self._system_prompt,
+                        telemetry=self._telemetry,  # 07 T8：L2 压缩成本 span
                     )
                 self._handler = ToolResultHandler(persist_dir, l2=l2)
         return self._handler
