@@ -41,3 +41,17 @@ def test_statusbar_session_id_suffix() -> None:
     )
     text = str(sb.render())
     assert "s-abc" in text and "200k" in text
+
+
+def test_statusbar_permission_mode() -> None:
+    """权限模式（06 M3：可控档）显示在会话 id 之前。"""
+    sb = StatusBar()
+    sb.update_status(
+        mode="DEFAULT",
+        token_count=100,
+        tool_count=7,
+        work_dir="/tmp",
+        permission="acceptEdits",
+    )
+    text = str(sb.render())
+    assert "权限 acceptEdits" in text

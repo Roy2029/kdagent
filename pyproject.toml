@@ -1,6 +1,6 @@
 [project]
 name = "kdagent"
-version = "0.2.0"
+version = "0.3.0"
 description = "KDAgent - 类 Claude Code 的 Coding Agent（Python 3.11+ / Textual）"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.27",
     "mcp>=1.0",
     "pyperclip>=1.11.0",
+    "pyyaml>=6.0.3",
     "textual>=0.80",
 ]
 
@@ -28,6 +29,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
+    "types-pyyaml>=6.0.12.20260815",
 ]
 
 [tool.ruff]

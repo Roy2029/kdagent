@@ -20,7 +20,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from kdagent.config import Config
 from kdagent.context.compactor import ContextFullError, estimate_messages_tokens, estimate_tokens
@@ -32,6 +32,8 @@ from kdagent.engine.events import (
     ErrorEvent,
     LoopCompleteEvent,
     MaxIterationsReachedEvent,
+    PermissionRequestEvent,
+    PermissionVerdict,
     StreamTextEvent,
     ToolResultEvent,
     ToolUseEvent,
@@ -40,9 +42,12 @@ from kdagent.engine.events import (
 )
 from kdagent.engine.llm.base import LLMClient, Payload, PromptTooLongError, Usage
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
+from kdagent.hooks.engine import HookEngine
+from kdagent.hooks.engine_types import HookContext
 from kdagent.obs.log import payload_text, snapshot
 from kdagent.obs.model import Span
 from kdagent.obs.telemetry import Telemetry
+from kdagent.permission.checker import PermissionChecker
 from kdagent.tools.base import AsyncConfirm, TodosCallback, ToolContext, ToolResult
 from kdagent.tools.registry import ToolRegistry
 
@@ -102,6 +107,8 @@ class Agent:
         model_name: str = "",
         telemetry: Telemetry | None = None,
         context_manager: ContextManager | None = None,
+        permission_checker: PermissionChecker | None = None,
+        hooks: HookEngine | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -117,6 +124,10 @@ class Agent:
         self._model_name = model_name or config.model  # llm.call span 记录 model（D9）
         self._telemetry = telemetry  # 07 埋点 sink，None = 无 obs 环境
         self._context_manager = context_manager  # 01 工具结果入口分发（M2-a L1 落盘）
+        # 06 M3 可控档：五层裁决器 + Hook 引擎。checker 存在时接管 require_confirm
+        # （升级为完整裁决系统，规格 06 §1）；hooks None = 无自动化（M1/M2 行为不变）。
+        self._permission_checker = permission_checker
+        self._hooks = hooks
         self._stop_reason = "completed"
         self._usage: Usage | None = None
         self._consecutive_failures = 0
@@ -169,6 +180,7 @@ class Agent:
         self._conversation.add_user_message(user_input)
         self._notify_conversation_change()
         self._stop_reason = "completed"
+        self._run_hook("session_start", HookContext(event="session_start", message=user_input))
         telemetry = self._telemetry
         # 07：一次 Agent.run() = 一条 Trace（根 span=trace.run，记停止原因）。
         root_cm: AbstractContextManager[Span | None] = nullcontext(None)
@@ -185,6 +197,7 @@ class Agent:
                     root_span.attributes["stop_reason"] = self._stop_reason
                 if telemetry is not None:
                     telemetry.end_trace()
+                self._run_hook("session_end", HookContext(event="session_end"))
 
     async def _run_loop(self) -> None:
         """ReAct 主循环（从 run 提取，供 trace.run span 包住）。"""
@@ -205,6 +218,14 @@ class Agent:
         self._events(MaxIterationsReachedEvent(limit=MAX_ITERATIONS))
 
     async def _loop_iteration(self) -> AgentStatus:
+        """一轮 LLM 调用 + 工具执行。包 turn_start/turn_end 生命周期 hook（06 §3.10）。"""
+        self._run_hook("turn_start", HookContext(event="turn_start"))
+        try:
+            return await self._loop_iteration_inner()
+        finally:
+            self._run_hook("turn_end", HookContext(event="turn_end"))
+
+    async def _loop_iteration_inner(self) -> AgentStatus:
         # 恢复四步②（04 §3.4）：链修复守在"发请求前"这一个出口——悬空 tool_use
         # 补错误结果、孤儿 tool_result 剔除，保证交替/配对合法。
         self._conversation.repair_chain()
@@ -234,6 +255,7 @@ class Agent:
                 self._stop_reason = "error"
                 self._flush_partial()
                 self._events(ErrorEvent(error=str(err)))
+                self._run_hook("error", HookContext(event="error", error=str(err)))
                 return "TERMINAL"
             # 清半截缓冲，走 force 预算压一次；失败（含预算耗尽）须终止。
             self._pending_text = []
@@ -282,8 +304,10 @@ class Agent:
                 self._stop_reason = "context-full" if isinstance(exc, ContextFullError) else "error"
                 self._events(ErrorEvent(error=str(exc)))
                 return "TERMINAL"
+            self._run_hook("compact", HookContext(event="compact", message="force"))
         elif check == "AUTO_COMPACT":
             await cm.auto_compact(self._conversation, prefix=self._assemble_payload())
+            self._run_hook("compact", HookContext(event="compact", message="auto"))
         return "CONTINUE"
 
     async def _emergency_compact(self, prefix: Payload) -> AgentStatus:
@@ -296,6 +320,7 @@ class Agent:
             self._stop_reason = "context-full" if isinstance(exc, ContextFullError) else "error"
             self._events(ErrorEvent(error=str(exc)))
             return "TERMINAL"
+        self._run_hook("compact", HookContext(event="compact", message="emergency"))
         return "CONTINUE"
 
     async def _stream_llm(self, payload: Payload) -> Exception | None:
@@ -440,23 +465,57 @@ class Agent:
             confirm=self._confirm,
             todos=self._todos,
         )
-        # 规格 05 §3.4：Y/N 前置——选 no 返回 is_error=True 结果，模型下轮自行调整。
-        if (
-            tool.require_confirm
-            and ctx.confirm is not None
-            and not await ctx.confirm(tool_use.name, tool_use.input)
-        ):
-            result = self._error_result(tool_use, "执行已被用户拒绝")
-            self._events(
-                ToolResultEvent(
-                    name=result.name,
-                    content=result.content,
-                    is_error=True,
-                    duration_ms=0,
-                )
-            )
-            return result
         telemetry = self._telemetry
+        # 06 M3 可控档：五层裁决。checker 存在时接管 require_confirm（升级为完整
+        # 裁决系统）；拒绝不终止 Loop——is_error 结果进历史，模型下轮自行调整。
+        permission = self._permission_checker
+        if permission is not None:
+            # 07：一次裁决 = 一个 permission.check span（effect/verdict 入属性）。
+            perm_cm: AbstractContextManager[Span | None] = nullcontext(None)
+            if telemetry is not None:
+                perm_cm = telemetry.span(
+                    "permission.check", "security", {"tool": tool_use.name}
+                )
+            with perm_cm as perm_span:
+                decision = permission.check(tool, tool_use.input)
+                if perm_span is not None:
+                    perm_span.attributes["effect"] = decision.effect
+                if decision.effect == "deny":
+                    return self._denied_result(tool_use, "权限拒绝：" + decision.reason)
+                if decision.effect == "ask":
+                    verdict = await self._ask_permission(tool_use.name, tool_use.input)
+                    if perm_span is not None:
+                        perm_span.attributes["verdict"] = verdict
+                    if verdict == "deny":
+                        return self._denied_result(tool_use, "已被用户拒绝")
+                    if verdict == "allow_always":
+                        # §3.7「始终允许」→ 追加本地规则，同类操作下次直接放行。
+                        content = permission.extract_content(tool, tool_use.input)
+                        permission.learn(tool_use.name, content)
+        else:
+            # 规格 05 §3.4（无 checker 时保留原 Y/N 前置）：选 no 返回 is_error 结果。
+            if (
+                tool.require_confirm
+                and ctx.confirm is not None
+                and not await ctx.confirm(tool_use.name, tool_use.input)
+            ):
+                return self._denied_result(tool_use, "执行已被用户拒绝")
+        # 06 §3.9/§3.10：pre_tool_use hooks（唯一可拦截事件）——在权限基线之上做
+        # 参数内容级动态拦截；reject 短路，理由作为错误结果进历史。
+        if self._hooks is not None:
+            hook_ctx = HookContext(
+                event="pre_tool_use",
+                tool_name=tool_use.name,
+                tool_args=tool_use.input,
+                file_path=self._hook_file_path(tool_use.input),
+            )
+            hook_cm: AbstractContextManager[Span | None] = nullcontext(None)
+            if telemetry is not None:
+                hook_cm = telemetry.span("hook.run", "security", {"event": "pre_tool_use"})
+            with hook_cm:
+                reject = self._hooks.run_pre_tool(hook_ctx)
+            if reject is not None:
+                return self._denied_result(tool_use, reject.reason)
         # 07：一次工具执行 = 一个 tool.exec span（复用 ToolResult.duration_ms/is_error）。
         tool_cm: AbstractContextManager[Span | None] = nullcontext(None)
         if telemetry is not None:
@@ -472,6 +531,17 @@ class Agent:
                 tool_span.attributes["duration_ms"] = result.duration_ms
                 if result.is_error:
                     tool_span.status = "error"
+        if self._hooks is not None:
+            self._run_hook(
+                "post_tool_use",
+                HookContext(
+                    event="post_tool_use",
+                    tool_name=tool_use.name,
+                    tool_args=tool_use.input,
+                    file_path=self._hook_file_path(tool_use.input),
+                    message=result.content,
+                ),
+            )
         self._events(
             ToolResultEvent(
                 name=result.name,
@@ -481,6 +551,54 @@ class Agent:
             )
         )
         return result
+
+    # ---- 06 M3 可控档：权限 HITL / hook 辅助 ----
+
+    async def _ask_permission(self, tool_name: str, input: dict[str, Any]) -> PermissionVerdict:
+        """L5 HITL（06 §3.7）：emit PermissionRequestEvent，阻塞等 UI 回传裁决。
+
+        UI 消费方 set_result(allow/deny/allow_always)；未来不 resolved 时调用方悬挂
+        （交互环境总有 UI 消费；headless 测试注入自动裁决 sink）。
+        """
+        summary = self._permission_summary(tool_name, input)
+        future: asyncio.Future[PermissionVerdict] = asyncio.get_running_loop().create_future()
+        self._events(PermissionRequestEvent(tool_name=tool_name, summary=summary, future=future))
+        return await future
+
+    def _permission_summary(self, tool_name: str, input: dict[str, Any]) -> str:
+        """审批对话框摘要：`Bash git commit -m "fix"`（超长截断）。"""
+        text = f"{tool_name} {dict(input)}"
+        return text if len(text) <= 200 else text[:200] + "…"
+
+    def _hook_file_path(self, input: dict[str, Any]) -> str:
+        """hook 上下文的 FILE_PATH：filesystem 工具取 path 参数，其余空串。"""
+        path = input.get("path")
+        return str(path) if isinstance(path, str) else ""
+
+    def _denied_result(self, tool_use: ToolUseBlock, message: str) -> ToolResult:
+        """权限拒绝/pre_tool 拦截结果：is_error 进历史 + 发 UI 事件展示原因。"""
+        result = self._error_result(tool_use, message)
+        self._events(
+            ToolResultEvent(
+                name=result.name,
+                content=result.content,
+                is_error=True,
+                duration_ms=0,
+            )
+        )
+        return result
+
+    def _run_hook(self, event: str, ctx: HookContext) -> None:
+        """生命周期/副作用 hook（06 §3.10）；hooks None = 无自动化，静默。"""
+        if self._hooks is None:
+            return
+        telemetry = self._telemetry
+        # 07：一次 hook 匹配 = 一个 hook.run span（event 入属性）。
+        hook_cm: AbstractContextManager[Span | None] = nullcontext(None)
+        if telemetry is not None:
+            hook_cm = telemetry.span("hook.run", "security", {"event": event})
+        with hook_cm:
+            self._hooks.run(event, ctx)
 
     def _error_result(self, tool_use: ToolUseBlock, message: str) -> ToolResult:
         return ToolResult(

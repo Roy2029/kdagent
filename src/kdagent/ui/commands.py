@@ -35,6 +35,8 @@ class UIController(Protocol):
     def clear_chat(self) -> None: ...
     def request_exit(self) -> None: ...
     def set_active_session(self, session: Session | None) -> None: ...
+    def set_permission_mode(self, mode: str) -> None: ...
+    def get_permission_mode(self) -> str: ...
 
 
 @dataclass
@@ -250,6 +252,25 @@ def _cmd_exit(ctx: CommandContext) -> None:
     ctx.ui.request_exit()
 
 
+# 06 M3 可控档：权限模式清单（/permissions 可切换；bypassPermissions 仅黑名单仍生效）。
+_PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
+
+
+def _cmd_permissions(ctx: CommandContext) -> None:
+    mode = ctx.ui.get_permission_mode()
+    if not ctx.args:
+        options = "、".join(f"/permissions {m}" for m in _PERMISSION_MODES)
+        lines = [f"当前权限模式：{mode}", f"可切换：{options}"]
+        ctx.ui.add_system_message("\n".join(lines))
+        return
+    target = ctx.args.strip().lower()
+    if target not in _PERMISSION_MODES:
+        ctx.ui.add_system_message(f"未知权限模式：{ctx.args}（可选：{'、'.join(_PERMISSION_MODES)}）")
+        return
+    ctx.ui.set_permission_mode(target)
+    ctx.ui.add_system_message(f"已切换到权限模式：{target}")
+
+
 def build_default_commands() -> CommandRegistry:
     """注册能跑档 7 个内置命令（05 §3.6）。"""
     registry = CommandRegistry()
@@ -318,6 +339,16 @@ def build_default_commands() -> CommandRegistry:
             usage="/exit",
             type="local",
             handler=_cmd_exit,
+        )
+    )
+    registry.register(
+        Command(
+            name="permissions",
+            aliases=["perm"],
+            description="权限模式：查看 / 切换（default/acceptEdits/plan/bypassPermissions）",
+            usage="/permissions [模式]",
+            type="local",
+            handler=_cmd_permissions,
         )
     )
     return registry

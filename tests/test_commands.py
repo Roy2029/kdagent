@@ -23,7 +23,16 @@ from kdagent.ui.commands import (
     parse_command,
 )
 
-TEST_COMMAND_NAMES = ["help", "status", "compact", "clear", "plan", "session", "exit"]
+TEST_COMMAND_NAMES = [
+    "help",
+    "status",
+    "compact",
+    "clear",
+    "plan",
+    "session",
+    "exit",
+    "permissions",
+]
 
 
 class RecordingUI:
@@ -55,6 +64,11 @@ class RecordingUI:
     def request_exit(self) -> None: ...
 
     def set_active_session(self, session: Session | None) -> None: ...
+
+    def set_permission_mode(self, mode: str) -> None: ...
+
+    def get_permission_mode(self) -> str:
+        return "default"
 
 
 def _ctx(
@@ -318,3 +332,43 @@ def test_session_list_shows_entries(tmp_path: Path) -> None:
     cmd = build_default_commands().find("session")
     cmd.handler(_ctx_session(tmp_path, ui, args="list"))  # type: ignore[union-attr]
     assert any(saved.id in m for m in ui.messages)
+
+
+# ---- /permissions（06 M3 可控档：权限模式查看/切换） -------------------------
+
+
+class _PermissionUI(RecordingUI):
+    """记录权限模式切换的 UI 替身。"""
+
+    def __init__(self, mode: str = "default") -> None:
+        super().__init__()
+        self.mode = mode
+
+    def set_permission_mode(self, mode: str) -> None:
+        self.mode = mode
+
+    def get_permission_mode(self) -> str:
+        return self.mode
+
+
+def test_permissions_no_args_shows_current_mode(tmp_path: Path) -> None:
+    ui = _PermissionUI(mode="acceptEdits")
+    cmd = build_default_commands().find("permissions")
+    cmd.handler(_ctx(tmp_path, ui))  # type: ignore[union-attr]
+    assert any("当前权限模式：acceptEdits" in m for m in ui.messages)
+
+
+def test_permissions_switch_mode(tmp_path: Path) -> None:
+    ui = _PermissionUI()
+    cmd = build_default_commands().find("permissions")
+    cmd.handler(_ctx(tmp_path, ui, args="plan"))  # type: ignore[union-attr]
+    assert ui.mode == "plan"
+    assert any("已切换到权限模式：plan" in m for m in ui.messages)
+
+
+def test_permissions_unknown_mode_guides(tmp_path: Path) -> None:
+    ui = _PermissionUI()
+    cmd = build_default_commands().find("permissions")
+    cmd.handler(_ctx(tmp_path, ui, args="nope"))  # type: ignore[union-attr]
+    assert ui.mode == "default"
+    assert any("未知权限模式" in m for m in ui.messages)

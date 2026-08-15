@@ -1,0 +1,72 @@
+"""L1 危险命令黑名单（规格 06 §3.3）。
+
+一组正则，命中直接 DENY，不经过任何规则/模式/确认。只对 Bash 生效——
+文件工具有路径沙箱（L2）守护，这里守护的是命令通道。
+
+按 shell 类型加载对应模式集：bash / powershell / cmd。本工具 Bash 经 Git Bash
+执行（`shutil.which("bash")` 优先），故默认加载 bash 模式集；PowerShell/cmd
+用户经 `permissions.blacklist_shell` 配置切换。
+"""
+
+from __future__ import annotations
+
+import re
+
+# (名称, 正则) 对——命中时 reason 报出命中的具体模式，便于定位。
+# bash 模式集（规格 06 §3.3 表，正则按 bash 语法）。
+_BASH: list[tuple[str, str]] = [
+    ("递归删除根目录", r"rm\s+(-[a-z]*[rf][a-z]*\s+)*/\s*$"),
+    ("格式化磁盘", r"mkfs\."),
+    ("直接写磁盘设备", r"dd\s+if=.*of=/dev/"),
+    ("递归改根目录权限", r"chmod\s+-R\s+777\s+(/|\./)?$"),
+    ("fork bomb", r":\(\)\{\s*:\s*\|\s*:\s*&\s*\};:"),
+    ("管道执行远程脚本(curl)", r"curl\s+.*\|\s*(ba|pw)?sh"),
+    ("管道执行远程脚本(wget)", r"wget\s+.*\|\s*(ba|pw)?sh"),
+    ("覆盖磁盘设备", r">\s*/dev/sd"),
+]
+
+# powershell 模式集（Windows 默认 shell；Remove-Item 递归强删 / 卷级格式化 / iex 远程执行）。
+_POWERSHELL: list[tuple[str, str]] = [
+    ("递归强制删除根目录", r"Remove-Item\s+.*(-Recurse|-Force).*[A-Za-z]:\\\s*$"),
+    ("卷级格式化", r"(Format-Volume|Initialize-Disk|Clear-Disk|format)\b"),
+    ("远程脚本执行(iex)", r"(Invoke-WebRequest|iwr|curl|wget)\s+.*\|\s*(iex|Invoke-Expression)"),
+    ("删除系统目录", r"Remove-Item\s+.*Windows\\System32"),
+]
+
+# cmd 模式集。
+_CMD: list[tuple[str, str]] = [
+    ("递归删除根目录", r"(del|erase)\s+(/[a-z]+\s+)+[A-Za-z]:\\\s*$"),
+    ("递归删除目录树", r"rd\s+(/[a-z]+\s+)+[A-Za-z]:\\\s*$"),
+    ("卷级格式化", r"(format\s+[A-Za-z]:|diskpart)"),
+    ("远程脚本执行", r"(curl|certutil\s+-decode)\s+.*\|\s*cmd"),
+]
+
+_SETS: dict[str, list[tuple[str, str]]] = {
+    "bash": _BASH,
+    "powershell": _POWERSHELL,
+    "cmd": _CMD,
+}
+
+
+class CommandBlacklist:
+    """危险命令黑名单。`match` 命中返回模式名（进 DENY reason），未命中返回 None。"""
+
+    def __init__(self, shell: str = "bash") -> None:
+        if shell not in _SETS:
+            raise ValueError(f"未知 shell 类型：{shell}（可选：{', '.join(_SETS)}）")
+        self._shell = shell
+        self._patterns = [(name, re.compile(pat, re.IGNORECASE)) for name, pat in _SETS[shell]]
+
+    @property
+    def shell(self) -> str:
+        return self._shell
+
+    def match(self, command: str) -> str | None:
+        """命中返回模式名（用于 DENY reason），未命中 None。"""
+        for name, pattern in self._patterns:
+            if pattern.search(command):
+                return name
+        return None
+
+    def __len__(self) -> int:
+        return len(self._patterns)

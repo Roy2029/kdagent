@@ -8,11 +8,15 @@ M1-c 阶段事件以同步 sink（Callable）emit；M1-e TUI 用 queue 消费。
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from kdagent.engine.llm.base import Usage
+
+# L5 HITL 裁决（06 §3.7）：用户拍板的三种结果；allow_always → 追加本地规则。
+PermissionVerdict = Literal["allow", "deny", "allow_always"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +89,18 @@ class MaxIterationsReachedEvent(AgentEvent):
     """迭代上限强制停止。"""
 
     limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionRequestEvent(AgentEvent):
+    """L5 HITL 权限审批请求（06 §3.7）：Agent Loop 阻塞等 UI 回传裁决。
+
+    `future`：UI 消费方用 `set_result(verdict)` 回传；verdict ∈ allow/deny/allow_always。
+    """
+
+    tool_name: str
+    summary: str
+    future: asyncio.Future[PermissionVerdict]
 
 
 AgentEventSink: TypeAlias = Callable[[AgentEvent], None]

@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pyperclip  # type: ignore[import-untyped]
 from textual import on, work
@@ -35,6 +35,8 @@ from kdagent.engine.events import (
     ErrorEvent,
     LoopCompleteEvent,
     MaxIterationsReachedEvent,
+    PermissionRequestEvent,
+    PermissionVerdict,
     StreamTextEvent,
     ToolResultEvent,
     ToolUseEvent,
@@ -42,7 +44,11 @@ from kdagent.engine.events import (
     UsageEvent,
 )
 from kdagent.engine.llm.base import LLMClient, Usage
+from kdagent.hooks.engine import HookEngine
+from kdagent.hooks.engine_types import HookContext
 from kdagent.obs import OTLPSpanExporter, SpanExporter, Telemetry
+from kdagent.permission.checker import PermissionChecker
+from kdagent.permission.modes import Mode
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.sessions.records import todo_items_from_raw
 from kdagent.tools.registry import ToolRegistry
@@ -53,7 +59,7 @@ from kdagent.ui.commands import (
     format_compact_report,
     parse_command,
 )
-from kdagent.ui.confirm import ConfirmDialog, ExitDialog
+from kdagent.ui.confirm import ConfirmDialog, ExitDialog, PermissionDialog
 from kdagent.ui.statusbar import StatusBar
 from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
@@ -202,7 +208,7 @@ class KDApp(App[None]):
     """KDAgent 主应用。实现 UIController，命令系统直接注入本实例。"""
 
     TITLE = "KDAgent"
-    SUB_TITLE = "能用档 · M2-e"
+    SUB_TITLE = "可控档 · M3-d"
     CSS = _CSS
     BINDINGS = [
         Binding("escape", "cancel_agent", "取消", show=False),
@@ -224,6 +230,8 @@ class KDApp(App[None]):
         model_name: str = "",
         obs_dir: Path | None = None,
         context_manager: ContextManager | None = None,
+        permission_checker: PermissionChecker | None = None,
+        hooks: HookEngine | None = None,
     ) -> None:
         super().__init__()
         self._config = config
@@ -253,10 +261,15 @@ class KDApp(App[None]):
             model_name=model_name,
             telemetry=self._telemetry,
             context_manager=context_manager,
+            permission_checker=permission_checker,
+            hooks=hooks,
         )
         if context_manager is not None:
             context_manager.set_session_id(self._session.id)  # 01：落盘目录随初始 sid
         self._context_manager = context_manager  # 04 §5 恢复③：/session resume 压缩接线
+        # 06 M3 可控档：五层裁决器 + Hook 引擎（cli 装配传入，/permissions 切换模式）。
+        self._permission_checker = permission_checker
+        self._hooks = hooks
         self._default_prompt = system_prompt
         self._agent_worker: Worker[Any] | None = None
         self._total_usage = Usage()
@@ -285,7 +298,11 @@ class KDApp(App[None]):
         self._status = self.query_one("#status", StatusBar)
         self._input = self.query_one("#input", ChatInput)
         self._input.focus()
+        self._run_app_hook("startup")  # 06 §3.10：应用生命周期 hook
         self.refresh_status()
+
+    def on_unmount(self) -> None:
+        self._run_app_hook("shutdown")
 
     # ---- 系统剪贴板（Textual 默认是进程内 _clipboard，不接系统剪贴板） -------
 
@@ -338,6 +355,8 @@ class KDApp(App[None]):
         elif isinstance(ev, MaxIterationsReachedEvent):
             chat.finish_stream()
             chat.append_error(f"达到迭代上限（{ev.limit} 轮），已强制停止。")
+        elif isinstance(ev, PermissionRequestEvent):
+            self._request_permission(ev)
 
     def _accumulate_usage(self, usage: Usage) -> None:
         self._total_usage = Usage(
@@ -486,6 +505,38 @@ class KDApp(App[None]):
         self.push_screen(ConfirmDialog(tool_name, tool_input), _on_result)
         return await future
 
+    # ---- 06 M3 可控档：L5 HITL 权限审批 + 应用生命周期 hook ----------------
+
+    def _request_permission(self, ev: PermissionRequestEvent) -> None:
+        """L5 HITL（06 §3.7）：弹 PermissionDialog，用户裁决回填 future。
+
+        `_on_event` 由 Agent 事件流同步调用，push_screen 立即返回（不阻塞事件流）；
+        Agent 侧阻塞在 `await future`，等用户点完按钮 dismiss 才继续。
+        """
+
+        def _on_result(verdict: str | None) -> None:
+            result = verdict if verdict is not None else "deny"
+            ev.future.set_result(cast(PermissionVerdict, result))
+
+        self.push_screen(PermissionDialog(ev.tool_name, ev.summary), _on_result)
+
+    def _run_app_hook(self, event: str) -> None:
+        """应用级生命周期 hook（startup/shutdown）；hooks None = 无自动化。"""
+        if self._hooks is not None:
+            self._hooks.run(event, HookContext(event=event))
+
+    def set_permission_mode(self, mode: str) -> None:
+        """切换五层裁决器模式（/permissions 命令；无 checker 时静默忽略）。"""
+        checker = self._permission_checker
+        if checker is not None:
+            checker.set_mode(cast(Mode, mode))
+            self.refresh_status()
+
+    def get_permission_mode(self) -> str:
+        """当前权限模式（无 checker 时显示 default 占位）。"""
+        checker = self._permission_checker
+        return checker.mode if checker is not None else "default"
+
     # ---- UIController 实现（命令系统依赖注入背包含 self） ------------------
 
     def add_system_message(self, text: str) -> None:
@@ -525,6 +576,7 @@ class KDApp(App[None]):
             window_size=WINDOW_SIZE,
             tool_count=self._agent.tool_count,
             work_dir=str(self._work_dir),
+            permission=self.get_permission_mode(),
         )
 
     def clear_chat(self) -> None:

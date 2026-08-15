@@ -19,6 +19,8 @@ from kdagent.engine.agent import DEFAULT_SYSTEM_PROMPT
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, LLMStreamEvent, Payload, ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
+from kdagent.hooks.engine import HookEngine
+from kdagent.permission.checker import build_permission_checker
 from kdagent.tools import build_default_registry
 from kdagent.ui.app import KDApp
 
@@ -70,6 +72,17 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     else:
         llm = _MissingKeyClient()
     kd_dir = work_dir / (config.kdagent_dir or ".kdagent")
+    # 06 M3 可控档：五层裁决器（默认模式来自 config.permissions.mode）+ Hook 引擎
+    # （config.hooks 列表）。本地规则 learn 目标 = 项目级 permissions.local.yaml。
+    permission_mode = config.permissions.get("mode", "default")
+    permission_checker = build_permission_checker(
+        work_dir,
+        mode=permission_mode if isinstance(permission_mode, str) else "default",
+        kdagent_dirs=[kd_dir],
+    )
+    hooks = HookEngine()
+    if config.hooks:
+        hooks.load({"hooks": config.hooks}, source="config.yaml")
     return KDApp(
         config=config,
         llm=llm,
@@ -82,6 +95,8 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         context_manager=ContextManager(
             kd_dir / "sessions", llm=llm, system_prompt=DEFAULT_SYSTEM_PROMPT
         ),
+        permission_checker=permission_checker,
+        hooks=hooks,
     )
 
 

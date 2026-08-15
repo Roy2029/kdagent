@@ -14,12 +14,19 @@ from conftest import FakeLLM
 from kdagent.config import Config
 from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
-from kdagent.engine.events import LoopCompleteEvent, StreamTextEvent, ToolResultEvent
+from kdagent.engine.events import (
+    LoopCompleteEvent,
+    PermissionRequestEvent,
+    StreamTextEvent,
+    ToolResultEvent,
+)
 from kdagent.engine.llm.base import LLMStreamEvent
 from kdagent.engine.messages import TextBlock
+from kdagent.permission.checker import PermissionChecker
 from kdagent.tools import build_default_registry
 from kdagent.ui.app import ChatInput, KDApp
 from kdagent.ui.chat import ChatView
+from kdagent.ui.confirm import PermissionDialog
 from kdagent.ui.statusbar import StatusBar
 from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
@@ -121,6 +128,37 @@ async def test_session_new_switches_conversation(tmp_path: Path) -> None:
         await pilot.pause()
         assert app._session.id != old_sid
         assert app._agent.conversation is not old_conv
+
+
+async def test_permission_request_dialog_resolves_future(tmp_path: Path) -> None:
+    """06 §3.7 HITL：PermissionRequestEvent → 弹 PermissionDialog，n 键 → future=deny。"""
+    app = _make_app(tmp_path)
+    future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    ev = PermissionRequestEvent(
+        tool_name="Bash", summary="Bash git status", future=future
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._on_event(ev)
+        await pilot.pause()
+        assert app.screen is PermissionDialog or any(
+            isinstance(s, PermissionDialog) for s in app.screen_stack
+        )
+        await pilot.press("n")  # 拒绝 → 回传 deny
+        await pilot.pause()
+        assert future.done() and future.result() == "deny"
+
+
+async def test_permission_mode_switch_updates_status(tmp_path: Path) -> None:
+    """/permissions plan → 状态栏显示权限 plan（无 checker 时静默）。"""
+    app = _make_app(tmp_path)
+    app._permission_checker = PermissionChecker(mode="default")  # type: ignore[assignment]
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.dispatch_command("permissions", "plan")
+        await pilot.pause()
+        status = app.query_one("#status", StatusBar)
+        assert "权限 plan" in str(status.render())
 
 
 async def test_session_resume_switches_conversation(tmp_path: Path) -> None:

@@ -15,11 +15,12 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
-# ModalScreen 子内容默认贴左上角；`ConfirmDialog/ExitDialog` 类选择器让 dialog 居中。
+# ModalScreen 子内容默认贴左上角；`ConfirmDialog/ExitDialog/PermissionDialog` 类
+# 选择器让 dialog 居中。
 # 注意：不能用 `Screen`/`ModalScreen` 基类选择器——Textual 8.2.8 下其 DEFAULT_CSS
 # 会覆盖 align（实测基类选择器不生效，具体类选择器才居中）。
 _DIALOG_CSS = """
-ConfirmDialog, ExitDialog { align: center middle; }
+ConfirmDialog, ExitDialog, PermissionDialog { align: center middle; }
 #dialog { width: 60; height: auto; min-height: 9; max-height: 18;
           border: thick $primary; background: $surface; padding: 1 2; }
 #dialog-title { text-align: center; }
@@ -76,6 +77,58 @@ class ConfirmDialog(ModalScreen[bool]):
 
     def action_focus_no(self) -> None:
         self.query_one("#no", Button).focus()
+
+
+class PermissionDialog(ModalScreen[str]):
+    """L5 HITL 权限审批（06 §3.7）：允许 / 拒绝 / 始终允许。
+
+    结果经 dismiss 回传裁决串（allow/deny/allow_always）；Esc 视为拒绝（None → deny）。
+    y/n/a 键直选；方向键在按钮间移动焦点。
+    """
+
+    CSS = _DIALOG_CSS
+    BINDINGS = [
+        Binding("y", "allow", "允许", show=False),
+        Binding("n", "deny", "拒绝", show=False),
+        Binding("a", "allow_always", "始终允许", show=False),
+        Binding("left", "focus_prev", "左", show=False),
+        Binding("right", "focus_next", "右", show=False),
+    ]
+
+    def __init__(self, tool_name: str, summary: str) -> None:
+        super().__init__()
+        self._tool_name = tool_name
+        self._summary = summary
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static(f"权限请求：{self._tool_name}", id="dialog-title")
+            args = self._summary or "（无参数）"
+            if len(args) > _MAX_ARGS_LEN:
+                args = args[:_MAX_ARGS_LEN] + "…"
+            yield Static(args, id="dialog-args")
+            with Horizontal(id="dialog-actions"):
+                yield Button("允许 (y)", variant="success", id="allow")
+                yield Button("拒绝 (n)", variant="error", id="deny")
+                yield Button("始终允许 (a)", variant="primary", id="allow_always")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(str(event.button.id))
+
+    def action_allow(self) -> None:
+        self.dismiss("allow")
+
+    def action_deny(self) -> None:
+        self.dismiss("deny")
+
+    def action_allow_always(self) -> None:
+        self.dismiss("allow_always")
+
+    def action_focus_prev(self) -> None:
+        self.query_one("#allow", Button).focus()
+
+    def action_focus_next(self) -> None:
+        self.query_one("#deny", Button).focus()
 
 
 class ExitDialog(ModalScreen[bool]):

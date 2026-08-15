@@ -24,11 +24,14 @@ class StatusBar(Static):
         work_dir: str,
         session_id: str | None = None,
         window_size: int | None = None,
+        permission: str = "",
     ) -> None:
         token_text = f"{token_count:,}"
         if window_size is not None:
             token_text = f"{token_text}/{window_size // 1000}k"
         parts = [f"[{mode}] tokens: {token_text}", f"工具 {tool_count}", work_dir]
+        if permission:
+            parts.append(f"权限 {permission}")
         if session_id:
             parts.append(session_id)
         self.update(" | ".join(parts))
