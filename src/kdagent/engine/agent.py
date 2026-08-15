@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -44,7 +44,9 @@ from kdagent.engine.llm.base import LLMClient, Payload, PromptTooLongError, Usag
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
 from kdagent.hooks.engine import HookEngine
 from kdagent.hooks.engine_types import HookContext
+from kdagent.memory.consolidator import MemoryConsolidator
 from kdagent.memory.extractor import MemoryExtractor
+from kdagent.memory.prompt import MEMORY_USAGE_INSTRUCTION
 from kdagent.memory.store import MemoryStore
 from kdagent.obs.log import payload_text, snapshot
 from kdagent.obs.model import Span
@@ -113,6 +115,7 @@ class Agent:
         hooks: HookEngine | None = None,
         memory_store: MemoryStore | None = None,
         memory_extractor: MemoryExtractor | None = None,
+        memory_consolidator: MemoryConsolidator | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -132,9 +135,11 @@ class Agent:
         # （升级为完整裁决系统，规格 06 §1）；hooks None = 无自动化（M1/M2 行为不变）。
         self._permission_checker = permission_checker
         self._hooks = hooks
-        # 08 M4 好用档：静默读注入（memory_store） + 静默写提取（memory_extractor）。
+        # 08 M4 好用档：静默读注入（memory_store） + 静默写提取（memory_extractor）
+        # + Dreaming 治理（memory_consolidator，门控通过则后台整理）。
         self._memory_store = memory_store
         self._memory_extractor = memory_extractor
+        self._memory_consolidator = memory_consolidator
         self._stop_reason = "completed"
         self._usage: Usage | None = None
         self._consecutive_failures = 0
@@ -214,6 +219,10 @@ class Agent:
                 raise
             except Exception:
                 pass
+        # 08 §3.6 Dreaming 治理：门控通过则后台调度整理（懒检查，同步返回零阻塞）。
+        if self._memory_consolidator is not None:
+            with suppress(Exception):
+                self._memory_consolidator.maybe_consolidate()
 
     async def _run_loop(self) -> None:
         """ReAct 主循环（从 run 提取，供 trace.run span 包住）。"""
@@ -403,11 +412,12 @@ class Agent:
             max_tokens = 4096
         # 08 §3.3 静默读：记忆索引随 CLAUDE.md 走同一管线注入（此处挂在 system，
         # 索引是动态增长的——build 时注入会过期，payload 组装时现取）。
+        # 08 §3.5 主动线：记忆使用说明随索引一起注入，让模型知道何时翻记忆。
         system = self._system_prompt
         if self._memory_store is not None:
             index = self._memory_store.index_markdown()
             if index:
-                system = f"{system}\n\n{index}"
+                system = f"{system}\n\n{index}\n\n{MEMORY_USAGE_INSTRUCTION}"
         return Payload(
             system=system,
             messages=self._conversation.messages,

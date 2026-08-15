@@ -18,20 +18,18 @@ if 距上次提取的累计增量 < EXTRACT_MIN_DELTA（20K tokens）: return # 
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 import time
 from collections.abc import Callable
 from typing import Any
 
 from kdagent.engine.conversation import ConversationManager
-from kdagent.engine.llm.base import LLMClient, Payload
+from kdagent.engine.llm.base import LLMClient
 from kdagent.memory.model import normalize_ops
+from kdagent.memory.ops import as_user_message, collect_ops_json
 from kdagent.memory.store import MemoryStore
 
 EXTRACT_MIN_INTERVAL = 10 * 60.0  # 秒：时间节流
 EXTRACT_MIN_DELTA = 20_000  # tokens：量级节流（滑动窗口累计）
-MAX_APPEND_CALLS = 2  # 单次调用不够时最多追加小调用次数
 
 # 提取指令（08 §3.4）：追加为最后一条 user 消息；交给 LLM 判断，不写规则引擎。
 _EXTRACT_INSTRUCTION = """下面是当前的记忆目录清单和最近对话的结尾部分。
@@ -49,9 +47,6 @@ _EXTRACT_INSTRUCTION = """下面是当前的记忆目录清单和最近对话的
 - 过时/被证伪的记忆用 delete
 - 没有值得记忆的内容输出 {"ops": []}，不要硬造
 """
-
-_JSON_RE = re.compile(r"\{.*\}", re.S)
-
 
 class MemoryExtractor:
     """双门槛节流 + 提取。`estimate` 注入 token 估算（默认 estimate_tokens 包装）。"""
@@ -115,42 +110,14 @@ class MemoryExtractor:
         self, conversation: ConversationManager, instruction: str
     ) -> Any:
         """流式收集 LLM 输出 → 解析 JSON；失败返回空结构（安全）。"""
-        payload = Payload(
+        # 提取指令追加为最后一条 user 消息（主上下文前缀缓存命中）。
+        return await collect_ops_json(
+            self._llm,
             system="你是 KDAgent 的记忆提取代理。只输出一个 JSON 对象。",
-            messages=[*conversation.messages],
-            max_tokens=4096,
+            messages=[*conversation.messages, as_user_message(instruction)],
         )
-        # 追加提取指令为最后一条 user 消息。
-        payload.messages.append(_as_user_message(instruction))
-        buf: list[str] = []
-        for _ in range(MAX_APPEND_CALLS):
-            buf.clear()
-            try:
-                async for ev in self._llm.stream_chat(payload):
-                    if ev.type == "text_delta" and ev.text:
-                        buf.append(ev.text)
-                text = "".join(buf)
-                m = _JSON_RE.search(text)
-                if m is not None:
-                    parsed = json.loads(m.group(0))
-                    if isinstance(parsed, (dict, list)):
-                        return parsed
-                if not buf:  # 空输出：什么都不做
-                    return {"ops": []}
-            except Exception:
-                return {"ops": []}
-            # 追加小调用：把上一次的 raw 输出作为修正输入（08 §3.4）。
-            retry_msg = f"上次输出无法解析：{text}。请重新输出合法 JSON。"
-            payload.messages.append(_as_user_message(retry_msg))
-        return {"ops": []}
 
     def _build_instruction(self, files: list[Any]) -> str:
         listing = "\n".join(f"- {f.name}（{f.type}）：{f.description}" for f in files)
         listing = listing or "（记忆目录为空）"
         return _EXTRACT_INSTRUCTION + f"\n\n记忆目录清单：\n{listing}"
-
-
-def _as_user_message(text: str) -> Any:
-    from kdagent.engine.messages import Message, TextBlock
-
-    return Message(role="user", content=[TextBlock(text)])

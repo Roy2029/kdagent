@@ -21,6 +21,7 @@ from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, LLMStreamEvent, Payload, ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
 from kdagent.hooks.engine import HookEngine
+from kdagent.memory.consolidator import MemoryConsolidator
 from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.store import build_memory_store
 from kdagent.permission.checker import build_permission_checker
@@ -95,6 +96,12 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         estimate=lambda conv: estimate_messages_tokens(conv.messages)
         + estimate_tokens(DEFAULT_SYSTEM_PROMPT),
     )
+    # 08 §3.6 Dreaming 治理：门控（时间/扫描/会话数）+ 锁 + 后台 LLM 整理。
+    memory_consolidator = MemoryConsolidator(
+        memory_store,
+        llm,
+        sessions_dir=kd_dir / "sessions",
+    )
     return KDApp(
         config=config,
         llm=llm,
@@ -111,6 +118,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         hooks=hooks,
         memory_store=memory_store,
         memory_extractor=memory_extractor,
+        memory_consolidator=memory_consolidator,
     )
 
 
