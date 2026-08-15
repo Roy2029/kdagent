@@ -63,6 +63,7 @@ from kdagent.ui.commands import (
     build_default_commands,
     format_compact_report,
     parse_command,
+    register_skill_commands,
 )
 from kdagent.ui.confirm import ConfirmDialog, ExitDialog, PermissionDialog
 from kdagent.ui.statusbar import StatusBar
@@ -288,6 +289,11 @@ class KDApp(App[None]):
         self._mcp_manager = mcp_manager
         # 09 M4-d Skill：SkillManager（/skills 查看清单；LoadSkill 已注册进 registry）。
         self._skill_manager = skill_manager
+        # 08 M4-e /memory 命令：记忆查看/管理（概要/list/add/delete/clear）。
+        self._memory_store = memory_store
+        # 09 §3.9 显式触发：已加载 Skill 自动注册 /name 命令（与内置冲突的跳过）。
+        if skill_manager is not None:
+            register_skill_commands(self._commands, skill_manager)
         self._default_prompt = system_prompt
         self._agent_worker: Worker[Any] | None = None
         self._total_usage = Usage()
@@ -455,6 +461,7 @@ class KDApp(App[None]):
             manual_compact=self._schedule_manual_compact,
             mcp_manager=self._mcp_manager,
             skill_manager=self._skill_manager,
+            memory_store=self._memory_store,
         )
 
     def _schedule_resume_compact(self, conversation: ConversationManager) -> None:

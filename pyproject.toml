@@ -1,6 +1,6 @@
 [project]
 name = "kdagent"
-version = "0.3.0"
+version = "0.4.0"
 description = "KDAgent - 类 Claude Code 的 Coding Agent（Python 3.11+ / Textual）"
 readme = "README.md"
 requires-python = ">=3.11"

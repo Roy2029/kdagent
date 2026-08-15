@@ -18,6 +18,8 @@ from kdagent.config import Config
 from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
 from kdagent.mcp.manager import MCPManager
+from kdagent.memory.model import MEMORY_TYPES, MemoryFile
+from kdagent.memory.store import MemoryStore
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.skill.manager import SkillManager
 
@@ -60,6 +62,8 @@ class CommandContext:
     # 09 M4-c/d 查看类命令：MCP 连接状态（/mcp）、Skill 清单（/skills）。
     mcp_manager: MCPManager | None = None
     skill_manager: SkillManager | None = None
+    # 08 M4-e：/memory 查看/管理记忆（概要/list/add/delete/clear）。
+    memory_store: MemoryStore | None = None
 
 
 @dataclass
@@ -294,6 +298,128 @@ def _cmd_skills(ctx: CommandContext) -> None:
     ctx.ui.add_system_message("\n".join(lines))
 
 
+def _cmd_memory(ctx: CommandContext) -> None:
+    """08 §3.5 /memory 命令：概要 / list / add / delete / clear（查看/管理记忆）。"""
+    store = ctx.memory_store
+    if store is None:
+        ctx.ui.add_system_message("记忆系统不可用。")
+        return
+    parts = ctx.args.split()
+    sub = parts[0] if parts else ""
+    if not sub:
+        entries = store.list_all()
+        if not entries:
+            ctx.ui.add_system_message("暂无记忆。可用 /memory add 手动添加。")
+            return
+        counts = {t: 0 for t in MEMORY_TYPES}
+        for e in entries:
+            counts[e.type] += 1
+        lines = [f"记忆 {len(entries)} 条："]
+        for t in MEMORY_TYPES:
+            if counts[t]:
+                lines.append(f"  {t}: {counts[t]}")
+        lines.append("/memory list 查看明细；/memory add 手动添加。")
+        ctx.ui.add_system_message("\n".join(lines))
+        return
+    if sub == "list":
+        entries = store.list_all()
+        if not entries:
+            ctx.ui.add_system_message("暂无记忆。")
+            return
+        lines = ["记忆列表："]
+        for e in entries:
+            scope = "用户" if e.type in ("user", "feedback") else "项目"
+            lines.append(f"  [{e.type}] {e.name}（{scope}）：{e.description or '(无描述)'}")
+        ctx.ui.add_system_message("\n".join(lines))
+        return
+    if sub == "add":
+        # /memory add <name> <type> <description> <content...>
+        if len(parts) < 4:
+            ctx.ui.add_system_message(
+                "/memory add <name> <type> <description> <content>：手动添加记忆"
+            )
+            return
+        name, raw_type, description = parts[1], parts[2], parts[3]
+        if raw_type not in MEMORY_TYPES:
+            ctx.ui.add_system_message(
+                f"type 需为 {'/'.join(MEMORY_TYPES)}（收到：{raw_type}）"
+            )
+            return
+        content = " ".join(parts[4:]) or description
+        # raw_type 经 MEMORY_TYPES 校验已收窄为 MemoryType
+        ok = store.create(
+            MemoryFile(name=name, description=description, type=raw_type, content=content)
+        )
+        ctx.ui.add_system_message(f"已添加记忆：{name}" if ok else f"记忆已存在：{name}")
+        return
+    if sub == "delete":
+        if len(parts) < 2:
+            ctx.ui.add_system_message("/memory delete <name>：删除指定记忆。")
+            return
+        ok = store.delete(parts[1])
+        ctx.ui.add_system_message(
+            f"已删除记忆：{parts[1]}" if ok else f"记忆不存在：{parts[1]}"
+        )
+        return
+    if sub == "clear":
+        entries = store.list_all()
+        for e in entries:
+            store.delete(e.name)
+        ctx.ui.add_system_message(f"已清空 {len(entries)} 条记忆。")
+        return
+    ctx.ui.add_system_message(
+        "/memory 支持：无参（概要）、list、add <name> <type> <description> <content>、"
+        "delete <name>、clear。"
+    )
+
+
+def skill_command_handler(skill_name: str) -> Callable[[CommandContext], None]:
+    """Skill 自动注册的 /name 命令 handler（09 §3.9 显式触发路径）。
+
+    prompt 类命令：加载完整 SOP（$ARGUMENTS 已替换为用户参数）→ 转发给 Agent
+    执行。fork 模式未落地 → 降级 inline + 警告（与 LoadSkill 同文案）。
+    """
+
+    def handler(ctx: CommandContext) -> None:
+        mgr = ctx.skill_manager
+        if mgr is None:
+            ctx.ui.add_system_message("Skill 系统不可用。")
+            return
+        skill = mgr.load(skill_name, ctx.args)
+        if skill is None:
+            ctx.ui.add_system_message(f"Skill 不存在：{skill_name}。")
+            return
+        body = skill.body
+        if skill.mode == "fork":
+            body = "⚠ fork 模式未落地，降级为 inline 执行。\n\n" + body
+        ctx.ui.send_user_message(body)
+
+    return handler
+
+
+def register_skill_commands(
+    registry: CommandRegistry, skill_manager: SkillManager
+) -> None:
+    """启动时把已加载 Skill 自动注册为 /name 命令（09 §3.9 显式触发路径）。
+
+    与内置/已有命令冲突的 Skill 跳过（如 name: help——命令重名启动即崩，跳过
+    并保留 LoadSkill/意图识别两条路径）。会话中新建的 Skill 需重启才注册命令
+    （仍可经 LoadSkill 使用）。
+    """
+    for skill in skill_manager.list():
+        if registry.find(skill.name) is not None:
+            continue
+        registry.register(
+            Command(
+                name=skill.name,
+                description=skill.description,
+                usage=f"/{skill.name} [参数]",
+                type="prompt",
+                handler=skill_command_handler(skill.name),
+            )
+        )
+
+
 # 06 M3 可控档：权限模式清单（/permissions 可切换；bypassPermissions 仅黑名单仍生效）。
 _PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
 
@@ -411,6 +537,15 @@ def build_default_commands() -> CommandRegistry:
             handler=_cmd_skills,
         )
     )
+    registry.register(
+        Command(
+            name="memory",
+            description="记忆：概要 / list / add / delete / clear",
+            usage="/memory [list|add <name> <type> <desc> <content>|delete <name>|clear]",
+            type="local",
+            handler=_cmd_memory,
+        )
+    )
     return registry
 
 
@@ -423,4 +558,5 @@ __all__ = [
     "build_default_commands",
     "format_compact_report",
     "parse_command",
+    "register_skill_commands",
 ]

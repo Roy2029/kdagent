@@ -12,6 +12,8 @@ from kdagent.config import Config
 from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
 from kdagent.mcp.manager import MCPManager
+from kdagent.memory.model import MemoryFile
+from kdagent.memory.store import MemoryStore
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.skill.manager import SkillManager
 from kdagent.tools import build_default_registry
@@ -23,6 +25,7 @@ from kdagent.ui.commands import (
     build_default_commands,
     format_compact_report,
     parse_command,
+    register_skill_commands,
 )
 
 TEST_COMMAND_NAMES = [
@@ -36,6 +39,7 @@ TEST_COMMAND_NAMES = [
     "permissions",
     "mcp",  # 09 M4-c：查看 MCP 连接状态
     "skills",  # 09 M4-d：查看已加载 Skill 清单
+    "memory",  # 08 M4-e：查看/管理记忆
 ]
 
 
@@ -82,6 +86,7 @@ def _ctx(
     manual_compact: Callable[[ConversationManager, str], None] | None = None,
     skill_manager: SkillManager | None = None,
     mcp_manager: MCPManager | None = None,
+    memory_store: MemoryStore | None = None,
 ) -> CommandContext:
     conv = ConversationManager()
     agent = Agent(
@@ -104,6 +109,7 @@ def _ctx(
         manual_compact=manual_compact,
         skill_manager=skill_manager,
         mcp_manager=mcp_manager,
+        memory_store=memory_store,
     )
 
 
@@ -430,3 +436,132 @@ def test_skills_empty_hints_creator(tmp_path: Path) -> None:
         _ctx(tmp_path, ui, skill_manager=mgr)
     )
     assert any("暂无可用 Skill" in m and "skill-creator" in m for m in ui.messages)
+
+
+# ---- /memory（08 M4-e：概要/list/add/delete/clear） -------------------------
+
+
+def _memory_store(tmp_path: Path) -> MemoryStore:
+    store = MemoryStore(tmp_path / "user", tmp_path / "proj")
+    store.create(MemoryFile(name="python-风格", description="PEP8 优先", type="user", content="用 type hints"))
+    store.create(MemoryFile(name="rag-方向", description="RAG 检索", type="project", content="向量库研究"))
+    return store
+
+
+def test_memory_summary_counts_by_type(tmp_path: Path) -> None:
+    ui = RecordingUI()
+    build_default_commands().find("memory").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, memory_store=_memory_store(tmp_path))
+    )
+    assert any("记忆 2 条" in m and "user: 1" in m and "project: 1" in m for m in ui.messages)
+
+
+def test_memory_list_shows_entries(tmp_path: Path) -> None:
+    ui = RecordingUI()
+    build_default_commands().find("memory").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, args="list", memory_store=_memory_store(tmp_path))
+    )
+    assert any("python-风格" in m and "rag-方向" in m for m in ui.messages)
+
+
+def test_memory_add_delete_clear(tmp_path: Path) -> None:
+    store = MemoryStore(tmp_path / "user", tmp_path / "proj")
+    ui = RecordingUI()
+    cmd = build_default_commands().find("memory")
+
+    cmd.handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, args="add 新记忆 feedback 纠正 应该用 X", memory_store=store)
+    )
+    assert any("已添加记忆：新记忆" in m for m in ui.messages)
+    assert store.read("新记忆") is not None
+    assert store.read("新记忆").content == "应该用 X"
+
+    cmd.handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, args="add 新记忆 user 重复", memory_store=store)
+    )
+    assert any("记忆已存在" in m for m in ui.messages)
+
+    cmd.handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, args="delete 新记忆", memory_store=store)
+    )
+    assert store.read("新记忆") is None
+
+    store.create(MemoryFile(name="a", description="a", type="user", content="a"))
+    cmd.handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, args="clear", memory_store=store)
+    )
+    assert store.list_all() == []
+
+
+def test_memory_invalid_type_guides(tmp_path: Path) -> None:
+    ui = RecordingUI()
+    build_default_commands().find("memory").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, args="add x nope 描述", memory_store=MemoryStore(tmp_path / "u", tmp_path / "p"))
+    )
+    assert any("type 需为" in m for m in ui.messages)
+
+
+# ---- Skill 自动注册 Slash 命令（09 M4-e：/name 显式触发） -------------------
+
+
+def test_register_skill_commands_auto_slash(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir(parents=True)
+    (root / "commit.md").write_text(
+        "---\nname: commit\ndescription: 分析 git 变更\n---\n\n# 步骤\n1. git status\n参数：$ARGUMENTS\n",
+        encoding="utf-8",
+    )
+    mgr = SkillManager([root])
+    mgr.scan()
+    reg = build_default_commands()
+    register_skill_commands(reg, mgr)
+    cmd = reg.find("commit")
+    assert cmd is not None
+    assert cmd.type == "prompt"
+    assert "/commit" in cmd.usage  # type: ignore[operator]
+
+
+def test_register_skill_commands_skips_builtin_conflict(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir(parents=True)
+    (root / "help.md").write_text(
+        "---\nname: help\ndescription: 试图占用内置命令\n---\n\nbody\n", encoding="utf-8"
+    )
+    mgr = SkillManager([root])
+    mgr.scan()
+    reg = build_default_commands()
+    register_skill_commands(reg, mgr)
+    # 不注册：/help 已被内置占用（描述仍是内置的）；Skill 仍可经 LoadSkill 触发
+    assert "列出命令" in reg.find("help").description  # type: ignore[union-attr]
+    assert mgr.get("help") is not None
+
+
+class _SendingUI(RecordingUI):
+    """记录 send_user_message（prompt 类命令把 SOP 转发给 Agent 的载体）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sent: list[str] = []
+
+    def send_user_message(self, text: str) -> None:
+        self.sent.append(text)
+
+
+def test_skill_slash_command_dispatches_sop(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir(parents=True)
+    (root / "commit.md").write_text(
+        "---\nname: commit\ndescription: 分析 git 变更\n---\n\n# 步骤\n1. git status\n参数：$ARGUMENTS\n",
+        encoding="utf-8",
+    )
+    mgr = SkillManager([root])
+    mgr.scan()
+    reg = build_default_commands()
+    register_skill_commands(reg, mgr)
+    ui = _SendingUI()
+    reg.find("commit").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, args="加个 docs", skill_manager=mgr)
+    )
+    # prompt 类命令：SOP（$ARGUMENTS 已替换）作为用户消息转发给 Agent 执行
+    assert any("参数：加个 docs" in m for m in ui.sent)
+    assert any("1. git status" in m for m in ui.sent)
