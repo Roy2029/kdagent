@@ -2,6 +2,7 @@
 
 用法：
 - kdagent eval <tasks.json>                         跑一轮评测
+- kdagent eval <tasks.json> --workers N             并发跑批（§3.7 可并行，D64；默认 1 顺序）
 - kdagent eval <tasks.json> --report <run_id>      只读复核（11 §3.4：失败题 → span 树 → 事件流）
 - kdagent eval <tasks.json> --annotate <run_id> <task_id> <kind> [--note ...]   人工批注修正归类
 
@@ -97,8 +98,12 @@ def load_tasks_file(path: Path) -> tuple[str, Path, Path, list[EvalTask]]:
     return str(data.get("run_id", "eval-default")), repo_dir, work_dir, tasks
 
 
-def run_eval_cli(tasks_file: Path) -> int:
-    """跑一轮评测并打印报告（退出码：0 全过 / 1 有失败 / 2 配置错误）。"""
+def run_eval_cli(tasks_file: Path, workers: int = 1) -> int:
+    """跑一轮评测并打印报告（退出码：0 全过 / 1 有失败 / 2 配置错误）。
+
+    `workers > 1` 走并发跑批（11 §3.7 可并行）：Semaphore 限并发，单任务异常
+    隔离记 harness_fault，不中断整批。
+    """
     try:
         run_id, repo_dir, work_dir, tasks = load_tasks_file(tasks_file)
     except ValueError as exc:
@@ -140,7 +145,7 @@ def run_eval_cli(tasks_file: Path) -> int:
         task_loader=lambda: tasks,
         obs_dir=obs_dir,
     )
-    report: EvalReport = asyncio.run(eval_runner.run(run_id))
+    report: EvalReport = asyncio.run(eval_runner.run(run_id, max_workers=workers))
     persist_report(work_dir, run_id, report)
     print(report.summary())
     if report.failed:

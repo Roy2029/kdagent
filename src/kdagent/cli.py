@@ -79,6 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
     eval_p = sub.add_parser("eval", help="跑一轮评测（11 评估体系）")
     eval_p.add_argument("tasks", help="评测配置 JSON 文件（tasks.json 结构见 kdagent.eval.cli）")
     eval_p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help="并发跑批数（11 §3.7 可并行；默认 1 顺序跑）",
+    )
+    eval_p.add_argument(
         "--report",
         metavar="RUN_ID",
         help="只读复核（11 §3.4）：失败题 → span 树 → 事件流阅读，不需要 api_key",
@@ -287,7 +294,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(run_diff_cli(Path(args.tasks), run_a, run_b))
         if args.metrics:
             raise SystemExit(run_metrics_cli(Path(args.tasks), args.metrics))
-        raise SystemExit(run_eval_cli(Path(args.tasks)))
+        raise SystemExit(run_eval_cli(Path(args.tasks), workers=args.workers))
     work_dir = Path(args.dir) if args.dir else None
     # 方案 A：Windows 终端不支持 Kitty 时禁用（对齐 Claude Code 回退传统流），
     # 恢复中文 IME；非 win32 为 no-op（compat.patch_windows_input）。

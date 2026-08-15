@@ -11,6 +11,7 @@ SubAgentRunner.run_to_completion 在副本目录跑（work_dir=副本）→ 无 
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import io
 import os
@@ -175,14 +176,44 @@ class EvalRunner:
         # 供失败定位（11 §3.4/§3.5，trace_store.load_traces / failed_events）。
         self._telemetry = Telemetry(obs_dir) if obs_dir is not None else None
 
-    async def run(self, run_id: str) -> EvalReport:
+    async def run(self, run_id: str, max_workers: int = 1) -> EvalReport:
+        """跑批（§3.2 第 2 步）：`max_workers=1` 顺序，>1 并发（§3.7 可并行）。
+
+        D64 起支持并发：asyncio.Semaphore 限并发 + gather 并行跑 `_safe_task`。
+        单任务异常由 `_safe_task` 隔离（记 harness_fault，不中断整批）。
+        """
+        if max_workers < 1:
+            raise ValueError("max_workers 必须 >= 1")
         tasks = self._task_loader()
         report = EvalReport(run_id=run_id, tasks=tasks)
         start = time.perf_counter()
-        for task in tasks:
-            await self._run_task(report, task)
+        if max_workers == 1:
+            for task in tasks:
+                await self._safe_task(report, task)
+        else:
+            sem = asyncio.Semaphore(max_workers)
+
+            async def _guarded(task: EvalTask) -> None:
+                async with sem:
+                    await self._safe_task(report, task)
+
+            await asyncio.gather(*(_guarded(task) for task in tasks))
         report.metrics.wall_s = time.perf_counter() - start
         return report
+
+    async def _safe_task(self, report: EvalReport, task: EvalTask) -> None:
+        """单任务执行 + 异常隔离：封史/跑批异常记 harness_fault，不拖垮整批（§3.7）。"""
+        report.metrics.total += 1  # 每个任务计一次（成功/失败都计）
+        try:
+            await self._run_task(report, task)
+        except Exception as exc:  # noqa: BLE001 —— 单任务异常只该记一笔
+            report.failed.append(
+                FailureCase(
+                    instance_id=task.instance_id,
+                    kind="harness_fault",
+                    reason=f"跑批异常：{type(exc).__name__}: {exc}",
+                )
+            )
 
     async def _run_task(self, report: EvalReport, task: EvalTask) -> None:
         work = self._work_dir / task.instance_id
@@ -207,7 +238,6 @@ class EvalRunner:
             if token is not None and self._telemetry is not None:
                 self._telemetry.reset_trace_attributes(token)
         model_patch = extract_patch(sealed)
-        report.metrics.total += 1
         report.metrics.total_turns += result.turns
         report.metrics.total_tokens += (
             result.usage.input_tokens + result.usage.output_tokens
