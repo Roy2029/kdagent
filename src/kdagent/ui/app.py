@@ -70,6 +70,7 @@ from kdagent.ui.commands import (
     register_skill_commands,
 )
 from kdagent.ui.confirm import ConfirmDialog, ExitDialog, PermissionDialog
+from kdagent.ui.evalreport import EvalReportScreen
 from kdagent.ui.statusbar import StatusBar
 from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
@@ -578,6 +579,10 @@ class KDApp(App[None]):
         """应用级生命周期 hook（startup/shutdown）；hooks None = 无自动化。"""
         if self._hooks is not None:
             self._hooks.run(event, HookContext(event=event))
+
+    def open_eval_report(self, run_id: str) -> None:
+        """11 §3.4 TUI 版：`/eval report` 打开内嵌评测报告屏（只读浏览 + 批注）。"""
+        self.push_screen(EvalReportScreen(run_id, self._work_dir))
 
     def set_permission_mode(self, mode: str) -> None:
         """切换五层裁决器模式（/permissions 命令；无 checker 时静默忽略）。"""

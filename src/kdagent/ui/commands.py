@@ -43,6 +43,8 @@ class UIController(Protocol):
     def set_active_session(self, session: Session | None) -> None: ...
     def set_permission_mode(self, mode: str) -> None: ...
     def get_permission_mode(self) -> str: ...
+    # 11 §3.4 TUI 版：/eval report <run_id> 打开评测报告屏（Textual Screen）。
+    def open_eval_report(self, run_id: str) -> None: ...
 
 
 @dataclass
@@ -485,6 +487,21 @@ def register_skill_commands(
 _PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
 
 
+def _cmd_eval(ctx: CommandContext) -> None:
+    """11 §3.4 TUI 版评测报告：`/eval report <run_id>` 打开内嵌报告屏。
+
+    失败题索引 → span 树 → 事件详情 + 批注，命令语法与 CLI `--report` 一致。
+    其余评测子命令（跑批/对比/报表）在 CLI 执行（11 §3.9 长任务后台），TUI 只读。
+    """
+    parts = ctx.args.split(maxsplit=1)
+    if not parts or parts[0] != "report" or len(parts) < 2:
+        ctx.ui.add_system_message(
+            "用法：/eval report <run_id>（打开评测报告屏，只读；跑批/对比/报表用 CLI）"
+        )
+        return
+    ctx.ui.open_eval_report(parts[1])
+
+
 def _cmd_permissions(ctx: CommandContext) -> None:
     mode = ctx.ui.get_permission_mode()
     if not ctx.args:
@@ -578,6 +595,15 @@ def build_default_commands() -> CommandRegistry:
             usage="/permissions [模式]",
             type="local",
             handler=_cmd_permissions,
+        )
+    )
+    registry.register(
+        Command(
+            name="eval",
+            description="评测报告（11 §3.4 TUI 版）：/eval report <run_id> 打开报告屏",
+            usage="/eval report <run_id>",
+            type="local",
+            handler=_cmd_eval,
         )
     )
     registry.register(

@@ -44,6 +44,7 @@ TEST_COMMAND_NAMES = [
     "memory",  # 08 M4-e：查看/管理记忆
     "tasks",  # 10 M5-a：后台任务便捷列表
     "worktree",  # 10 M5-b：隔离工作目录 list/remove/cleanup
+    "eval",  # 11 §3.4 TUI 版：/eval report <run_id> 打开评测报告屏
 ]
 
 
