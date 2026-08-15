@@ -22,6 +22,10 @@ from kdagent.obs.model import LogLevel, Span, SpanLog, Trace, gen_id, now_ms
 
 _current_span_id: ContextVar[str | None] = ContextVar("_current_span_id", default=None)
 _current_trace: ContextVar[Trace | None] = ContextVar("_current_trace", default=None)
+# 预置 trace attributes（07 §3.8 eval.run_id/task_id）：contextvar 隔离——每个
+# asyncio.Task 独立上下文副本，并发子代理各自 set 互不覆盖（D60，替代实例级可变状态）。
+# default=None 而非 {}（B039：ContextVar 默认值不可变，可变共享会跨上下文串改）。
+_trace_attrs: ContextVar[dict[str, Any] | None] = ContextVar("_trace_attrs", default=None)
 
 
 class Telemetry:
@@ -45,19 +49,24 @@ class Telemetry:
         self.log_full_prompt = log_full_prompt
         self._enabled = enabled
         self._trace_token: Any | None = None
-        self._preset_attributes: dict[str, Any] = {}  # 实例级预置（07 §3.8 eval 标记）
 
     @property
     def enabled(self) -> bool:
         return self._enabled
 
-    def set_trace_attributes(self, attributes: dict[str, Any]) -> None:
+    def set_trace_attributes(self, attributes: dict[str, Any]) -> Any:
         """预置本次 begin_trace 的 trace attributes（07 §3.8：eval.run_id/task_id 关联）。
 
-        eval runner 每任务前调用，子 Agent 内部 begin_trace 时自动带上；串行跑批安全，
-        并发子代理共享实例会竞争（评估并发跑批留待后续，记待决）。
+        写 contextvar（D60）：每个 asyncio.Task 有独立上下文副本，**并发子代理各自
+        set 互不覆盖**（原实例级可变状态在并发下会互相串标记）。调用方应持返回的
+        token 在作用域结束 reset（eval runner try/finally）；不 reset 时同 task 内
+        多次 set 覆盖累积，串行语义与原实现一致。
         """
-        self._preset_attributes = dict(attributes)
+        return _trace_attrs.set(dict(attributes))
+
+    def reset_trace_attributes(self, token: Any) -> None:
+        """撤销一次 set_trace_attributes（恢复该作用域之前的标记，防跨任务残留）。"""
+        _trace_attrs.reset(token)
 
     def begin_trace(
         self,
@@ -68,7 +77,7 @@ class Telemetry:
         """02 Agent.run() 进入时调用：创建 Trace 并设为当前，落头行。"""
         if not self._enabled:
             return None
-        merged = {**self._preset_attributes, **(attributes or {})}
+        merged = {**(_trace_attrs.get() or {}), **(attributes or {})}
         trace = Trace(
             trace_id=gen_id(),
             session_id=session_id,

@@ -190,13 +190,22 @@ class EvalRunner:
             shutil.rmtree(work)
         sealed = seal_copy(self._source_repo, task.base_commit, work)
         prompt = self._build_prompt(task)
-        if self._telemetry is not None:
+        # 07 §3.8 eval 标记：contextvar 隔离（D60）——并发跑批各自 set 互不覆盖，
+        # try/finally reset 防跨任务残留。
+        token = (
             self._telemetry.set_trace_attributes(
                 {"eval.run_id": report.run_id, "eval.task_id": task.instance_id}
             )
-        result = await self._runner.run_to_completion(
-            self._definition, prompt, work_dir=sealed, telemetry=self._telemetry
+            if self._telemetry is not None
+            else None
         )
+        try:
+            result = await self._runner.run_to_completion(
+                self._definition, prompt, work_dir=sealed, telemetry=self._telemetry
+            )
+        finally:
+            if token is not None and self._telemetry is not None:
+                self._telemetry.reset_trace_attributes(token)
         model_patch = extract_patch(sealed)
         report.metrics.total += 1
         report.metrics.total_turns += result.turns

@@ -5,6 +5,7 @@ Telemetry 预置 eval 标记 → 子代理 run 全程产 trace → 落盘 → tr
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from conftest import FakeLLM, done, tool_call
@@ -21,21 +22,59 @@ from kdagent.tools import build_default_registry
 
 def test_telemetry_preset_attributes_merged(tmp_path: Path) -> None:
     telemetry = Telemetry(tmp_path)
-    telemetry.set_trace_attributes({"eval.run_id": "run-1"})
-    trace = telemetry.begin_trace("s", "snap", attributes={"eval.task_id": "task-a"})
-    assert trace is not None
-    assert trace.attributes == {"eval.run_id": "run-1", "eval.task_id": "task-a"}
+    token = telemetry.set_trace_attributes({"eval.run_id": "run-1"})
+    try:
+        trace = telemetry.begin_trace("s", "snap", attributes={"eval.task_id": "task-a"})
+        assert trace is not None
+        assert trace.attributes == {"eval.run_id": "run-1", "eval.task_id": "task-a"}
+    finally:
+        telemetry.reset_trace_attributes(token)
     telemetry.end_trace()
 
 
 def test_telemetry_preset_persists_across_traces(tmp_path: Path) -> None:
+    """同一 set 覆盖多 trace（eval runner 单任务多 trace 语义）。"""
     telemetry = Telemetry(tmp_path)
-    telemetry.set_trace_attributes({"eval.run_id": "run-1"})
-    t1 = telemetry.begin_trace("s1", "a")
-    telemetry.end_trace()
-    t2 = telemetry.begin_trace("s2", "b")
-    assert t1 is not None and t2 is not None
-    assert t2.attributes.get("eval.run_id") == "run-1"  # 同实例多任务共享标记
+    token = telemetry.set_trace_attributes({"eval.run_id": "run-1"})
+    try:
+        t1 = telemetry.begin_trace("s1", "a")
+        telemetry.end_trace()
+        t2 = telemetry.begin_trace("s2", "b")
+        assert t1 is not None and t2 is not None
+        assert t2.attributes.get("eval.run_id") == "run-1"  # 同实例多任务共享标记
+        telemetry.end_trace()
+    finally:
+        telemetry.reset_trace_attributes(token)
+
+
+async def test_telemetry_preset_concurrent_isolation(tmp_path: Path) -> None:
+    """并发子代理共享实例：contextvar 隔离（D60）——各自 set 互不覆盖标记。"""
+    telemetry = Telemetry(tmp_path)
+
+    async def make(run_id: str, task_id: str) -> object:
+        # 每个 asyncio.Task 复制独立上下文副本，set/reset 只作用于本 task（try/finally 镜像 eval runner）
+        token = telemetry.set_trace_attributes({"eval.run_id": run_id, "eval.task_id": task_id})
+        try:
+            tr = telemetry.begin_trace(f"s-{task_id}", "题目")
+            telemetry.end_trace()
+            return tr
+        finally:
+            telemetry.reset_trace_attributes(token)
+
+    a, b = await asyncio.gather(make("run-1", "task-a"), make("run-1", "task-b"))
+    assert a is not None and b is not None
+    assert a.attributes["eval.task_id"] == "task-a"  # type: ignore[union-attr]
+    assert b.attributes["eval.task_id"] == "task-b"  # type: ignore[union-attr]
+
+
+def test_telemetry_preset_reset_restores_default(tmp_path: Path) -> None:
+    """set → reset → 恢复无标记（eval runner try/finally 防跨任务残留）。"""
+    telemetry = Telemetry(tmp_path)
+    token = telemetry.set_trace_attributes({"eval.run_id": "run-1"})
+    telemetry.reset_trace_attributes(token)
+    tr = telemetry.begin_trace("s", "题目")
+    assert tr is not None
+    assert tr.attributes == {}  # reset 后标记不残留
     telemetry.end_trace()
 
 
@@ -45,16 +84,19 @@ def test_telemetry_preset_persists_across_traces(tmp_path: Path) -> None:
 def _export_fixture(obs_dir: Path) -> None:
     """JsonlExporter 落盘一条带 eval 标记的 trace：1 个 is_error tool span + 1 ok span。"""
     telemetry = Telemetry(obs_dir)
-    telemetry.set_trace_attributes({"eval.run_id": "run-1", "eval.task_id": "task-b"})
-    trace = telemetry.begin_trace("sess-1", "题目")
-    assert trace is not None
-    with telemetry.span("tool.exec", "tool", {"tool": "EditFile", "input": {"path": "src/a.py"}}) as s1:
-        if s1 is not None:
-            s1.attributes["is_error"] = True
-            s1.status = "error"
-    with telemetry.span("tool.exec", "tool", {"tool": "ReadFile", "input": {"path": "src/a.py"}}):
-        pass  # ok span
-    telemetry.end_trace()
+    token = telemetry.set_trace_attributes({"eval.run_id": "run-1", "eval.task_id": "task-b"})
+    try:
+        trace = telemetry.begin_trace("sess-1", "题目")
+        assert trace is not None
+        with telemetry.span("tool.exec", "tool", {"tool": "EditFile", "input": {"path": "src/a.py"}}) as s1:
+            if s1 is not None:
+                s1.attributes["is_error"] = True
+                s1.status = "error"
+        with telemetry.span("tool.exec", "tool", {"tool": "ReadFile", "input": {"path": "src/a.py"}}):
+            pass  # ok span
+        telemetry.end_trace()
+    finally:
+        telemetry.reset_trace_attributes(token)
 
 
 def test_load_traces_filters_by_run_and_task(tmp_path: Path) -> None:
@@ -96,7 +138,7 @@ async def test_run_to_completion_emits_eval_trace(tmp_path: Path) -> None:
     definition = AgentDef(name="d", description="d", system_prompt="p", max_turns=5)
     obs_dir = tmp_path / "obs"
     telemetry = Telemetry(obs_dir)
-    telemetry.set_trace_attributes({"eval.run_id": "run-9", "eval.task_id": "task-x"})
+    token = telemetry.set_trace_attributes({"eval.run_id": "run-9", "eval.task_id": "task-x"})
     runner = SubAgentRunner(
         llm=FakeLLM(
             [tool_call("TodoWrite", {"todos": [{"content": "目标", "tasks": []}]}), done("完成")]
@@ -105,7 +147,10 @@ async def test_run_to_completion_emits_eval_trace(tmp_path: Path) -> None:
         config=Config(),
         work_dir=tmp_path,
     )
-    result = await runner.run_to_completion(definition, "任务", telemetry=telemetry)
+    try:
+        result = await runner.run_to_completion(definition, "任务", telemetry=telemetry)
+    finally:
+        telemetry.reset_trace_attributes(token)
     assert "完成" in result.text
     traces = load_traces(obs_dir, run_id="run-9", task_id="task-x")
     assert len(traces) == 1
