@@ -42,17 +42,24 @@ class ToolContext:
     tool_use_id: str = ""
     confirm: AsyncConfirm | None = None
     todos: TodosCallback | None = None
+    # 01 §5.2 L1 落盘目录（{sessions_dir}/{sid}/tool-results/），ReadFile 读回豁免用
+    persist_dir: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
-    """工具执行结果（03 §3.2；07 可观测性消费 duration_ms）。"""
+    """工具执行结果（03 §3.2；07 可观测性消费 duration_ms）。
+
+    persist_exempt：01 §5.2 L1 读回豁免——ReadFile 读回落盘文件时置 True，
+    入口处理器跳过 L1（否则永远读不到全文）。
+    """
 
     tool_use_id: str
     name: str
     content: str
     is_error: bool = False
     duration_ms: int = 0
+    persist_exempt: bool = False
 
 
 class Tool(Protocol):

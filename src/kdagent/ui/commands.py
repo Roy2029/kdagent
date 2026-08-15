@@ -30,6 +30,7 @@ class UIController(Protocol):
     def set_plan_mode(self, enabled: bool) -> None: ...
     def is_plan_mode(self) -> bool: ...
     def get_token_count(self) -> int: ...
+    def get_context_tokens(self) -> int: ...
     def refresh_status(self) -> None: ...
     def clear_chat(self) -> None: ...
     def request_exit(self) -> None: ...
@@ -48,6 +49,10 @@ class CommandContext:
     config: Config
     registry: CommandRegistry | None = None
     session_manager: SessionManager | None = None
+    # 04 §5 恢复③：/session resume 超 AUTO_COMPACT_TRIGGER 时触发压缩（App 异步接线）
+    resume_compact: Callable[[ConversationManager], None] | None = None
+    # 05 §3.6：/compact 手动压缩（App 同步调度异步执行；str=带参保留重点，同 resume 模式）
+    manual_compact: Callable[[ConversationManager, str], None] | None = None
 
 
 @dataclass
@@ -152,15 +157,24 @@ def _cmd_status(ctx: CommandContext) -> None:
     ctx.ui.add_system_message("\n".join(lines))
 
 
+def format_compact_report(before: int, after: int) -> str:
+    """压缩前后 token 对比（05 §3.6：/compact 显示前后对比）。"""
+    saved = max(0, before - after)
+    return f"上下文压缩完成：{before:,} → {after:,} tokens（释放 {saved:,}）"
+
+
 def _cmd_compact(ctx: CommandContext) -> None:
-    token = ctx.ui.get_token_count()
+    # 窗口口径（05 §3.2：当前上下文占用/窗口上限）——<5K 无需压缩
+    token = ctx.ui.get_context_tokens()
     if token < 5000:
-        ctx.ui.add_system_message("当前 token 低于 5K，无需压缩。")
+        ctx.ui.add_system_message("当前上下文低于 5K token，无需压缩。")
         return
-    # 01 三层压缩 M2 落地（13 路线图 M2-c）；M1-e 提供占位与前置检查。
-    ctx.ui.add_system_message(
-        "上下文压缩引擎（01 三层压缩）在 M2 落地，当前仅做 token 检查。"
-    )
+    if ctx.manual_compact is None:
+        ctx.ui.add_system_message("上下文压缩能力不可用（未接入 L3 压缩引擎）。")
+        return
+    # 01 §7 手动触发：与自动共用同一套 L3 逻辑，仅触发方式不同（App 异步执行）；
+    # 带参 = 保留重点（05 §3.6），透传给 Compactor 注入摘要指令。
+    ctx.manual_compact(ctx.conversation, ctx.args)
 
 
 def _cmd_clear(ctx: CommandContext) -> None:
@@ -212,7 +226,7 @@ def _cmd_session(ctx: CommandContext) -> None:
             ctx.ui.add_system_message("/session resume <id>：恢复指定会话。")
             return
         try:
-            session = mgr.resume(arg)
+            session = mgr.resume(arg, compact=ctx.resume_compact)
         except FileNotFoundError as exc:
             ctx.ui.add_system_message(str(exc))
             return
@@ -316,5 +330,6 @@ __all__ = [
     "CommandType",
     "UIController",
     "build_default_commands",
+    "format_compact_report",
     "parse_command",
 ]

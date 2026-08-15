@@ -25,6 +25,8 @@ from textual.widgets import Header, TextArea
 from textual.worker import Worker
 
 from kdagent.config import Config
+from kdagent.context.compactor import WINDOW_SIZE, estimate_messages_tokens, estimate_tokens
+from kdagent.context.context_manager import ContextManager
 from kdagent.engine.agent import DEFAULT_SYSTEM_PROMPT, Agent
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.events import (
@@ -40,19 +42,24 @@ from kdagent.engine.events import (
     UsageEvent,
 )
 from kdagent.engine.llm.base import LLMClient, Usage
+from kdagent.obs import OTLPSpanExporter, SpanExporter, Telemetry
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.sessions.records import todo_items_from_raw
 from kdagent.tools.registry import ToolRegistry
 from kdagent.ui.chat import ChatView
-from kdagent.ui.commands import CommandContext, build_default_commands, parse_command
+from kdagent.ui.commands import (
+    CommandContext,
+    build_default_commands,
+    format_compact_report,
+    parse_command,
+)
 from kdagent.ui.confirm import ConfirmDialog, ExitDialog
 from kdagent.ui.statusbar import StatusBar
 from kdagent.ui.todoregion import TodoRegion
 from kdagent.ui.toolregion import ToolRegion
 
 PLAN_SYSTEM_PROMPT = (
-    "你是 KDAgent。当前处于 Plan 模式：只读探索、制定方案，"
-    "不要修改文件或执行有副作用的操作。"
+    "你是 KDAgent。当前处于 Plan 模式：只读探索、制定方案，不要修改文件或执行有副作用的操作。"
 )
 
 # Claude Code 风格布局（05 §3.1）：Chat 主区 1fr，todo/tools 有内容才展开，
@@ -175,11 +182,27 @@ class ChatInput(TextArea):
         self.post_message(self.TabComplete())
 
 
+def _build_telemetry(config: Config, obs_dir: Path | None) -> Telemetry | None:
+    """按配置组装 07 Telemetry：exporter 可插拔（otel.enabled）、脱敏规则、全文日志。"""
+    if obs_dir is None:
+        return None
+    exporter: SpanExporter | None = None
+    if bool(config.otel.get("enabled")):
+        exporter = OTLPSpanExporter(str(config.otel.get("endpoint", "")))
+    sanitize = config.obs.get("sanitize")
+    return Telemetry(
+        obs_dir,
+        exporter=exporter,
+        sanitize_rules=sanitize if isinstance(sanitize, dict) else None,
+        log_full_prompt=bool(config.debug.get("log_full_prompt", False)),
+    )
+
+
 class KDApp(App[None]):
     """KDAgent 主应用。实现 UIController，命令系统直接注入本实例。"""
 
     TITLE = "KDAgent"
-    SUB_TITLE = "能跑档 · M1-e"
+    SUB_TITLE = "能用档 · M2-e"
     CSS = _CSS
     BINDINGS = [
         Binding("escape", "cancel_agent", "取消", show=False),
@@ -198,13 +221,20 @@ class KDApp(App[None]):
         work_dir: Path,
         sessions_dir: Path | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        model_name: str = "",
+        obs_dir: Path | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         super().__init__()
         self._config = config
         self._work_dir = work_dir
-        self._session_manager = SessionManager(sessions_dir or Path(".kdagent") / "sessions")
+        self._session_manager = SessionManager(
+            sessions_dir or Path(".kdagent") / "sessions", obs_dir=obs_dir
+        )
         # 当前会话（M1-f：App 持 Session，Agent 对话实时落盘，/session 切换）。
         self._session = self._session_manager.create(conversation)
+        # 07 埋点 sink（M2-d）：trace 落盘 {kdagent_dir}/obs/traces/{sid}/。
+        self._telemetry = _build_telemetry(config, obs_dir)
         # 属性名不用 `_registry`：Textual 内部也有 `_registry`（其 CommandRegistry），
         # 同名会覆盖冲突（启动即崩）。
         self._commands = build_default_commands()
@@ -219,7 +249,14 @@ class KDApp(App[None]):
             confirm=self._confirm,
             todos=self._on_todos,
             on_conversation_change=self._on_conversation_change,
+            session_id=self._session.id,
+            model_name=model_name,
+            telemetry=self._telemetry,
+            context_manager=context_manager,
         )
+        if context_manager is not None:
+            context_manager.set_session_id(self._session.id)  # 01：落盘目录随初始 sid
+        self._context_manager = context_manager  # 04 §5 恢复③：/session resume 压缩接线
         self._default_prompt = system_prompt
         self._agent_worker: Worker[Any] | None = None
         self._total_usage = Usage()
@@ -322,8 +359,9 @@ class KDApp(App[None]):
             todo_region.show_todos(items)
 
     def _on_conversation_change(self) -> None:
-        """每落一条消息后实时写盘（04 §3.2 实时落盘；todos 随最新记录落盘）。"""
+        """每落一条消息后实时写盘（04 §3.2 实时落盘）+ 刷新状态栏窗口占用（05 §3.2）。"""
         self._session.flush_last()
+        self.refresh_status()
 
     # ---- 用户输入：命令快车道 vs Agent Loop（05 §3.3） ---------------------
 
@@ -370,7 +408,59 @@ class KDApp(App[None]):
             config=self._config,
             registry=self._commands,
             session_manager=self._session_manager,
+            resume_compact=self._schedule_resume_compact,
+            manual_compact=self._schedule_manual_compact,
         )
+
+    def _schedule_resume_compact(self, conversation: ConversationManager) -> None:
+        """04 §5 恢复③：/session resume 超阈时的压缩入口（同步调度、异步执行）。
+
+        只在事件循环里调度，不在命令 handler 里阻塞等压缩——resume 立即返回，
+        压缩任务随后跑；失败静默（主循环阶段 A 会兜底再试）。
+        """
+        if self._context_manager is None:
+            return
+        asyncio.create_task(self._run_resume_compact(conversation))
+
+    async def _run_resume_compact(self, conversation: ConversationManager) -> None:
+        cm = self._context_manager
+        if cm is None:
+            return
+        # resume 压缩失败不阻塞恢复；01 §6.1 主循环阶段 A 兜底再试。
+        with contextlib.suppress(Exception):
+            await cm.force_compact(conversation)
+
+    def _schedule_manual_compact(self, conversation: ConversationManager, focus: str) -> None:
+        """05 §3.6：/compact 调度入口（同步调度、异步执行，同 resume 压缩模式）。
+
+        focus = /compact 带参的保留重点；压缩后由 `_run_manual_compact` 报前后对比。
+        """
+        if self._context_manager is None:
+            self.add_system_message("上下文压缩能力不可用（未接入 L3 压缩引擎）。")
+            return
+        asyncio.create_task(self._run_manual_compact(conversation, focus))
+
+    async def _run_manual_compact(
+        self, conversation: ConversationManager, focus: str
+    ) -> None:
+        """执行手动压缩 + 前后 token 对比 + 刷新 ChatView/状态栏（05 §5 验收项）。"""
+        cm = self._context_manager
+        if cm is None:
+            return
+        before = self.get_context_tokens()
+        try:
+            await cm.manual_compact(conversation, focus=focus)
+        except Exception as exc:
+            chat = self._chat
+            if chat is not None:
+                chat.append_error(f"压缩失败：{exc}")
+            return
+        after = self.get_context_tokens()
+        self.add_system_message(format_compact_report(before, after))
+        chat = self._chat
+        if chat is not None:
+            chat.load_conversation(conversation.messages)  # 摘要消息替代早期原文
+        self.refresh_status()
 
     @work(group="agent", exclusive=False)
     async def run_agent(self, text: str) -> None:
@@ -415,6 +505,15 @@ class KDApp(App[None]):
         u = self._total_usage
         return u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_creation_tokens
 
+    def get_context_tokens(self) -> int:
+        """当前上下文窗口占用估算（05 §3.2 tokens: x/y k 的 x；压缩前后对比口径）。
+
+        = system prompt + 全部消息（01 §5.4 窗口口径，同 Agent 阶段 A 判定）。
+        """
+        return estimate_messages_tokens(self._agent.conversation.messages) + estimate_tokens(
+            self._agent.system_prompt
+        )
+
     def refresh_status(self) -> None:
         status = self._status
         if status is None:
@@ -422,7 +521,8 @@ class KDApp(App[None]):
         mode = "PLAN" if self._plan_mode else "DEFAULT"
         status.update_status(
             mode=mode,
-            token_count=self.get_token_count(),
+            token_count=self.get_context_tokens(),
+            window_size=WINDOW_SIZE,
             tool_count=self._agent.tool_count,
             work_dir=str(self._work_dir),
         )
@@ -438,6 +538,7 @@ class KDApp(App[None]):
             return
         self._session = session
         self._agent.set_conversation(session.conversation)
+        self._agent.set_session_id(session.id)  # 07：trace 关联切换后的 sid
         chat = self._chat
         if chat is not None:
             chat.load_conversation(session.conversation.messages)

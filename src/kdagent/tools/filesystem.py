@@ -22,6 +22,7 @@ def _result(
     content: str,
     start: float,
     is_error: bool = False,
+    persist_exempt: bool = False,
 ) -> ToolResult:
     return ToolResult(
         tool_use_id=ctx.tool_use_id,
@@ -29,6 +30,7 @@ def _result(
         content=content,
         is_error=is_error,
         duration_ms=int((time.perf_counter() - start) * 1000),
+        persist_exempt=persist_exempt,
     )
 
 
@@ -126,7 +128,11 @@ class ReadFile:
             lines[offset : offset + int(limit)] if limit is not None else lines[offset:]
         )
         content = "".join(f"{i + 1 + offset}: {line}" for i, line in enumerate(lines))
-        return _result(ctx, self.name, content, start)
+        # 01 §5.2 读回闭环：读回落盘文件（tool-results 目录内）→ 豁免 L1 二次落盘。
+        persist_exempt = (
+            ctx.persist_dir is not None and path.is_relative_to(ctx.persist_dir)
+        )
+        return _result(ctx, self.name, content, start, persist_exempt=persist_exempt)
 
 
 class WriteFile:

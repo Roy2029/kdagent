@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 from kdagent.config import Config
+from kdagent.context.compactor import ContextFullError, estimate_messages_tokens, estimate_tokens
+from kdagent.context.context_manager import ContextManager
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.events import (
     AgentEventSink,
@@ -35,8 +38,11 @@ from kdagent.engine.events import (
     TurnCompleteEvent,
     UsageEvent,
 )
-from kdagent.engine.llm.base import LLMClient, Payload, Usage
+from kdagent.engine.llm.base import LLMClient, Payload, PromptTooLongError, Usage
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
+from kdagent.obs.log import payload_text, snapshot
+from kdagent.obs.model import Span
+from kdagent.obs.telemetry import Telemetry
 from kdagent.tools.base import AsyncConfirm, TodosCallback, ToolContext, ToolResult
 from kdagent.tools.registry import ToolRegistry
 
@@ -92,6 +98,10 @@ class Agent:
         confirm: AsyncConfirm | None = None,
         todos: TodosCallback | None = None,
         on_conversation_change: Callable[[], None] | None = None,
+        session_id: str = "",
+        model_name: str = "",
+        telemetry: Telemetry | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -103,15 +113,31 @@ class Agent:
         self._confirm = confirm  # 05 UI 确认钩子，None = 非交互环境直接执行
         self._todos = todos  # 03 TodoWrite 归一化回调 → 会话状态 + UI 渲染
         self._on_conversation_change = on_conversation_change  # 每次落一条消息后回调
+        self._session_id = session_id  # 07 trace 关联（04 sid，/session 切换时更新）
+        self._model_name = model_name or config.model  # llm.call span 记录 model（D9）
+        self._telemetry = telemetry  # 07 埋点 sink，None = 无 obs 环境
+        self._context_manager = context_manager  # 01 工具结果入口分发（M2-a L1 落盘）
+        self._stop_reason = "completed"
         self._usage: Usage | None = None
         self._consecutive_failures = 0
         self._turn = 0
         self._pending_text: list[str] = []
         self._pending_tool_uses: list[ToolUseBlock] = []
 
+    def set_session_id(self, sid: str) -> None:
+        """切换会话时更新 trace 关联的 session_id + 上下文落盘目录（04 /session new/resume）。"""
+        self._session_id = sid
+        if self._context_manager is not None:
+            self._context_manager.set_session_id(sid)
+
     def set_system_prompt(self, text: str) -> None:
         """运行时切换 system prompt（05 /plan 模式切换用）。"""
         self._system_prompt = text
+
+    @property
+    def system_prompt(self) -> str:
+        """当前 system prompt（05 状态栏/上下文窗口估算用）。"""
+        return self._system_prompt
 
     @property
     def tool_count(self) -> int:
@@ -142,49 +168,80 @@ class Agent:
         """跑完整循环直到终止；用户取消或超限也干净返回。"""
         self._conversation.add_user_message(user_input)
         self._notify_conversation_change()
+        self._stop_reason = "completed"
+        telemetry = self._telemetry
+        # 07：一次 Agent.run() = 一条 Trace（根 span=trace.run，记停止原因）。
+        root_cm: AbstractContextManager[Span | None] = nullcontext(None)
+        if telemetry is not None:
+            telemetry.begin_trace(self._session_id, user_input[:200])
+            root_cm = telemetry.span(
+                "trace.run", "session", {"user_input_snapshot": user_input[:200]}
+            )
+        with root_cm as root_span:
+            try:
+                await self._run_loop()
+            finally:
+                if root_span is not None:
+                    root_span.attributes["stop_reason"] = self._stop_reason
+                if telemetry is not None:
+                    telemetry.end_trace()
+
+    async def _run_loop(self) -> None:
+        """ReAct 主循环（从 run 提取，供 trace.run span 包住）。"""
         for turn in range(MAX_ITERATIONS):
             self._turn = turn
             try:
                 status = await self._loop_iteration()
             except asyncio.CancelledError:
                 # 停止条件 3：用户取消。已收部分落成一条消息，不碎不丢。
+                self._stop_reason = "cancelled"
                 self._flush_partial()
                 self._events(CancelledEvent())
                 return
             if status == "TERMINAL":
                 return
         # 停止条件 2：迭代上限强制停止，提示用户。
+        self._stop_reason = "max-iterations"
         self._events(MaxIterationsReachedEvent(limit=MAX_ITERATIONS))
 
     async def _loop_iteration(self) -> AgentStatus:
         # 恢复四步②（04 §3.4）：链修复守在"发请求前"这一个出口——悬空 tool_use
         # 补错误结果、孤儿 tool_result 剔除，保证交替/配对合法。
         self._conversation.repair_chain()
+        # 阶段 A（01 §6.1）：每轮 API 前预防性压缩。FORCE 超限先压（失败即终止），
+        # AUTO 尽力而为（失败只熔断自动路径，不终止）。压缩成功已由 ContextManager
+        # 整体重写会话文件（04 §3.5），不触发 _notify_conversation_change。
+        if (
+            self._context_manager is not None
+            and await self._precompact_if_needed() == "TERMINAL"
+        ):
+            return "TERMINAL"
         payload = self._assemble_payload()
         self._pending_text = []
         self._pending_tool_uses = []
-        try:
-            async for ev in self._llm.stream_chat(payload):
-                if ev.type == "text_delta":
-                    self._pending_text.append(ev.text or "")
-                    self._events(StreamTextEvent(ev.text or ""))
-                elif ev.type == "tool_use" and ev.tool_use is not None:
-                    self._pending_tool_uses.append(ev.tool_use)
-                    self._events(
-                        ToolUseEvent(
-                            id=ev.tool_use.id, name=ev.tool_use.name, input=ev.tool_use.input
-                        )
-                    )
-                elif ev.type == "usage" and ev.usage is not None:
-                    self._usage = ev.usage
-                    self._events(UsageEvent(ev.usage))
-                elif ev.type == "error" and ev.error is not None:
-                    raise ev.error
-        except Exception as exc:
-            # 停止条件 4（provider 异常）：上报并终止，不无限重试（M1-c 简化）。
-            self._flush_partial()
-            self._events(ErrorEvent(error=str(exc)))
-            return "TERMINAL"
+        # 阶段 B（01 §6 ③）：prompt_too_long 撞墙 → 紧急压缩 → 重建 payload 重试一次。
+        retry = 0
+        while True:
+            err = await self._stream_llm(payload)
+            if err is None:
+                break
+            if (
+                not isinstance(err, PromptTooLongError)
+                or retry >= 1
+                or self._context_manager is None
+            ):
+                # 停止条件 4（provider 异常）：上报并终止，不无限重试（M1-c 简化）。
+                self._stop_reason = "error"
+                self._flush_partial()
+                self._events(ErrorEvent(error=str(err)))
+                return "TERMINAL"
+            # 清半截缓冲，走 force 预算压一次；失败（含预算耗尽）须终止。
+            self._pending_text = []
+            self._pending_tool_uses = []
+            if await self._emergency_compact(payload) == "TERMINAL":
+                return "TERMINAL"
+            payload = self._assemble_payload()
+            retry += 1
 
         tool_uses = self._pending_tool_uses
         blocks = self._assemble_blocks(self._pending_text, tool_uses)
@@ -199,6 +256,7 @@ class Agent:
             batches = partition_tool_calls(tool_uses, self._tools)
             for batch in batches:
                 results = await self._execute_batch(batch)
+                results = await self._process_results(results)
                 self._conversation.add_tool_results(results)
                 self._notify_conversation_change()
                 self._update_circuit_breaker(results)
@@ -207,6 +265,96 @@ class Agent:
         # 停止条件 1：模型主动完成（无 tool_use）。
         self._events(LoopCompleteEvent(turns=self._turn + 1, usage=self._usage))
         return "TERMINAL"
+
+    async def _precompact_if_needed(self) -> AgentStatus:
+        """阶段 A（01 §6.1）：每轮 API 前预防性压缩判定。
+
+        FORCE_COMPACT 走 force 预算，失败（含预算耗尽 → ContextFullError）必须终止；
+        AUTO_COMPACT 尽力而为，失败只熔断自动路径，不终止。
+        """
+        cm = self._context_manager
+        assert cm is not None
+        check = cm.check_before_call(self._estimate_context_tokens())
+        if check == "FORCE_COMPACT":
+            try:
+                await cm.force_compact(self._conversation, prefix=self._assemble_payload())
+            except Exception as exc:
+                self._stop_reason = "context-full" if isinstance(exc, ContextFullError) else "error"
+                self._events(ErrorEvent(error=str(exc)))
+                return "TERMINAL"
+        elif check == "AUTO_COMPACT":
+            await cm.auto_compact(self._conversation, prefix=self._assemble_payload())
+        return "CONTINUE"
+
+    async def _emergency_compact(self, prefix: Payload) -> AgentStatus:
+        """阶段 B（01 §6 ③）：prompt_too_long 撞墙后走 force 预算压一次再重试。"""
+        cm = self._context_manager
+        assert cm is not None
+        try:
+            await cm.emergency_compact(self._conversation, prefix=prefix)
+        except Exception as exc:
+            self._stop_reason = "context-full" if isinstance(exc, ContextFullError) else "error"
+            self._events(ErrorEvent(error=str(exc)))
+            return "TERMINAL"
+        return "CONTINUE"
+
+    async def _stream_llm(self, payload: Payload) -> Exception | None:
+        """流式调一次 LLM（llm.call span + prompt 日志）；异常返回，由调用方决定重试/终止。
+
+        prompt 日志（07 §3.4 + D9 `debug.log_full_prompt`）：默认只落摘要（长度 + 首尾
+        片段），开关打开才落全文。全文含本地业务代码，防误导出泄露。
+        """
+        telemetry = self._telemetry
+        # 07：一次 LLM 调用 = 一个 llm.call span（model/耗时/tokens）。
+        llm_cm: AbstractContextManager[Span | None] = nullcontext(None)
+        if telemetry is not None:
+            llm_cm = telemetry.span("llm.call", "client", {"model": self._model_name})
+        with llm_cm as llm_span:
+            log_full = bool(self._config.debug.get("log_full_prompt", False))
+            if llm_span is not None and telemetry is not None:
+                text = payload_text(payload)
+                telemetry.add_log(
+                    llm_span.span_id,
+                    "debug",
+                    text if log_full else snapshot(text),
+                    {"full": log_full},
+                )
+            try:
+                async for ev in self._llm.stream_chat(payload):
+                    if ev.type == "text_delta":
+                        self._pending_text.append(ev.text or "")
+                        self._events(StreamTextEvent(ev.text or ""))
+                    elif ev.type == "tool_use" and ev.tool_use is not None:
+                        self._pending_tool_uses.append(ev.tool_use)
+                        self._events(
+                            ToolUseEvent(
+                                id=ev.tool_use.id, name=ev.tool_use.name, input=ev.tool_use.input
+                            )
+                        )
+                    elif ev.type == "usage" and ev.usage is not None:
+                        self._usage = ev.usage
+                        if llm_span is not None:
+                            llm_span.attributes.update(
+                                input_tokens=ev.usage.input_tokens,
+                                output_tokens=ev.usage.output_tokens,
+                                cache_read_tokens=ev.usage.cache_read_tokens,
+                                cache_creation_tokens=ev.usage.cache_creation_tokens,
+                            )
+                        self._events(UsageEvent(ev.usage))
+                    elif ev.type == "error" and ev.error is not None:
+                        raise ev.error
+            except Exception as exc:
+                if llm_span is not None and telemetry is not None:
+                    llm_span.status = "error"
+                    telemetry.add_log(llm_span.span_id, "error", f"{type(exc).__name__}: {exc}")
+                return exc
+        return None
+
+    def _estimate_context_tokens(self) -> int:
+        """当前上下文 token 估算（01 §5.4 窗口口径）：system + 全部消息。"""
+        return estimate_messages_tokens(self._conversation.messages) + estimate_tokens(
+            self._system_prompt
+        )
 
     def _assemble_payload(self) -> Payload:
         max_tokens = self._config.extra.get("max_tokens")
@@ -218,6 +366,24 @@ class Agent:
             tools=self._tools.schemas(),
             max_tokens=max_tokens,
         )
+
+    async def _process_results(self, results: list[ToolResult]) -> list[ToolResult]:
+        """01 入口处理（L1 落盘 + L2 在线摘要，M2）：历史只放预览/摘要+路径。
+
+        处理发生在写入历史之前（01 P3：预处理必须在写入前）。content 被替换为
+        最终形态，`persisted`/`compressed` 元信息由 ContextManager 内部持有，Agent 不感知。
+
+        `p_tokens`：已有上下文 token（L2 经济性判定，01 §5.3）——system + 当前消息
+        （含本轮 tool_use，尚未写入本批 tool_result）；`prefix`：主调用 payload，
+        L2 摘要复用其前缀命中缓存。
+        """
+        if self._context_manager is None:
+            return results
+        prefix = self._assemble_payload()
+        processed = await self._context_manager.on_tool_results(
+            results, self._estimate_context_tokens(), prefix=prefix
+        )
+        return [replace(r, content=p.content) for r, p in zip(results, processed, strict=True)]
 
     def _assemble_blocks(
         self, text_parts: list[str], tool_uses: list[ToolUseBlock]
@@ -290,10 +456,22 @@ class Agent:
                 )
             )
             return result
-        try:
-            result = await tool.execute(ctx, tool_use.input)
-        except Exception as exc:
-            result = self._error_result(tool_use, f"执行异常：{exc}")
+        telemetry = self._telemetry
+        # 07：一次工具执行 = 一个 tool.exec span（复用 ToolResult.duration_ms/is_error）。
+        tool_cm: AbstractContextManager[Span | None] = nullcontext(None)
+        if telemetry is not None:
+            tool_cm = telemetry.span("tool.exec", "tool", {"tool": tool_use.name})
+        with tool_cm as tool_span:
+            try:
+                result = await tool.execute(ctx, tool_use.input)
+            except Exception as exc:
+                result = self._error_result(tool_use, f"执行异常：{exc}")
+            # 必须在 span 关闭（__exit__ 落盘）前写入，否则属性丢失。
+            if tool_span is not None:
+                tool_span.attributes["is_error"] = result.is_error
+                tool_span.attributes["duration_ms"] = result.duration_ms
+                if result.is_error:
+                    tool_span.status = "error"
         self._events(
             ToolResultEvent(
                 name=result.name,
@@ -320,7 +498,5 @@ class Agent:
             self._consecutive_failures += sum(1 for r in results if r.is_error)
         if self._consecutive_failures >= CIRCUIT_BREAK_LIMIT:
             self._consecutive_failures = 0
-            self._conversation.add_user_message(
-                "", extra_blocks=[TextBlock(_CIRCUIT_REMINDER)]
-            )
+            self._conversation.add_user_message("", extra_blocks=[TextBlock(_CIRCUIT_REMINDER)])
             self._notify_conversation_change()

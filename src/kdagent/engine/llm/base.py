@@ -13,6 +13,10 @@ from typing import Any, Literal, Protocol
 from kdagent.engine.messages import Message, ToolUseBlock
 
 
+class PromptTooLongError(RuntimeError):
+    """API 返回上下文超长（prompt too long）——01 §6 ③ 紧急压缩触发点。"""
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
     """Provider 配置，分发到对应 adapter（D9 多 provider 抽象）。"""

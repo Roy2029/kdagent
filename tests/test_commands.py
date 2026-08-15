@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from kdagent.ui.commands import (
     CommandRegistry,
     UIController,
     build_default_commands,
+    format_compact_report,
     parse_command,
 )
 
@@ -43,6 +45,9 @@ class RecordingUI:
     def get_token_count(self) -> int:
         return 0
 
+    def get_context_tokens(self) -> int:
+        return 0
+
     def refresh_status(self) -> None: ...
 
     def clear_chat(self) -> None: ...
@@ -52,7 +57,12 @@ class RecordingUI:
     def set_active_session(self, session: Session | None) -> None: ...
 
 
-def _ctx(tmp_path: Path, ui: UIController, args: str = "") -> CommandContext:
+def _ctx(
+    tmp_path: Path,
+    ui: UIController,
+    args: str = "",
+    manual_compact: Callable[[ConversationManager, str], None] | None = None,
+) -> CommandContext:
     conv = ConversationManager()
     agent = Agent(
         config=Config(),
@@ -71,6 +81,7 @@ def _ctx(tmp_path: Path, ui: UIController, args: str = "") -> CommandContext:
         config=Config(),
         registry=build_default_commands(),
         session_manager=SessionManager(tmp_path / ".kdagent" / "sessions"),
+        manual_compact=manual_compact,
     )
 
 
@@ -175,6 +186,52 @@ def test_compact_below_threshold_hints_no_need(tmp_path: Path) -> None:
     ui = RecordingUI()
     build_default_commands().find("compact").handler(_ctx(tmp_path, ui))  # type: ignore[union-attr]
     assert any("无需压缩" in m for m in ui.messages)
+
+
+# ---- /compact（M2-e：与自动共用 L3 逻辑 + 前后对比） -------------------------
+
+
+class _CompactingUI(RecordingUI):
+    """高上下文 token 的 UI 替身（触发 /compact 调度路径）。"""
+
+    def __init__(self, tokens: int = 100_000) -> None:
+        super().__init__()
+        self.tokens = tokens
+
+    def get_context_tokens(self) -> int:
+        return self.tokens
+
+
+def test_compact_dispatches_manual_compact(tmp_path: Path) -> None:
+    """/compact（token ≥5K）→ 调度 manual_compact，focus 为空。"""
+    ui = _CompactingUI()
+    calls: list[tuple[ConversationManager, str]] = []
+    ctx = _ctx(tmp_path, ui, manual_compact=lambda conv, focus: calls.append((conv, focus)))
+    build_default_commands().find("compact").handler(ctx)  # type: ignore[union-attr]
+    assert len(calls) == 1 and calls[0][1] == ""
+
+
+def test_compact_forwards_focus(tmp_path: Path) -> None:
+    """/compact <重点>：参数作为保留重点传给 manual_compact（05 §3.6 带参）。"""
+    ui = _CompactingUI()
+    calls: list[str] = []
+    ctx = _ctx(tmp_path, ui, args="bug A", manual_compact=lambda conv, focus: calls.append(focus))
+    build_default_commands().find("compact").handler(ctx)  # type: ignore[union-attr]
+    assert calls == ["bug A"]
+
+
+def test_compact_without_ability_guides(tmp_path: Path) -> None:
+    """manual_compact 未注入（未接 L3）→ 提示能力不可用。"""
+    ui = _CompactingUI()
+    ctx = _ctx(tmp_path, ui)
+    build_default_commands().find("compact").handler(ctx)  # type: ignore[union-attr]
+    assert any("压缩能力不可用" in m for m in ui.messages)
+
+
+def test_compact_report_shows_before_after() -> None:
+    """前后 token 对比文案（05 §5：显示前后对比）。"""
+    text = format_compact_report(120_000, 30_000)
+    assert "120,000" in text and "30,000" in text and "90,000" in text
 
 
 # ---- /session resume/new/delete（M1-f 接线） --------------------------------

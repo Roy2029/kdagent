@@ -21,6 +21,11 @@ class Config:
     kdagent_dir: str = ".kdagent"
     model: str = ""
     extra: dict[str, object] = field(default_factory=dict)
+    # 07 可观测性（M2）：debug.log_full_prompt 全文日志开关；
+    # otel.enabled 切 OTLP exporter（M2 仅接口）；obs.sanitize 出口脱敏规则。
+    debug: dict[str, object] = field(default_factory=dict)
+    otel: dict[str, object] = field(default_factory=dict)
+    obs: dict[str, object] = field(default_factory=dict)
 
 
 def load_config() -> Config:

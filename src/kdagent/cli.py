@@ -14,6 +14,8 @@ from pathlib import Path
 from kdagent import __version__
 from kdagent.compat import patch_windows_input
 from kdagent.config import load_api_key, load_config
+from kdagent.context.context_manager import ContextManager
+from kdagent.engine.agent import DEFAULT_SYSTEM_PROMPT
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMClient, LLMStreamEvent, Payload, ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
@@ -51,28 +53,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_kdapp(work_dir: Path | None = None) -> KDApp:
-    """组装真实依赖：DeepSeek（OpenAI 兼容 adapter）+ 7 工具 + 会话目录。"""
+    """组装真实依赖：DeepSeek（OpenAI 兼容 adapter）+ 7 工具 + 会话目录 + 07 obs。"""
     config = load_config()
     work_dir = (work_dir or Path.cwd()).resolve()
     api_key = load_api_key()
+    model = config.model or "deepseek-chat"
     if api_key:
         llm: LLMClient = OpenAICompatClient(
             ProviderConfig(
                 protocol="openai",
-                model=config.model or "deepseek-chat",
+                model=model,
                 base_url="https://api.deepseek.com/v1",
                 api_key=api_key,
             )
         )
     else:
         llm = _MissingKeyClient()
+    kd_dir = work_dir / (config.kdagent_dir or ".kdagent")
     return KDApp(
         config=config,
         llm=llm,
         conversation=ConversationManager(),
         tools=build_default_registry(),
         work_dir=work_dir,
-        sessions_dir=work_dir / ".kdagent" / "sessions",
+        sessions_dir=kd_dir / "sessions",
+        model_name=model,
+        obs_dir=kd_dir / "obs",
+        context_manager=ContextManager(
+            kd_dir / "sessions", llm=llm, system_prompt=DEFAULT_SYSTEM_PROMPT
+        ),
     )
 
 

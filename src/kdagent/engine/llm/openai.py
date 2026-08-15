@@ -22,11 +22,25 @@ import httpx
 from kdagent.engine.llm.base import (
     LLMStreamEvent,
     Payload,
+    PromptTooLongError,
     ProviderConfig,
     ToolSchema,
     Usage,
 )
 from kdagent.engine.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock
+
+# 上下文超长错误标记（01 §6 ③：紧急压缩触发）。DeepSeek/OpenAI 兼容在 HTTP 400 body。
+_PTL_MARKERS = (
+    "maximum context length",
+    "context_length_exceeded",
+    "context length exceeded",
+    "prompt is too long",
+    "please reduce the length",
+)
+
+
+def _is_prompt_too_long(body: str) -> bool:
+    return any(m in body.lower() for m in _PTL_MARKERS)
 
 
 def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
@@ -192,6 +206,8 @@ class OpenAICompatClient:
             if resp.status_code != 200:
                 # 手动读响应体再抛，带上 DeepSeek 具体报错（raise_for_status 不含 body）。
                 body_text = (await resp.aread())[:1000].decode("utf-8", errors="replace")
+                if _is_prompt_too_long(body_text):
+                    raise PromptTooLongError(f"LLM API {resp.status_code}: {body_text}")
                 raise RuntimeError(f"LLM API {resp.status_code}: {body_text}")
             async for line in resp.aiter_lines():
                 for event in parser.feed(line):
