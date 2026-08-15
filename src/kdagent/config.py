@@ -42,8 +42,16 @@ class Config:
     # 三源合并 + 项目级覆盖用户级同名 Server（09 §3.2）。
     mcp_servers: dict[str, object] = field(default_factory=dict)
     # 10 M5-a SubAgent：agents 段（enable_verification_agent 开关，Verification 默认关
-    # T27；后续可扩展默认模型/后台超时等）。
+    # T27；auto_background_ms 前台超时自动转后台阈值，D79 落地 10 §3.7 ②）。
     agents: dict[str, object] = field(default_factory=dict)
+
+    def get_auto_background_ms(self) -> int:
+        """10 §3.7 ②：前台 Agent 工具超时自动转后台的阈值 ms（`agents.auto_background_ms`）。
+
+        默认 120_000（120s）；非法值回退默认（零配置可用）。
+        """
+        v = self.agents.get("auto_background_ms", 120_000)
+        return int(v) if isinstance(v, (int, float)) else 120_000
 
 
 def load_config() -> Config:

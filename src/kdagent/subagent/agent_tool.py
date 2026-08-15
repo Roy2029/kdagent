@@ -12,8 +12,10 @@ Agent 类型动态加载（用户新建定义文件即用），工具列表保�
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +23,8 @@ from kdagent.engine.conversation import ConversationManager
 from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.model import AgentDef
 from kdagent.subagent.named import NamedAgentError, NamedAgentManager
-from kdagent.subagent.runner import FORK_SYSTEM_PROMPT, SubAgentRunner
-from kdagent.subagent.task import TaskManager
+from kdagent.subagent.runner import FORK_SYSTEM_PROMPT, SubAgentResult, SubAgentRunner
+from kdagent.subagent.task import BackgroundTask, TaskManager
 from kdagent.subagent.worktree import Worktree, WorktreeError, WorktreeManager
 from kdagent.tools.base import ToolContext, ToolResult
 
@@ -180,7 +182,11 @@ class Agent:
         if background:
             task = self._task_manager.launch(definition, prompt, model=model)
             return self._started_result(ctx, task.id, type_name, background=True)
-        result = await self._runner.run_to_completion(definition, prompt, model=model)
+        # 前台：超时/主 Agent 取消 → adopt 转后台继续（10 §3.7 ②③，adoptRunning D79）。
+        result, adopted_id = await self._foreground_or_adopt(definition, prompt, model=model)
+        if adopted_id:
+            return self._started_result(ctx, adopted_id, type_name, background=True)
+        assert result is not None  # adopted_id 为空 = 前台正常完成，result 必有值
         duration_ms = int((time.perf_counter() - start) * 1000)
         if result.is_error:
             content = f"[Agent {type_name} 失败] {result.error or result.text}"
@@ -195,6 +201,41 @@ class Agent:
             is_error=result.is_error,
             duration_ms=duration_ms,
         )
+
+    async def _foreground_or_adopt(
+        self,
+        definition: AgentDef,
+        prompt: str,
+        *,
+        model: str,
+        work_dir: Path | None = None,
+        on_complete: Callable[[BackgroundTask], None] | None = None,
+    ) -> tuple[SubAgentResult | None, str]:
+        """前台跑 run_to_completion；超时或主 Agent 取消 → adopt 转后台（10 §3.7 ②③）。
+
+        返回 `(result, "")` = 前台正常完成；`(None, task_id)` = 已转后台继续跑，
+        调用方据此返回「已后台启动 + task id」结果。adopt 不取消任务——实例/事件流/
+        部分结果无损移交 TaskManager 继续消费，完成时 `<task-notification>` 注入主对话。
+        """
+        timeout_s = self._task_manager.get_auto_background_ms() / 1000.0
+        fg = asyncio.create_task(
+            self._runner.run_to_completion(definition, prompt, model=model, work_dir=work_dir)
+        )
+        try:
+            done, _ = await asyncio.wait({fg}, timeout=timeout_s)
+        except asyncio.CancelledError:
+            # ③ 主 Agent 取消（用户 Esc）：子 Agent 不杀掉，转后台继续。
+            self._task_manager.adopt(
+                fg, definition, prompt, work_dir=work_dir, on_complete=on_complete
+            )
+            raise
+        if fg in done:
+            return fg.result(), ""
+        # ② 前台超时：转后台继续，立即返回 task id 供 TaskList/TaskGet 查询。
+        adopted = self._task_manager.adopt(
+            fg, definition, prompt, work_dir=work_dir, on_complete=on_complete
+        )
+        return None, adopted.id
 
     async def _execute_worktree(
         self,
@@ -233,9 +274,35 @@ class Agent:
             return self._start_worktree_background(
                 ctx, definition, prompt, model=model, wt=wt, wt_name=wt_name
             )
-        result = await self._runner.run_to_completion(
-            definition, _WORKTREE_NOTICE + "\n\n" + prompt, model=model, work_dir=Path(wt.path)
+        # 前台：超时/取消转后台（adoptRunning D79），后台路径同样经 _cleanup 清理 worktree。
+        def _cleanup(bt: BackgroundTask) -> None:
+            try:
+                kept = wm.auto_cleanup(wt_name)
+            except WorktreeError:
+                kept = True  # 清理失败保守保留
+            if kept:
+                bt.result = (bt.result or "") + (
+                    f"\n[Worktree 保留于 {wt.path}，分支 {wt.branch}]"
+                )
+
+        result, adopted_id = await self._foreground_or_adopt(
+            definition,
+            _WORKTREE_NOTICE + "\n\n" + prompt,
+            model=model,
+            work_dir=Path(wt.path),
+            on_complete=_cleanup,
         )
+        if adopted_id:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content=(
+                    f"[Agent {definition.name} 已后台启动（独立 worktree），task id={adopted_id}]\n"
+                    f"worktree：{wt.path}（分支 {wt.branch}）\n"
+                    "用 TaskList/TaskGet 查询状态与结果；完成后有变更则保留供 review。"
+                ),
+            )
+        assert result is not None  # adopted_id 为空 = 前台正常完成，result 必有值
         duration_ms = int((time.perf_counter() - start) * 1000)
         kept = False
         try:

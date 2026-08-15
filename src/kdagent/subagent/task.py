@@ -70,11 +70,14 @@ class TaskManager:
         runner: SubAgentRunner,
         *,
         parent_conversation: ConversationManager | None = None,
+        auto_background_ms: int = 120_000,
     ) -> None:
         self._runner = runner
         self._parent_conversation = parent_conversation
         self._tasks: dict[str, BackgroundTask] = {}
         self._counter = 0
+        # 10 §3.7 ②（D79）：前台 Agent 工具超时自动转后台阈值 ms，cli 传 config 值。
+        self._auto_background_ms = auto_background_ms
 
     def set_parent_conversation(self, conversation: ConversationManager) -> None:
         """延迟绑定主对话（KDApp 构造 Agent 后注入）：完成通知的注入目标。"""
@@ -83,6 +86,35 @@ class TaskManager:
     def set_telemetry(self, telemetry: Telemetry) -> None:
         """延迟注入 telemetry（KDApp 装配后）：转发 runner——子 Agent trace 挂父链。"""
         self._runner.set_telemetry(telemetry)
+
+    def get_auto_background_ms(self) -> int:
+        """前台 Agent 工具超时自动转后台阈值 ms（10 §3.7 ②）。"""
+        return self._auto_background_ms
+
+    def _finalize(
+        self,
+        bt: BackgroundTask,
+        result: SubAgentResult | None,
+        *,
+        cancelled: bool = False,
+        error: str = "",
+    ) -> None:
+        """任务终态统一收尾：填状态/结果 + 清理钩子 + 注入通知（launch/adopt 共用）。"""
+        if result is not None:
+            bt.status = "completed" if not result.is_error else "failed"
+            bt.result = result.error or result.text
+            bt.is_error = result.is_error
+            bt.usage = result.usage
+            bt.turns = result.turns
+        else:
+            bt.status = "failed"
+            bt.result = error or "（任务被取消）"
+            bt.is_error = True
+        bt.end_time = time.perf_counter()
+        if bt.on_complete is not None:
+            with contextlib.suppress(Exception):
+                bt.on_complete(bt)  # 清理钩子失败不阻断任务终态
+        self._notify(bt)
 
     def launch(
         self,
@@ -125,25 +157,11 @@ class TaskManager:
                     background=background,
                     work_dir=Path(bt.work_dir) if bt.work_dir else None,
                 )
-                bt.status = "completed" if not result.is_error else "failed"
-                bt.result = result.error or result.text
-                bt.is_error = result.is_error
-                bt.usage = result.usage
-                bt.turns = result.turns
+                self._finalize(bt, result)
             except asyncio.CancelledError:
-                bt.status = "failed"
-                bt.result = "（任务被取消）"
-                bt.is_error = True
+                self._finalize(bt, None, cancelled=True)
             except Exception as exc:
-                bt.status = "failed"
-                bt.result = f"执行异常：{exc}"
-                bt.is_error = True
-            finally:
-                bt.end_time = time.perf_counter()
-                if bt.on_complete is not None:
-                    with contextlib.suppress(Exception):
-                        bt.on_complete(bt)  # 清理钩子失败不阻断任务终态
-                self._notify(bt)
+                self._finalize(bt, None, error=f"执行异常：{exc}")
 
         runner_task = asyncio.create_task(_run())
 
@@ -152,14 +170,66 @@ class TaskManager:
             if not started:
                 # 协程体尚未开始即被取消：_run 的 finally 不会执行（M5-c 竞态），
                 # 同步补终态 + 钩子 + 通知，避免 status 永久卡在 running。
-                bt.end_time = time.perf_counter()
-                bt.status = "failed"
-                bt.result = "（任务被取消）"
-                bt.is_error = True
-                if bt.on_complete is not None:
-                    with contextlib.suppress(Exception):
-                        bt.on_complete(bt)
-                self._notify(bt)
+                self._finalize(bt, None, cancelled=True)
+
+        bt.cancel = _cancel
+        return bt
+
+    def adopt(
+        self,
+        task: asyncio.Task[SubAgentResult],
+        definition: AgentDef,
+        task_desc: str,
+        *,
+        work_dir: Path | None = None,
+        on_complete: Callable[[BackgroundTask], None] | None = None,
+    ) -> BackgroundTask:
+        """adoptRunning（10 §3.7）：接管运行中的前台任务，不杀掉重来。
+
+        前台 Agent 工具超时（②）/ 主 Agent 取消（③ Esc）时把运行中的
+        `run_to_completion` Task 移交本管理器继续消费——任务实例/事件流/取消
+        函数/部分结果天然保留（task 未取消、conversation 已产内容不丢），主对话
+        不再 await，完成时经 `_notify` 注入 `<task-notification>`。
+        """
+        self._counter += 1
+        task_id = f"task-{self._counter}"
+        bt = BackgroundTask(
+            id=task_id,
+            definition=definition,
+            task=task_desc,
+            start_time=time.perf_counter(),
+            work_dir=str(work_dir) if work_dir is not None else None,
+            on_complete=on_complete,
+        )
+        self._tasks[task_id] = bt
+        cancel_requested = False  # 取消请求标志：agent 吞取消时 watcher 据此标终态
+
+        async def _watch() -> None:
+            try:
+                result = await task
+            except asyncio.CancelledError:
+                self._finalize(bt, None, cancelled=True)
+                return
+            except Exception as exc:
+                self._finalize(bt, None, error=f"执行异常：{exc}")
+                return
+            if cancel_requested:
+                # fg 已跑完（agent 把取消吞成正常返回，M1 停止条件 3），但用户已请求
+                # 取消 → 标「任务被取消」（取消语义由 adopt 明确传达，不掩盖事实）。
+                self._finalize(bt, None, cancelled=True)
+                return
+            self._finalize(bt, result)
+
+        # watcher 由事件循环持引用（pending task），无需外部变量保活；取消只作用于
+        # fg（task），watcher 恒为收尾者不取消（D79 坑：提前 cancel 丢终态）。
+        asyncio.create_task(_watch())
+
+        def _cancel() -> None:
+            nonlocal cancel_requested
+            cancel_requested = True
+            task.cancel()
+            # 不取消 watcher——它是唯一收尾者（D79 坑）：watcher 在首次调度前被
+            # cancel 会直接 cancelled，协程体（含 _finalize）根本不执行 → 终态丢失。
 
         bt.cancel = _cancel
         return bt

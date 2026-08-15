@@ -199,7 +199,11 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         make_client=_make_client(api_key),
         hooks=hooks,  # 10 §3.3：共享主 HookEngine，子 Agent hook 同生效
     )
-    task_manager = TaskManager(subagent_runner)
+    task_manager = TaskManager(
+        subagent_runner,
+        # 10 §3.7 ②（D79）：前台 Agent 工具超时自动转后台阈值（agents.auto_background_ms）。
+        auto_background_ms=config.get_auto_background_ms(),
+    )
     # 10 M5-b Worktree：空间隔离工作目录（§3.10-3.13）。目录在仓库内
     # `.kdagent/worktrees/`（已 .gitignore）；过期清理 fail-closed 不丢成果。
     worktree_manager = WorktreeManager(work_dir, kd_dir / "worktrees")
