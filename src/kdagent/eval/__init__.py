@@ -21,6 +21,7 @@ from kdagent.eval.runner import (
     EvalRunner,
     classify,
     extract_patch,
+    gold_check,
     gold_similarity,
     seal_copy,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "RunMetrics",
     "classify",
     "extract_patch",
+    "gold_check",
     "gold_similarity",
     "load_tasks_file",
     "load_workspace",

@@ -30,6 +30,7 @@ class EvalTask:
     fail_to_pass: list[str] = field(default_factory=list)  # 原失败测试必须全过
     pass_to_pass: list[str] = field(default_factory=list)  # 原通过测试不能被碰坏
     gold_patch: str = ""  # 官方参考补丁（gold 校验用）
+    env_valid: bool = False  # gold 校验通过才 True（11 §3.2 步骤 3，D82：runner 校验后置位）
     test_cmd: str = ""  # 判分测试命令（可选；给了才跑真实测试）
     p2p_cmd: str = ""  # PASS_TO_PASS 判分测试命令（D81：给了则跑，破坏 → 不 resolved）
     constraint: str = ""  # 任务约束（如「不要改测试文件」）→ 类 5 标记
@@ -73,6 +74,7 @@ class EvalReport:
     tasks: list[EvalTask] = field(default_factory=list)
     resolved: list[str] = field(default_factory=list)
     failed: list[FailureCase] = field(default_factory=list)
+    invalid: list[str] = field(default_factory=list)  # 环境失效被剔除的题（11 §3.2 步骤 3，D82）
     metrics: RunMetrics = field(default_factory=RunMetrics)
 
     def summary(self) -> str:
@@ -95,4 +97,9 @@ class EvalReport:
             lines.append("\n失败归类：")
             for f in self.failed:
                 lines.append(f"- {f.instance_id} [{f.kind}] {f.reason}")
+        if self.invalid:
+            lines.append(
+                f"\n剔除环境失效 {len(self.invalid)} 道（gold 补丁无法应用，不计分）："
+                + "、".join(self.invalid)
+            )
         return "\n".join(lines)

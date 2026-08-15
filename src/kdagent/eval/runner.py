@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import asdict
@@ -134,6 +135,50 @@ def gold_similarity(model_patch: str, gold_patch: str) -> float:
     return difflib.SequenceMatcher(None, model_patch, gold_patch).ratio()
 
 
+def gold_check(base_repo: Path, base_commit: str, gold_patch: str) -> bool:
+    """gold 补丁能否干净应用到 base commit（11 §3.2 步骤 3 gold 校验，D82）。
+
+    完整 gold 校验 = 应用补丁后跑 F2P 测试判 resolved（依赖 Docker harness，待 224）；
+    本前置只验**补丁可应用性**——gold 补丁都打不上的题（文件缺失/历史不符）是
+    环境失效，跑了也没有正确答案可对照，应剔除不进入计分（§3.2：防环境问题
+    误算成 Agent 能力不足）。无 gold_patch 视为有效（无法校验）。
+    """
+    if not gold_patch:
+        return True
+    # 简化文本（无 hunk）是相似度判分兜底用的 gold 表示，不是可 apply 的补丁——
+    # git apply 校验不了 → 视为有效放行，防误伤（真补丁才有环境校验意义）。
+    if "@@ -" not in gold_patch:
+        return True
+    try:
+        archive_bytes = subprocess.run(
+            ["git", "-C", str(base_repo), "archive", "--format=tar", base_commit],
+            env=_GIT_ENV,
+            capture_output=True,
+            timeout=120,
+        ).stdout
+        with tempfile.TemporaryDirectory(prefix="goldcheck-") as td:
+            dest = Path(td)
+            with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as tar:
+                try:
+                    tar.extractall(dest, filter="data")  # Python 3.12+（数据过滤）
+                except TypeError:
+                    tar.extractall(dest)  # Python 3.11 无 filter
+            proc = subprocess.run(
+                ["git", "apply", "--check", "-"],
+                cwd=dest,
+                input=gold_patch,
+                env=_GIT_ENV,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+            return proc.returncode == 0
+    except (subprocess.SubprocessError, OSError, tarfile.TarError):
+        return False  # 归档/应用异常 = 环境失效
+
+
 def classify(
     task: EvalTask, model_patch: str, test_passed: bool | None, agent_error: str
 ) -> tuple[FailureKind, str]:
@@ -199,9 +244,19 @@ class EvalRunner:
             raise ValueError("max_workers 必须 >= 1")
         tasks = self._task_loader()
         report = EvalReport(run_id=run_id, tasks=tasks)
+        # 11 §3.2 步骤 3 gold 校验（D82）：gold 补丁无法应用到 base commit 的题是
+        # 环境失效（文件缺失/历史不符）——跑了也没有正确答案可对照，剔除不进入计分，
+        # 不浪费 Agent 算力。无 gold_patch 视为有效（无法校验，保持原行为）。
+        valid_tasks: list[EvalTask] = []
+        for task in tasks:
+            if self._gold_valid(task):
+                task.env_valid = True
+                valid_tasks.append(task)
+            else:
+                report.invalid.append(task.instance_id)
         start = time.perf_counter()
         if max_workers == 1:
-            for task in tasks:
+            for task in valid_tasks:
                 await self._safe_task(report, task)
         else:
             sem = asyncio.Semaphore(max_workers)
@@ -210,10 +265,21 @@ class EvalRunner:
                 async with sem:
                     await self._safe_task(report, task)
 
-            await asyncio.gather(*(_guarded(task) for task in tasks))
+            await asyncio.gather(*(_guarded(task) for task in valid_tasks))
         report.metrics.wall_s = time.perf_counter() - start
         sort_report_by_task_order(report, tasks)
         return report
+
+    def _gold_valid(self, task: EvalTask) -> bool:
+        """gold 校验（11 §3.2 步骤 3，D82）：gold 补丁能否干净应用到 base commit。
+
+        无法应用 = 环境失效（历史不符/文件缺失），剔除不进入计分；单题校验异常只
+        剔除该题，不阻断整个跑批。无 gold_patch 视为有效（gold_check 内部放行）。
+        """
+        try:
+            return gold_check(self._source_repo, task.base_commit, task.gold_patch)
+        except Exception:  # noqa: BLE001 —— 单题校验失败只该剔除该题
+            return False
 
     async def _safe_task(self, report: EvalReport, task: EvalTask) -> None:
         """单任务执行 + 异常隔离：封史/跑批异常记 harness_fault，不拖垮整批（§3.7）。"""

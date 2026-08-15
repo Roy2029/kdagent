@@ -17,6 +17,7 @@ from kdagent.eval import (
     EvalTask,
     classify,
     extract_patch,
+    gold_check,
     gold_similarity,
     seal_copy,
 )
@@ -316,7 +317,7 @@ def _repo_with_keep(tmp_path: Path) -> Path:
     return repo
 
 
-async def _run_eval(repo: Path, tmp_path: Path, llm: FakeLLM, task: EvalTask) -> EvalReport:
+async def _run_eval(repo: Path, tmp_path: Path, llm: FakeLLM, *tasks: EvalTask) -> EvalReport:
     runner = _runner(tmp_path, llm)
     manager = AgentManager([BUILTIN_AGENTS_DIR])
     manager.scan()
@@ -324,7 +325,7 @@ async def _run_eval(repo: Path, tmp_path: Path, llm: FakeLLM, task: EvalTask) ->
     assert definition is not None
     ev = EvalRunner(
         runner, definition=definition, source_repo=repo,
-        work_dir=tmp_path / "eval", task_loader=lambda: [task],
+        work_dir=tmp_path / "eval", task_loader=lambda: list(tasks),
     )
     return await ev.run("run-p2p")
 
@@ -422,3 +423,63 @@ def test_load_tasks_file_empty(tmp_path: Path) -> None:
     cfg.write_text('{"repo_dir": ".", "tasks": []}', encoding="utf-8")
     with pytest.raises(ValueError, match="tasks 为空"):
         load_tasks_file(cfg)
+
+
+# ---- gold 校验（11 §3.2 步骤 3 + §5 222，D82：环境失效题剔除） ----------------
+
+_PATCH_README = (
+    "--- a/README.md\n+++ b/README.md\n"
+    "@@ -1 +1 @@\n-# t\n+# t fixed\n"
+)
+_PATCH_MISSING = (
+    "--- a/bug.py\n+++ b/bug.py\n"
+    "@@ -1 +1 @@\n-def f():\n+def g():\n"
+)
+
+
+def test_gold_check_cleanly_applies(repo: Path) -> None:
+    """gold 补丁（真 diff，改 base 里存在的文件）能应用到 base commit → 环境有效。"""
+    assert gold_check(repo, _base_commit(repo), _PATCH_README) is True
+
+
+def test_gold_check_unapplicable_is_env_invalid(repo: Path) -> None:
+    """gold 补丁改 base 里不存在的文件（bug.py 在 base commit 之后才加）→ 环境失效。"""
+    assert gold_check(repo, _base_commit(repo), _PATCH_MISSING) is False
+
+
+def test_gold_check_simplified_text_is_valid(repo: Path) -> None:
+    """无 hunk 的简化文本（相似度兜底用）无法 apply 校验 → 放行，防误伤。"""
+    assert gold_check(repo, _base_commit(repo), "+++ README.md\n+# fixed\n") is True
+
+
+def test_gold_check_empty_patch_is_valid(repo: Path) -> None:
+    """无 gold_patch → 无法校验，视为有效（保持原行为）。"""
+    assert gold_check(repo, _base_commit(repo), "") is True
+
+
+@pytest.mark.asyncio
+async def test_eval_runner_gold_valid_filters_env_invalid(repo: Path, tmp_path: Path) -> None:
+    """gold 可应用题正常判分；gold 不可应用题剔除（invalid），metrics.total 只计 valid。"""
+    llm = FakeLLM([tool_call("Bash", {"command": "echo fixed > flag.txt"}), done("改完了")])
+    a = EvalTask(
+        instance_id="g1",
+        base_commit=_base_commit(repo),
+        problem_statement="制造 flag.txt",
+        gold_patch=_PATCH_README,
+        test_cmd="test -f flag.txt",
+    )
+    b = EvalTask(
+        instance_id="g2",
+        base_commit=_base_commit(repo),
+        problem_statement="修 bug",
+        gold_patch=_PATCH_MISSING,  # base 无 bug.py → 环境失效
+        test_cmd="test -f flag.txt",
+    )
+    report = await _run_eval(repo, tmp_path, llm, a, b)
+    assert report.resolved == ["g1"]
+    assert report.invalid == ["g2"]
+    assert report.metrics.total == 1  # 只计 valid 题
+    assert report.metrics.resolved == 1
+    assert report.failed == []
+    assert [t.env_valid for t in report.tasks] == [True, False]
+    assert "g2" in report.summary()  # 报表标注剔除
