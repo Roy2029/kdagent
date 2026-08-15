@@ -1,0 +1,362 @@
+"""TaskManager：后台任务生命周期（规格 10 §3.7）。
+
+后台运行模式四种进入路径（10 §3.7）：① 调用传 run_in_background: true；
+② 前台超 120s 自动切换（get_auto_background_ms）；③ 用户 Esc 手动切换；
+④ Fork 无条件后台。M5-a 落地 ① 与 ④（Fork），②③ 留 M5 后续。
+
+TaskManager.launch 在后台协程跑 run_to_completion，完成推 notify 回调 → 主对话
+注入 `<task-notification>`（不打断当前对话）。
+
+Task 工具（4 个内置）：TaskList / TaskGet / TaskCreate（给 Hook 用）/ TaskUpdate。
+不给后台任务做 slash command 栈（10 §3.7）：用户问「后台任务咋样了」→ 主 Agent
+自己用 TaskList/TaskGet 查 → 自然语言回答；`/tasks` 命令仅作便捷列表。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+from kdagent.engine.conversation import ConversationManager
+from kdagent.engine.llm.base import Usage
+from kdagent.engine.messages import TextBlock
+from kdagent.subagent.model import AgentDef
+from kdagent.subagent.runner import SubAgentResult, SubAgentRunner
+from kdagent.tools.base import ToolContext, ToolResult
+
+TaskStatus = Literal["running", "completed", "failed"]
+
+
+@dataclass(slots=True)
+class BackgroundTask:
+    """一个后台子任务（10 §3.7 BackgroundTask）。"""
+
+    id: str
+    definition: AgentDef
+    task: str
+    status: TaskStatus = "running"
+    result: str = ""
+    is_error: bool = False
+    usage: Usage = field(default_factory=Usage)
+    turns: int = 0
+    start_time: float = 0.0
+    end_time: float = 0.0
+    cancel: Callable[[], None] = lambda: None
+
+    @property
+    def duration_s(self) -> float:
+        end = self.end_time or time.perf_counter()
+        return max(0.0, end - self.start_time)
+
+    def summary(self) -> str:
+        """列表行：`id [status] type 耗时s`。"""
+        return f"- {self.id} [{self.status}] {self.definition.name} 耗时 {self.duration_s:.1f}s"
+
+
+class TaskManager:
+    """后台任务注册表 + 调度。launch 后台跑 run_to_completion，完成回调注入主对话。"""
+
+    def __init__(
+        self,
+        runner: SubAgentRunner,
+        *,
+        parent_conversation: ConversationManager | None = None,
+    ) -> None:
+        self._runner = runner
+        self._parent_conversation = parent_conversation
+        self._tasks: dict[str, BackgroundTask] = {}
+        self._counter = 0
+
+    def set_parent_conversation(self, conversation: ConversationManager) -> None:
+        """延迟绑定主对话（KDApp 构造 Agent 后注入）：完成通知的注入目标。"""
+        self._parent_conversation = conversation
+
+    def launch(
+        self,
+        definition: AgentDef,
+        task: str,
+        *,
+        model: str = "",
+        background: bool = True,
+    ) -> BackgroundTask:
+        """在后台协程跑 RunToCompletion；立即返回 task 供轮询。
+
+        `cancel` 绑定到 asyncio.Task.cancel——用户/主 Agent 可随时中断。
+        """
+        self._counter += 1
+        task_id = f"task-{self._counter}"
+        bt = BackgroundTask(
+            id=task_id, definition=definition, task=task, start_time=time.perf_counter()
+        )
+        self._tasks[task_id] = bt
+
+        async def _run() -> None:
+            try:
+                result: SubAgentResult = await self._runner.run_to_completion(
+                    definition,
+                    task,
+                    model=model,
+                    background=background,
+                )
+            except asyncio.CancelledError:
+                bt.status = "failed"
+                bt.result = "（任务被取消）"
+                bt.end_time = time.perf_counter()
+                return
+            except Exception as exc:
+                bt.status = "failed"
+                bt.result = f"执行异常：{exc}"
+                bt.is_error = True
+                bt.end_time = time.perf_counter()
+                self._notify(bt)
+                return
+            bt.status = "completed" if not result.is_error else "failed"
+            bt.result = result.error or result.text
+            bt.is_error = result.is_error
+            bt.usage = result.usage
+            bt.turns = result.turns
+            bt.end_time = time.perf_counter()
+            self._notify(bt)
+
+        runner_task = asyncio.create_task(_run())
+
+        def _cancel() -> None:
+            runner_task.cancel()
+
+        bt.cancel = _cancel
+        return bt
+
+    def get(self, task_id: str) -> BackgroundTask | None:
+        return self._tasks.get(task_id)
+
+    def list(self) -> list[BackgroundTask]:
+        """按 id 升序（创建顺序）。"""
+        return [self._tasks[t] for t in sorted(self._tasks)]
+
+    def _notify(self, task: BackgroundTask) -> None:
+        """完成 → 主对话注入 `<task-notification>`（10 §3.7，不打断当前对话）。"""
+        conv = self._parent_conversation
+        if conv is None:
+            return
+        text = (
+            "<task-notification>\n"
+            f"后台任务 {task.id}（{task.definition.name}）已完成，耗时 {task.duration_s:.1f}s。\n"
+            f"结果摘要：\n{(task.result or '（无结果）')[:500]}\n"
+            "</task-notification>"
+        )
+        conv.add_user_message("", extra_blocks=[TextBlock(text)])
+
+
+class TaskList:
+    """列出后台任务（id/status/耗时/类型）。"""
+
+    name = "TaskList"
+    description = (
+        "列出当前所有后台任务（状态、耗时、类型）。"
+        "何时使用：主 Agent 被问「后台任务进行得怎么样」时先查清单。"
+    )
+    input_schema = {"type": "object", "properties": {}}
+    category = "system"
+    require_confirm = False
+
+    def __init__(self, manager: TaskManager) -> None:
+        self._manager = manager
+
+    def is_read_only(self) -> bool:
+        return True
+
+    def is_destructive(self) -> bool:
+        return False
+
+    def is_concurrency_safe(self, input: dict[str, Any]) -> bool:
+        return False
+
+    def validate_input(self, input: dict[str, Any]) -> list[str]:
+        return []
+
+    async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
+        tasks = self._manager.list()
+        if not tasks:
+            content = "当前无后台任务"
+        else:
+            content = f"后台任务 {len(tasks)} 个：\n" + "\n".join(t.summary() for t in tasks)
+        return ToolResult(tool_use_id=ctx.tool_use_id, name=self.name, content=content)
+
+
+class TaskGet:
+    """查单个后台任务的状态与结果。"""
+
+    name = "TaskGet"
+    description = (
+        "查询单个后台任务的状态与结果。"
+        "何时使用：TaskList 发现任务后，用 id 查它的结果文本。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "后台任务 id（如 task-1）"},
+        },
+        "required": ["id"],
+    }
+    category = "system"
+    require_confirm = False
+
+    def __init__(self, manager: TaskManager) -> None:
+        self._manager = manager
+
+    def is_read_only(self) -> bool:
+        return True
+
+    def is_destructive(self) -> bool:
+        return False
+
+    def is_concurrency_safe(self, input: dict[str, Any]) -> bool:
+        return False
+
+    def validate_input(self, input: dict[str, Any]) -> list[str]:
+        if not input.get("id"):
+            return ["id 必填"]
+        return []
+
+    async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
+        task = self._manager.get(str(input.get("id", "")))
+        if task is None:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content=f"后台任务不存在：{input.get('id')}",
+                is_error=True,
+            )
+        content = (
+            f"任务 {task.id} [{task.status}] {task.definition.name} "
+            f"耗时 {task.duration_s:.1f}s 轮次 {task.turns}\n"
+            f"{task.result or '（尚无结果）'}"
+        )
+        return ToolResult(tool_use_id=ctx.tool_use_id, name=self.name, content=content)
+
+
+class TaskCreate:
+    """登记一个外部管理的后台任务条目（10 §3.7：给 Hook 用）。"""
+
+    name = "TaskCreate"
+    description = (
+        "登记一个由外部（Hook/流程）管理的后台任务条目，返回 task id 供后续 TaskUpdate。"
+        "何时使用：Hook 触发长任务需要可查询条目时（一般不用模型主动创建）。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "description": "任务类型标签（如 build / test）"},
+            "task": {"type": "string", "description": "任务描述"},
+        },
+        "required": ["type", "task"],
+    }
+    category = "system"
+    require_confirm = False
+
+    def __init__(self, manager: TaskManager) -> None:
+        self._manager = manager
+
+    def is_read_only(self) -> bool:
+        return False
+
+    def is_destructive(self) -> bool:
+        return False
+
+    def is_concurrency_safe(self, input: dict[str, Any]) -> bool:
+        return False
+
+    def validate_input(self, input: dict[str, Any]) -> list[str]:
+        errors = []
+        if not input.get("type"):
+            errors.append("type 必填")
+        if not input.get("task"):
+            errors.append("task 必填")
+        return errors
+
+    async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
+        manager = self._manager
+        manager._counter += 1
+        task_id = f"task-{manager._counter}"
+        definition = AgentDef(
+            name=str(input.get("type", "")),
+            description="外部登记任务",
+            system_prompt="",
+            max_turns=1,
+        )
+        bt = BackgroundTask(
+            id=task_id,
+            definition=definition,
+            task=str(input.get("task", "")),
+            start_time=time.perf_counter(),
+        )
+        manager._tasks[task_id] = bt
+        return ToolResult(
+            tool_use_id=ctx.tool_use_id,
+            name=self.name,
+            content=f"已登记后台任务 {task_id}（外部管理，用 TaskUpdate 更新状态）",
+        )
+
+
+class TaskUpdate:
+    """更新外部登记任务的 status/result（10 §3.7：与 TaskCreate 配对）。"""
+
+    name = "TaskUpdate"
+    description = (
+        "更新一个已登记后台任务的状态与结果（与 TaskCreate 配对）。"
+        "何时使用：外部流程完成任务后回填状态。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string", "description": "任务 id"},
+            "status": {"type": "string", "enum": ["completed", "failed"], "description": "新状态"},
+            "result": {"type": "string", "description": "结果文本"},
+        },
+        "required": ["id", "status"],
+    }
+    category = "system"
+    require_confirm = False
+
+    def __init__(self, manager: TaskManager) -> None:
+        self._manager = manager
+
+    def is_read_only(self) -> bool:
+        return False
+
+    def is_destructive(self) -> bool:
+        return False
+
+    def is_concurrency_safe(self, input: dict[str, Any]) -> bool:
+        return False
+
+    def validate_input(self, input: dict[str, Any]) -> list[str]:
+        errors = []
+        if not input.get("id"):
+            errors.append("id 必填")
+        status = input.get("status")
+        if status not in ("completed", "failed"):
+            errors.append("status 必填且为 completed/failed")
+        return errors
+
+    async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
+        task = self._manager.get(str(input.get("id", "")))
+        if task is None:
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content=f"后台任务不存在：{input.get('id')}",
+                is_error=True,
+            )
+        task.status = input["status"]
+        if input.get("result"):
+            task.result = str(input.get("result"))
+        task.end_time = time.perf_counter()
+        return ToolResult(
+            tool_use_id=ctx.tool_use_id,
+            name=self.name,
+            content=f"任务 {task.id} 已更新为 {task.status}",
+        )

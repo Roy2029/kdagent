@@ -41,6 +41,9 @@ class Config:
     # 09 M4-c 工具生态：mcp_servers 段（server 名 → {command, args, env}），
     # 三源合并 + 项目级覆盖用户级同名 Server（09 §3.2）。
     mcp_servers: dict[str, object] = field(default_factory=dict)
+    # 10 M5-a SubAgent：agents 段（enable_verification_agent 开关，Verification 默认关
+    # T27；后续可扩展默认模型/后台超时等）。
+    agents: dict[str, object] = field(default_factory=dict)
 
 
 def load_config() -> Config:
@@ -72,6 +75,7 @@ def load_config() -> Config:
         permissions=_dict("permissions"),
         hooks=_list("hooks"),
         mcp_servers=_dict("mcp_servers"),
+        agents=_dict("agents"),
     )
 
 

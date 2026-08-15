@@ -118,6 +118,9 @@ class Agent:
         memory_extractor: MemoryExtractor | None = None,
         memory_consolidator: MemoryConsolidator | None = None,
         skills: SkillManager | None = None,
+        # 10 M5-a SubAgent：实例级迭代上限（子 Agent 用定义文件 maxTurns；None =
+        # 运行时读模块级 MAX_ITERATIONS=50，保证测试 monkeypatch 生效）。
+        max_iterations: int | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -145,6 +148,8 @@ class Agent:
         # 09 M4-d Skill 两阶段加载：system-reminder 注入「可用 Skill」清单（轻量），
         # 完整 SOP 经 LoadSkill 工具按需加载（agent 只持清单，正文在 manager）。
         self._skills = skills
+        # 10 M5-a SubAgent：子 Agent 迭代上限（RunToCompletion 防失控，10 §3.5）。
+        self._max_iterations = max_iterations if max_iterations is not None else MAX_ITERATIONS
         self._stop_reason = "completed"
         self._usage: Usage | None = None
         self._consecutive_failures = 0
@@ -236,7 +241,7 @@ class Agent:
 
     async def _run_loop(self) -> None:
         """ReAct 主循环（从 run 提取，供 trace.run span 包住）。"""
-        for turn in range(MAX_ITERATIONS):
+        for turn in range(self._max_iterations):
             self._turn = turn
             try:
                 status = await self._loop_iteration()
@@ -250,7 +255,12 @@ class Agent:
                 return
         # 停止条件 2：迭代上限强制停止，提示用户。
         self._stop_reason = "max-iterations"
-        self._events(MaxIterationsReachedEvent(limit=MAX_ITERATIONS))
+        self._events(MaxIterationsReachedEvent(limit=self._max_iterations))
+
+    @property
+    def turns(self) -> int:
+        """已执行轮数（10 M5-a SubAgentRunner 结果统计用）。"""
+        return self._turn + 1
 
     async def _loop_iteration(self) -> AgentStatus:
         """一轮 LLM 调用 + 工具执行。包 turn_start/turn_end 生命周期 hook（06 §3.10）。"""

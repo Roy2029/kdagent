@@ -22,6 +22,7 @@ from kdagent.memory.model import MEMORY_TYPES, MemoryFile
 from kdagent.memory.store import MemoryStore
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.skill.manager import SkillManager
+from kdagent.subagent.task import TaskManager
 
 CommandType = Literal["local", "local-ui", "prompt"]
 
@@ -64,6 +65,8 @@ class CommandContext:
     skill_manager: SkillManager | None = None
     # 08 M4-e：/memory 查看/管理记忆（概要/list/add/delete/clear）。
     memory_store: MemoryStore | None = None
+    # 10 M5-a：/tasks 后台任务便捷列表（Task 工具为主，/tasks 仅查看）。
+    task_manager: TaskManager | None = None
 
 
 @dataclass
@@ -373,6 +376,25 @@ def _cmd_memory(ctx: CommandContext) -> None:
     )
 
 
+def _cmd_tasks(ctx: CommandContext) -> None:
+    """10 §3.7：后台任务便捷列表（local 仅查看；查询/管理以 TaskList/TaskGet 为主）。"""
+    mgr = ctx.task_manager
+    if mgr is None:
+        ctx.ui.add_system_message("后台任务系统不可用。")
+        return
+    tasks = mgr.list()
+    if not tasks:
+        ctx.ui.add_system_message(
+            "当前无后台任务。主 Agent 可用 Agent 工具（run_in_background=true）启动。"
+        )
+        return
+    lines = [f"后台任务 {len(tasks)} 个："]
+    for t in tasks:
+        lines.append(f"  {t.summary()}")
+    lines.append("查询详情让主 Agent 用 TaskGet；状态变化会注入对话通知。")
+    ctx.ui.add_system_message("\n".join(lines))
+
+
 def skill_command_handler(skill_name: str) -> Callable[[CommandContext], None]:
     """Skill 自动注册的 /name 命令 handler（09 §3.9 显式触发路径）。
 
@@ -544,6 +566,15 @@ def build_default_commands() -> CommandRegistry:
             usage="/memory [list|add <name> <type> <desc> <content>|delete <name>|clear]",
             type="local",
             handler=_cmd_memory,
+        )
+    )
+    registry.register(
+        Command(
+            name="tasks",
+            description="后台任务便捷列表（/tasks；详情让主 Agent 用 TaskGet）",
+            usage="/tasks",
+            type="local",
+            handler=_cmd_tasks,
         )
     )
     return registry

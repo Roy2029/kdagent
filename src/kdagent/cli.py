@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from kdagent import __version__
@@ -28,6 +28,19 @@ from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.store import build_memory_store
 from kdagent.permission.checker import build_permission_checker
 from kdagent.skill import BUILTIN_SKILLS_DIR, LoadSkill, SkillCreator, SkillManager
+from kdagent.subagent import (
+    BUILTIN_AGENTS_DIR,
+    AgentManager,
+    SubAgentRunner,
+    TaskCreate,
+    TaskGet,
+    TaskList,
+    TaskManager,
+    TaskUpdate,
+)
+from kdagent.subagent import (
+    Agent as AgentTool,
+)
 from kdagent.tools import build_default_registry
 from kdagent.ui.app import KDApp
 
@@ -124,6 +137,32 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     skill_manager.scan()
     registry.register(LoadSkill(skill_manager))
     registry.register(SkillCreator(skill_manager))
+    # 10 M5-a SubAgent：三级搜索（项目>用户>内置）+ 内置 4 Agent（Verification 默认关
+    # T27）。AgentManager 供 Agent 工具选型；TaskManager 管理后台任务，完成注入主对话。
+    # SubAgentRunner 持主 llm/registry/config，`make_client` 支持 model 覆盖换 client。
+    agent_manager = AgentManager(
+        [
+            kd_dir / "agents",  # 项目级（可提交 git、团队共享）
+            Path.home() / ".kdagent" / "agents",  # 用户级（个人通用）
+            BUILTIN_AGENTS_DIR,  # 内置级（开箱即用 4 类）
+        ],
+        enable_verification=bool(config.agents.get("enable_verification_agent", False)),
+    )
+    agent_manager.scan()
+    subagent_runner = SubAgentRunner(
+        llm=llm,
+        tools=registry,
+        config=config,
+        work_dir=work_dir,
+        permission_checker=permission_checker,
+        make_client=_make_client(api_key),
+    )
+    task_manager = TaskManager(subagent_runner)
+    registry.register(AgentTool(subagent_runner, agent_manager, task_manager))
+    registry.register(TaskList(task_manager))
+    registry.register(TaskGet(task_manager))
+    registry.register(TaskCreate(task_manager))
+    registry.register(TaskUpdate(task_manager))
     return KDApp(
         config=config,
         llm=llm,
@@ -143,7 +182,25 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         memory_consolidator=memory_consolidator,
         mcp_manager=mcp_manager,
         skill_manager=skill_manager,
+        task_manager=task_manager,
+        agent_manager=agent_manager,
     )
+
+
+def _make_client(api_key: str) -> Callable[[str], LLMClient]:
+    """model 覆盖工厂：子 Agent 指定 model 时新建 OpenAI 兼容 client（10 §3.3）。"""
+
+    def factory(model: str) -> LLMClient:
+        return OpenAICompatClient(
+            ProviderConfig(
+                protocol="openai",
+                model=model,
+                base_url="https://api.deepseek.com/v1",
+                api_key=api_key,
+            )
+        )
+
+    return factory
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -16,6 +16,8 @@ from kdagent.memory.model import MemoryFile
 from kdagent.memory.store import MemoryStore
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.skill.manager import SkillManager
+from kdagent.subagent.runner import SubAgentRunner
+from kdagent.subagent.task import TaskManager
 from kdagent.tools import build_default_registry
 from kdagent.ui.commands import (
     Command,
@@ -40,6 +42,7 @@ TEST_COMMAND_NAMES = [
     "mcp",  # 09 M4-c：查看 MCP 连接状态
     "skills",  # 09 M4-d：查看已加载 Skill 清单
     "memory",  # 08 M4-e：查看/管理记忆
+    "tasks",  # 10 M5-a：后台任务便捷列表
 ]
 
 
@@ -87,6 +90,7 @@ def _ctx(
     skill_manager: SkillManager | None = None,
     mcp_manager: MCPManager | None = None,
     memory_store: MemoryStore | None = None,
+    task_manager: TaskManager | None = None,
 ) -> CommandContext:
     conv = ConversationManager()
     agent = Agent(
@@ -110,6 +114,7 @@ def _ctx(
         skill_manager=skill_manager,
         mcp_manager=mcp_manager,
         memory_store=memory_store,
+        task_manager=task_manager,
     )
 
 
@@ -499,6 +504,32 @@ def test_memory_invalid_type_guides(tmp_path: Path) -> None:
         _ctx(tmp_path, ui, args="add x nope 描述", memory_store=MemoryStore(tmp_path / "u", tmp_path / "p"))
     )
     assert any("type 需为" in m for m in ui.messages)
+
+
+# ---- /tasks（10 M5-a：后台任务便捷列表） ------------------------------------
+
+
+def test_tasks_no_manager_guides(tmp_path: Path) -> None:
+    ui = RecordingUI()
+    build_default_commands().find("tasks").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui)
+    )
+    assert any("后台任务系统不可用" in m for m in ui.messages)
+
+
+def test_tasks_empty_list(tmp_path: Path) -> None:
+    runner = SubAgentRunner(
+        llm=FakeLLM([]),
+        tools=build_default_registry(),
+        config=Config(),
+        work_dir=tmp_path,
+    )
+    tm = TaskManager(runner)
+    ui = RecordingUI()
+    build_default_commands().find("tasks").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, task_manager=tm)
+    )
+    assert any("当前无后台任务" in m for m in ui.messages)
 
 
 # ---- Skill 自动注册 Slash 命令（09 M4-e：/name 显式触发） -------------------

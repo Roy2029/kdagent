@@ -56,6 +56,9 @@ from kdagent.permission.modes import Mode
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.sessions.records import todo_items_from_raw
 from kdagent.skill.manager import SkillManager
+from kdagent.subagent.agent_tool import Agent as SubAgentTool
+from kdagent.subagent.manager import AgentManager
+from kdagent.subagent.task import TaskManager
 from kdagent.tools.registry import ToolRegistry
 from kdagent.ui.chat import ChatView
 from kdagent.ui.commands import (
@@ -243,6 +246,8 @@ class KDApp(App[None]):
         memory_consolidator: MemoryConsolidator | None = None,
         mcp_manager: MCPManager | None = None,
         skill_manager: SkillManager | None = None,
+        task_manager: TaskManager | None = None,
+        agent_manager: AgentManager | None = None,
     ) -> None:
         super().__init__()
         self._config = config
@@ -257,6 +262,7 @@ class KDApp(App[None]):
         # 属性名不用 `_registry`：Textual 内部也有 `_registry`（其 CommandRegistry），
         # 同名会覆盖冲突（启动即崩）。
         self._commands = build_default_commands()
+        self._tools = tools  # 10 M5-a：Agent 工具父对话绑定（SubAgentTool 取回）
         self._agent = Agent(
             config=config,
             llm=llm,
@@ -294,6 +300,16 @@ class KDApp(App[None]):
         # 09 §3.9 显式触发：已加载 Skill 自动注册 /name 命令（与内置冲突的跳过）。
         if skill_manager is not None:
             register_skill_commands(self._commands, skill_manager)
+        # 10 M5-a SubAgent：后台任务管理器 + Agent 工具父对话绑定（Fork 继承源 +
+        # 完成通知注入目标）。TaskManager 与 Agent 工具共享主对话引用——KDApp 持有
+        # 唯一 Agent 实例，构造完成后在此接线（cli 阶段无 agent 可绑）。
+        self._task_manager = task_manager
+        self._agent_manager = agent_manager
+        if task_manager is not None:
+            task_manager.set_parent_conversation(self._agent.conversation)
+        agent_tool = self._tools.get("Agent")
+        if isinstance(agent_tool, SubAgentTool):
+            agent_tool.set_parent_conversation(self._agent.conversation)
         self._default_prompt = system_prompt
         self._agent_worker: Worker[Any] | None = None
         self._total_usage = Usage()
@@ -462,6 +478,7 @@ class KDApp(App[None]):
             mcp_manager=self._mcp_manager,
             skill_manager=self._skill_manager,
             memory_store=self._memory_store,
+            task_manager=self._task_manager,
         )
 
     def _schedule_resume_compact(self, conversation: ConversationManager) -> None:
