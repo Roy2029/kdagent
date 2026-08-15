@@ -152,6 +152,14 @@ def classify(
     return "not_located", "未定位到该改的文件（补丁与官方补丁无交集）"
 
 
+def sort_report_by_task_order(report: EvalReport, tasks: list[EvalTask]) -> None:
+    """报告按题序稳定排序（D65）：并发下 resolved/failed 是完成序追加，跨轮顺序
+    会跳动——复核索引/复测对比按落盘顺序展示，题序归位保证可读性。原地排序。"""
+    order = {t.instance_id: i for i, t in enumerate(tasks)}
+    report.resolved.sort(key=lambda iid: order.get(iid, len(order)))
+    report.failed.sort(key=lambda c: order.get(c.instance_id, len(order)))
+
+
 class EvalRunner:
     """跑批编排（§3.2 跑批阶段）：封史 → 隔离跑 → 判分 → 归类 → 报告。"""
 
@@ -181,6 +189,7 @@ class EvalRunner:
 
         D64 起支持并发：asyncio.Semaphore 限并发 + gather 并行跑 `_safe_task`。
         单任务异常由 `_safe_task` 隔离（记 harness_fault，不中断整批）。
+        D65 起报告按题序稳定排序（并发下为完成序追加，复核/复测展示跨轮一致）。
         """
         if max_workers < 1:
             raise ValueError("max_workers 必须 >= 1")
@@ -199,6 +208,7 @@ class EvalRunner:
 
             await asyncio.gather(*(_guarded(task) for task in tasks))
         report.metrics.wall_s = time.perf_counter() - start
+        sort_report_by_task_order(report, tasks)
         return report
 
     async def _safe_task(self, report: EvalReport, task: EvalTask) -> None:

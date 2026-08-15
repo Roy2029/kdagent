@@ -14,7 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from kdagent.eval import EvalRunner, EvalTask
+from kdagent.eval import EvalReport, EvalRunner, EvalTask, FailureCase, RunMetrics
+from kdagent.eval.runner import sort_report_by_task_order
 from kdagent.subagent.model import AgentDef
 
 _GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
@@ -137,10 +138,10 @@ def _tasks(repo: Path, count: int, marker: str = "") -> list[EvalTask]:
 
 @pytest.mark.asyncio
 async def test_concurrent_two_tasks_resolve(repo: Path, tmp_path: Path) -> None:
-    """max_workers=2：两任务都 resolved，metrics 计数正确。"""
+    """max_workers=2：两任务都 resolved，metrics 计数正确（题序稳定排序）。"""
     ev = _make_ev(repo, tmp_path, _ResolveRunner(), _tasks(repo, 2))
     report = await ev.run("run-conc", max_workers=2)
-    assert sorted(report.resolved) == ["t0", "t1"]
+    assert report.resolved == ["t0", "t1"]  # D65：完成序 → 题序归位
     assert report.metrics.total == 2
     assert report.metrics.resolved == 2
     assert report.failed == []
@@ -180,7 +181,7 @@ async def test_concurrent_overlaps(repo: Path, tmp_path: Path) -> None:
     ev = _make_ev(repo, tmp_path, _BarrierRunner(2, max_active), _tasks(repo, 2))
     report = await ev.run("run-ov", max_workers=2)
     assert max_active[0] == 2  # 二者同时在飞
-    assert sorted(report.resolved) == ["t0", "t1"]
+    assert report.resolved == ["t0", "t1"]
 
 
 # ---- 顺序路径回归 ----
@@ -190,7 +191,7 @@ async def test_sequential_default_two_tasks(repo: Path, tmp_path: Path) -> None:
     """默认 max_workers=1 顺序跑仍全过（total 计数上移后不回归）。"""
     ev = _make_ev(repo, tmp_path, _ResolveRunner(), _tasks(repo, 2))
     report = await ev.run("run-seq")
-    assert sorted(report.resolved) == ["t0", "t1"]
+    assert report.resolved == ["t0", "t1"]
     assert report.metrics.total == 2
     assert report.failed == []
 
@@ -210,3 +211,30 @@ async def test_max_workers_validation(repo: Path, tmp_path: Path) -> None:
     ev = _make_ev(repo, tmp_path, _ResolveRunner(), [])
     with pytest.raises(ValueError, match="max_workers"):
         await ev.run("run-bad", max_workers=0)
+
+
+# ---- 报告题序稳定排序（D65） ----
+
+def test_sort_report_by_task_order() -> None:
+    """并发为完成序追加，跑批结束按题序归位（复核/复测展示稳定）。"""
+    tasks = [EvalTask(instance_id=iid) for iid in ("t0", "t1", "t2")]
+    report = EvalReport(
+        run_id="r",
+        tasks=tasks,
+        resolved=["t2", "t0"],  # 完成序乱序
+        failed=[
+            FailureCase(instance_id="t1", kind="not_located", reason="x"),
+        ],
+        metrics=RunMetrics(total=3, resolved=2),
+    )
+    sort_report_by_task_order(report, tasks)
+    assert report.resolved == ["t0", "t2"]
+    assert report.failed[0].instance_id == "t1"
+
+
+def test_sort_report_unknown_id_appends_last() -> None:
+    """任务表里没有的 instance_id 排最后（防御性，不崩）。"""
+    tasks = [EvalTask(instance_id="t0")]
+    report = EvalReport(run_id="r", tasks=tasks, resolved=["ghost", "t0"])
+    sort_report_by_task_order(report, tasks)
+    assert report.resolved == ["t0", "ghost"]
