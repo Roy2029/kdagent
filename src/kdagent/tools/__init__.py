@@ -2,6 +2,7 @@
 
 from kdagent.tools.base import Tool, ToolContext, ToolResult
 from kdagent.tools.filesystem import EditFile, Glob, Grep, ReadFile, WriteFile
+from kdagent.tools.git_revert import GitRevert
 from kdagent.tools.registry import ToolRegistry
 from kdagent.tools.shell import Bash
 from kdagent.tools.test_runner import TestRunner, parse_failed_tests
@@ -19,6 +20,7 @@ def build_default_registry() -> ToolRegistry:
 __all__ = [
     "Bash",
     "EditFile",
+    "GitRevert",
     "Glob",
     "Grep",
     "ReadFile",

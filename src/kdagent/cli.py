@@ -45,7 +45,7 @@ from kdagent.subagent import (
 from kdagent.subagent import (
     Agent as AgentTool,
 )
-from kdagent.tools import TestRunner, build_default_registry
+from kdagent.tools import GitRevert, TestRunner, build_default_registry
 from kdagent.ui.app import KDApp
 
 
@@ -206,6 +206,8 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     # 12 Harness 测试闭环：TestRunner 工具（隔离沙箱跑测试 + 结构化 TestingEvent）。
     # resolve_worktree 注入 worktree_manager.path（解耦 tools→subagent 包循环）。
     registry.register(TestRunner(worktree_manager.path))
+    # 12 §3.2 代码回滚：GitRevert 精确回退（worktree 变更保护下失败改动可恢复）。
+    registry.register(GitRevert())
     # 10 M5-d SendMessage：命名 Agent 注册表 + 消息投递工具。命名 Agent 存活到
     # 会话结束（注册即常驻），SendMessage 投递新任务唤醒继续。
     named_manager = NamedAgentManager(subagent_runner)
