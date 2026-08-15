@@ -17,7 +17,9 @@ from typing import Literal, Protocol
 from kdagent.config import Config
 from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
+from kdagent.mcp.manager import MCPManager
 from kdagent.sessions.manager import Session, SessionManager
+from kdagent.skill.manager import SkillManager
 
 CommandType = Literal["local", "local-ui", "prompt"]
 
@@ -55,6 +57,9 @@ class CommandContext:
     resume_compact: Callable[[ConversationManager], None] | None = None
     # 05 §3.6：/compact 手动压缩（App 同步调度异步执行；str=带参保留重点，同 resume 模式）
     manual_compact: Callable[[ConversationManager, str], None] | None = None
+    # 09 M4-c/d 查看类命令：MCP 连接状态（/mcp）、Skill 清单（/skills）。
+    mcp_manager: MCPManager | None = None
+    skill_manager: SkillManager | None = None
 
 
 @dataclass
@@ -252,6 +257,43 @@ def _cmd_exit(ctx: CommandContext) -> None:
     ctx.ui.request_exit()
 
 
+def _cmd_mcp(ctx: CommandContext) -> None:
+    """09 §3.11：查看已连接 Server / 工具 / 连接状态（与 /permissions 同构查看类）。"""
+    mgr = ctx.mcp_manager
+    if mgr is None:
+        ctx.ui.add_system_message("MCP 系统不可用（未配置 mcp_servers）。")
+        return
+    lines = ["MCP Server 状态："]
+    if mgr.connected:
+        lines.append(f"  已连接：{'、'.join(sorted(mgr.connected))}")
+    else:
+        lines.append("  已连接：无")
+    if mgr.failed:
+        for name, err in mgr.failed.items():
+            lines.append(f"  失败：{name}（{err}）")
+    mcp_tools = [n for n in ctx.agent.tool_names if n.startswith("mcp_")]
+    lines.append(f"  工具：{len(mcp_tools)} 个（{', '.join(mcp_tools) if mcp_tools else '无'}）")
+    ctx.ui.add_system_message("\n".join(lines))
+
+
+def _cmd_skills(ctx: CommandContext) -> None:
+    """09 §3.11：查看已加载 Skill 清单（两阶段加载第一阶段产物）。"""
+    mgr = ctx.skill_manager
+    if mgr is None:
+        ctx.ui.add_system_message("Skill 系统不可用。")
+        return
+    skills = mgr.list()
+    if not skills:
+        ctx.ui.add_system_message("暂无可用 Skill。可用 skill-creator 工具创建一个。")
+        return
+    lines = [f"可用 Skill（{len(skills)} 个）："]
+    for s in skills:
+        mode = "" if s.mode == "inline" else f"（{s.mode}）"
+        lines.append(f"  {s.name}{mode}：{s.description}")
+    lines.append("调用 LoadSkill(\"<name>\") 加载完整 SOP。")
+    ctx.ui.add_system_message("\n".join(lines))
+
+
 # 06 M3 可控档：权限模式清单（/permissions 可切换；bypassPermissions 仅黑名单仍生效）。
 _PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
 
@@ -349,6 +391,24 @@ def build_default_commands() -> CommandRegistry:
             usage="/permissions [模式]",
             type="local",
             handler=_cmd_permissions,
+        )
+    )
+    registry.register(
+        Command(
+            name="mcp",
+            description="MCP 状态：已连接 Server / 工具列表 / 连接失败",
+            usage="/mcp",
+            type="local",
+            handler=_cmd_mcp,
+        )
+    )
+    registry.register(
+        Command(
+            name="skills",
+            description="Skill 清单：查看已加载 Skill（name + description）",
+            usage="/skills",
+            type="local",
+            handler=_cmd_skills,
         )
     )
     return registry

@@ -52,6 +52,7 @@ from kdagent.obs.log import payload_text, snapshot
 from kdagent.obs.model import Span
 from kdagent.obs.telemetry import Telemetry
 from kdagent.permission.checker import PermissionChecker
+from kdagent.skill.manager import SkillManager, build_skills_reminder
 from kdagent.tools.base import AsyncConfirm, TodosCallback, ToolContext, ToolResult
 from kdagent.tools.registry import ToolRegistry
 
@@ -116,6 +117,7 @@ class Agent:
         memory_store: MemoryStore | None = None,
         memory_extractor: MemoryExtractor | None = None,
         memory_consolidator: MemoryConsolidator | None = None,
+        skills: SkillManager | None = None,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -140,6 +142,9 @@ class Agent:
         self._memory_store = memory_store
         self._memory_extractor = memory_extractor
         self._memory_consolidator = memory_consolidator
+        # 09 M4-d Skill 两阶段加载：system-reminder 注入「可用 Skill」清单（轻量），
+        # 完整 SOP 经 LoadSkill 工具按需加载（agent 只持清单，正文在 manager）。
+        self._skills = skills
         self._stop_reason = "completed"
         self._usage: Usage | None = None
         self._consecutive_failures = 0
@@ -166,6 +171,11 @@ class Agent:
     def tool_count(self) -> int:
         """已注册工具数（05 /status 展示用）。"""
         return len(self._tools.all())
+
+    @property
+    def tool_names(self) -> list[str]:
+        """已注册工具名（09 /mcp 查看工具列表用）。"""
+        return sorted(t.name for t in self._tools.all())
 
     @property
     def conversation(self) -> ConversationManager:
@@ -429,6 +439,13 @@ class Agent:
                 "或关键词搜索）：\n" + listing + "\n</system-reminder>"
             )
             system = f"{system}\n\n{reminder}"
+        # 09 §3.9 两阶段加载：Skill 轻量清单注入 system-reminder（只列 name+description，
+        # 渐进式披露）；完整 SOP 经 LoadSkill 按需加载。改 reminder 不改 system → 前缀缓存
+        # 不受影响（与延迟工具同机制）。清单变化随 payload 组装现取，build 时注入会过期。
+        if self._skills is not None:
+            skills_reminder = build_skills_reminder(self._skills.list())
+            if skills_reminder:
+                system = f"{system}\n\n{skills_reminder}"
         return Payload(
             system=system,
             messages=self._conversation.messages,

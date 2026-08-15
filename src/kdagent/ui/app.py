@@ -55,6 +55,7 @@ from kdagent.permission.checker import PermissionChecker
 from kdagent.permission.modes import Mode
 from kdagent.sessions.manager import Session, SessionManager
 from kdagent.sessions.records import todo_items_from_raw
+from kdagent.skill.manager import SkillManager
 from kdagent.tools.registry import ToolRegistry
 from kdagent.ui.chat import ChatView
 from kdagent.ui.commands import (
@@ -240,6 +241,7 @@ class KDApp(App[None]):
         memory_extractor: MemoryExtractor | None = None,
         memory_consolidator: MemoryConsolidator | None = None,
         mcp_manager: MCPManager | None = None,
+        skill_manager: SkillManager | None = None,
     ) -> None:
         super().__init__()
         self._config = config
@@ -274,6 +276,7 @@ class KDApp(App[None]):
             memory_store=memory_store,
             memory_extractor=memory_extractor,
             memory_consolidator=memory_consolidator,
+            skills=skill_manager,
         )
         if context_manager is not None:
             context_manager.set_session_id(self._session.id)  # 01：落盘目录随初始 sid
@@ -283,6 +286,8 @@ class KDApp(App[None]):
         self._hooks = hooks
         # 09 M4-c 工具生态：MCP Manager（启动即后台连接，on_unmount 关闭）。
         self._mcp_manager = mcp_manager
+        # 09 M4-d Skill：SkillManager（/skills 查看清单；LoadSkill 已注册进 registry）。
+        self._skill_manager = skill_manager
         self._default_prompt = system_prompt
         self._agent_worker: Worker[Any] | None = None
         self._total_usage = Usage()
@@ -448,6 +453,8 @@ class KDApp(App[None]):
             session_manager=self._session_manager,
             resume_compact=self._schedule_resume_compact,
             manual_compact=self._schedule_manual_compact,
+            mcp_manager=self._mcp_manager,
+            skill_manager=self._skill_manager,
         )
 
     def _schedule_resume_compact(self, conversation: ConversationManager) -> None:

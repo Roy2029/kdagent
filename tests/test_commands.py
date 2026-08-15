@@ -11,7 +11,9 @@ from conftest import FakeLLM
 from kdagent.config import Config
 from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
+from kdagent.mcp.manager import MCPManager
 from kdagent.sessions.manager import Session, SessionManager
+from kdagent.skill.manager import SkillManager
 from kdagent.tools import build_default_registry
 from kdagent.ui.commands import (
     Command,
@@ -32,6 +34,8 @@ TEST_COMMAND_NAMES = [
     "session",
     "exit",
     "permissions",
+    "mcp",  # 09 M4-c：查看 MCP 连接状态
+    "skills",  # 09 M4-d：查看已加载 Skill 清单
 ]
 
 
@@ -76,6 +80,8 @@ def _ctx(
     ui: UIController,
     args: str = "",
     manual_compact: Callable[[ConversationManager, str], None] | None = None,
+    skill_manager: SkillManager | None = None,
+    mcp_manager: MCPManager | None = None,
 ) -> CommandContext:
     conv = ConversationManager()
     agent = Agent(
@@ -96,6 +102,8 @@ def _ctx(
         registry=build_default_commands(),
         session_manager=SessionManager(tmp_path / ".kdagent" / "sessions"),
         manual_compact=manual_compact,
+        skill_manager=skill_manager,
+        mcp_manager=mcp_manager,
     )
 
 
@@ -159,7 +167,7 @@ def test_complete_prefix_matching() -> None:
 # ---- 内置命令与 handler ----------------------------------------------------
 
 
-def test_default_commands_all_seven() -> None:
+def test_default_commands_all() -> None:
     reg = build_default_commands()
     names = [c.name for c in reg.all()]
     assert sorted(names) == sorted(TEST_COMMAND_NAMES)
@@ -372,3 +380,53 @@ def test_permissions_unknown_mode_guides(tmp_path: Path) -> None:
     cmd.handler(_ctx(tmp_path, ui, args="nope"))  # type: ignore[union-attr]
     assert ui.mode == "default"
     assert any("未知权限模式" in m for m in ui.messages)
+
+
+# ---- /mcp、/skills（09 M4-c/d 查看类命令） ---------------------------------
+
+
+def test_mcp_no_manager_guides(tmp_path: Path) -> None:
+    ui = RecordingUI()
+    build_default_commands().find("mcp").handler(_ctx(tmp_path, ui))  # type: ignore[union-attr]
+    assert any("MCP 系统不可用" in m for m in ui.messages)
+
+
+def test_mcp_shows_connection_status(tmp_path: Path) -> None:
+    from kdagent.tools.registry import ToolRegistry
+
+    mgr = MCPManager(ToolRegistry())
+    mgr._connected.add("github")
+    mgr._failed["broken"] = "RuntimeError: nope"
+    ui = RecordingUI()
+    build_default_commands().find("mcp").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, mcp_manager=mgr)
+    )
+    assert any("github" in m and "broken" in m for m in ui.messages)
+
+
+def test_skills_lists_loaded(tmp_path: Path) -> None:
+    root = tmp_path / "skills"
+    root.mkdir(parents=True)
+    (root / "commit.md").write_text(
+        "---\nname: commit\ndescription: 分析 git 变更\n---\n\nbody\n", encoding="utf-8"
+    )
+    (root / "review.md").write_text(
+        "---\nname: review\ndescription: 审查代码\nmode: fork\n---\n\nbody\n", encoding="utf-8"
+    )
+    mgr = SkillManager([root])
+    mgr.scan()
+    ui = RecordingUI()
+    build_default_commands().find("skills").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, skill_manager=mgr)
+    )
+    assert any("commit" in m and "review（fork）" in m for m in ui.messages)
+
+
+def test_skills_empty_hints_creator(tmp_path: Path) -> None:
+    mgr = SkillManager([tmp_path / "skills"])
+    mgr.scan()
+    ui = RecordingUI()
+    build_default_commands().find("skills").handler(  # type: ignore[union-attr]
+        _ctx(tmp_path, ui, skill_manager=mgr)
+    )
+    assert any("暂无可用 Skill" in m and "skill-creator" in m for m in ui.messages)

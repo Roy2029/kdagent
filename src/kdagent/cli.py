@@ -27,6 +27,7 @@ from kdagent.memory.consolidator import MemoryConsolidator
 from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.store import build_memory_store
 from kdagent.permission.checker import build_permission_checker
+from kdagent.skill import BUILTIN_SKILLS_DIR, LoadSkill, SkillCreator, SkillManager
 from kdagent.tools import build_default_registry
 from kdagent.ui.app import KDApp
 
@@ -110,6 +111,19 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     registry.register(ToolSearch(registry))
     mcp_manager = MCPManager(registry)
     mcp_manager.load_configs(config.mcp_servers if isinstance(config.mcp_servers, dict) else {})
+    # 09 M4-d Skill 两阶段加载：三级搜索（项目>用户>内置），启动只扫 frontmatter
+    # （system-reminder 注入「可用 Skill」清单），完整 SOP 经 LoadSkill 按需加载。
+    # skill-creator 写入用户级目录（~/.kdagent/skills/，个人通用）。
+    skill_manager = SkillManager(
+        [
+            kd_dir / "skills",  # 项目级（可提交 git、团队共享）
+            Path.home() / ".kdagent" / "skills",  # 用户级（个人通用）
+            BUILTIN_SKILLS_DIR,  # 内置级（开箱即用）
+        ]
+    )
+    skill_manager.scan()
+    registry.register(LoadSkill(skill_manager))
+    registry.register(SkillCreator(skill_manager))
     return KDApp(
         config=config,
         llm=llm,
@@ -128,6 +142,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         memory_extractor=memory_extractor,
         memory_consolidator=memory_consolidator,
         mcp_manager=mcp_manager,
+        skill_manager=skill_manager,
     )
 
 
