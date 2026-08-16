@@ -2,6 +2,47 @@
 
 KDAgent 版本对应档位里程碑（版本路线见 `docs/技术规格/00-总览与路线图.md`，docs 本地维护不随仓库分发）。
 
+## [0.5.0] - 2026-08-16 — M5 生产级：SubAgent + Worktree + 评估 MVP
+
+### 主里程碑（M5-a → M5-e）
+
+| 里程碑 | 内容 |
+|---|---|
+| M5-a SubAgent 体系 | `Agent≈Tool` 统一入口 + 工具过滤四层（防递归/嵌套/越权）+ Task 工具集（TaskList/Get/Create/Update）+ 内置 4 Agent（Explore 只读 / Plan / general-purpose / Verification 默认关）+ Fork（继承父对话无条件后台） |
+| M5-b Worktree 空间隔离 | slug 白名单防路径遍历 → `git worktree add` 空间隔离 + 显式 cwd 模式 + fail-closed 清理（有变更保留不丢成果）+ `/worktree` 命令 |
+| M5-c 后台 + worktree | 后台任务生命周期（完成/失败 `<task-notification>` 注入）+ worktree 创建后设置（.worktreeinclude 复制 + 大依赖软链） |
+| M5-d 命名 Agent | SendMessage 命名投递 + 消息循环串行消费（FIFO，多消息续跑）+ Fork 命名 |
+| M5-e 评估 MVP | `kdagent eval` CLI：封史副本（git archive 单提交防作弊）→ 隔离执行 → 补丁提取 → 判分双轨（真实测试 / gold 相似度）→ 失败归类五类 |
+
+### M5 遗留增强（D53-D83，31 块）速览
+
+- **Harness 测试闭环**（D53）：TestRunner 工具（current/worktree/temp 三沙箱）+ TestingEvent + 规则量化四规则（先读后编辑/失败必重跑/禁碰测试/判据写作）+ 测试基建探测 + 常驻铁律
+- **检查点与反思**（D54/D57/D58）：双层检查点（声明驱动 + 行为观察兜底）→ Replan 接入（断路器反复受阻引导换路）→ 声明 vs 行为自动核验（判据机械分类器）
+- **错误模式沉淀**（D59）：写失败 → 事件驱动客观诊断（7 类）→ feedback 记忆自动复用
+- **可观测性**（D55/D60/D68-D72/D80）：tool span 补 input/output 埋点 · eval 标记 contextvar 并发隔离 · compact/L2 压缩成本 span · metrics 聚合纯函数 · `/metrics` 面板 · 判分后回填 trace 判定 · **OTLP 接口实装**（标准库最小实装，protojson 编码）
+- **评估体系完善**（D61-D67/D73/D81/D82）：复核界面 CLI + TUI 报告屏 · 复测对比（diff_runs/metrics_by_run）· 并发跑批 · 题序稳定排序 · 估算成本（计价表）· **P2P 保护判分**（F2P 全过 + P2P 无损坏才算 resolved）· **gold 校验**（环境失效题剔除）
+- **测试 UI 三态渲染**（D74）：passed✓/failed✗/regression⚠
+- **工具/Hook/MCP 补全**（D75-D77）：Hook 子 Agent 生效（共享引擎）· GitRevert 精确回退 · MCP 外部内容来源标注
+- **SubAgent 运行时**（D78/D79）：子 Agent 挂父 trace（跨 trace 父子链可重建）· adoptRunning 前台切后台（超时/取消自动转后台继续）
+- **计价配置化**（D83）：`cost:` 段按 provider 取价目（T5-1 机制，数值待标定）
+
+### 验收基线
+
+712 passed + 5 skipped · mypy 93 源文件 · ruff 干净
+
+## [0.4.0] - 2026-08-16 — M4 好用档：静默记忆 + MCP + Skill
+
+### 新增
+- **静默记忆**（`08`）：MEMORY.md 索引注入式静默读（无向量/无 side-query）+ 结构化 JSON 操作集静默写（双门槛节流：≥10min + ≥20K 增量）+ Dreaming 整理（提取 → 去重 → 合并 → 归档，后台调度）
+- **MCP 工具桥**（`09`）：官方 Python SDK 客户端 + 启动即后台连接（懒连死循环规避）+ 工具延迟加载跨厂商（四步延迟，改 reminder 不改 system 保前缀缓存）+ `/mcp` 命令
+- **Skill 两阶段**（`09`）：轻量注册 → 按需 LoadSkill（改 reminder 不改 system）+ 三级优先级（项目>用户>内置）+ 自动注册 `/name` 命令 + `skill-creator` 内置
+- **/memory 命令**：概要/列表/add/delete/clear
+- **MEMORY.md 记忆管理**：`memory/*.md` 文件是唯一真相源
+
+### 验收基线
+
+368 测试全绿
+
 ## [0.3.0] - 2026-08-16 — M3 可控档：五层权限 + Hook 引擎 + /permissions
 
 ### 新增
