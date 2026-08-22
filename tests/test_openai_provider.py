@@ -42,6 +42,8 @@ def test_serialize_tool_result_as_separate_tool_role() -> None:
 
 
 def test_serialize_user_with_text_and_tool_result_split() -> None:
+    """混合消息（text+tool_result 被 `_append` 合并）序列化：tool 响应优先输出，
+    保证紧跟其上一条 assistant(tool_calls)——否则打断 tool 配对触发 400。"""
     messages = [
         Message(
             role="user",
@@ -50,8 +52,8 @@ def test_serialize_user_with_text_and_tool_result_split() -> None:
     ]
     result = _serialize_messages(messages)
     assert result == [
-        {"role": "user", "content": "说明"},
         {"role": "tool", "tool_call_id": "x", "content": "结果"},
+        {"role": "user", "content": "说明"},
     ]
 
 
@@ -115,6 +117,31 @@ def test_parser_usage_chunk_maps_cache_fields() -> None:
 def test_parser_ignores_non_data_lines() -> None:
     parser = _OpenAIStreamParser()
     assert parser.feed(": keep-alive") == []
+
+
+def test_parser_dedups_duplicate_tool_call_id() -> None:
+    """同 id 重复 tool_call（厂商流式偶发）→ 只保留第一个，防历史链损坏。"""
+    lines = [
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_A","function":{"name":"Bash","arguments":"{}"}}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_A","function":{"name":"Bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+    ]
+    events = _feed_all(_OpenAIStreamParser(), lines)
+    tool_uses = [e.tool_use for e in events if e.type == "tool_use"]
+    assert len(tool_uses) == 1  # call_A 去重，不产生同 id 两条
+    assert tool_uses[0].id == "call_A"
+
+
+def test_parser_keeps_distinct_tool_call_ids() -> None:
+    """不同 id 的 tool_call 不去重（正常多工具并行）。"""
+    lines = [
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_A","function":{"name":"Bash","arguments":"{}"}}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_B","function":{"name":"Glob","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+    ]
+    events = _feed_all(_OpenAIStreamParser(), lines)
+    tool_uses = [e.tool_use for e in events if e.type == "tool_use"]
+    assert sorted(tu.id for tu in tool_uses) == ["call_A", "call_B"]
 
 
 # ---------- 可选真实调用 ----------

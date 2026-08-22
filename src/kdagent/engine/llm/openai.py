@@ -77,10 +77,13 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
                     text_parts.append(block.text)
                 elif isinstance(block, ToolResultBlock):
                     tool_results.append(block)
-            if text_parts:
-                out.append({"role": "user", "content": "".join(text_parts)})
+            # tool 响应优先输出：OpenAI 要求 tool 消息紧跟其 assistant(tool_calls)。
+            # 混合消息（text+tool_result 被 `_append` 合并）若先输出 user 文本会打断
+            # tool 配对，触发 "insufficient tool messages following tool_calls" 400。
             for tr in tool_results:
                 out.append({"role": "tool", "tool_call_id": tr.tool_use_id, "content": tr.content})
+            if text_parts:
+                out.append({"role": "user", "content": "".join(text_parts)})
     return out
 
 
@@ -165,10 +168,15 @@ class _OpenAIStreamParser:
 
     def _flush_tool_calls(self) -> list[LLMStreamEvent]:
         events: list[LLMStreamEvent] = []
+        seen_ids: set[str] = set()
         for index in sorted(self._tool_calls):
             entry = self._tool_calls[index]
             if not entry["name"]:
                 continue  # 残缺 tool_call 丢弃
+            if entry["id"] in seen_ids:
+                continue  # 流式同 id 重复（厂商偶发）→ 保第一个，防历史链损坏
+            if entry["id"]:
+                seen_ids.add(entry["id"])
             try:
                 arguments = json.loads(entry["arguments"]) if entry["arguments"] else {}
             except json.JSONDecodeError:

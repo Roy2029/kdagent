@@ -9,7 +9,7 @@ import pytest
 
 from kdagent.config import Config
 from kdagent.tools.base import ToolContext
-from kdagent.tools.shell import Bash
+from kdagent.tools.shell import Bash, wsl_delete_diagnosis
 
 
 def _ctx(work_dir: Path) -> ToolContext:
@@ -48,3 +48,43 @@ def test_bash_meta_declarations() -> None:
     assert tool.is_destructive() is True  # 保守声明（D10）
     assert tool.is_concurrency_safe({}) is False  # 保守声明
     assert tool.is_read_only() is False
+
+
+# ---- R3：WSL 删除映射诊断（方案 B，纯函数） ----
+
+def test_wsl_diagnosis_detects_drive_target() -> None:
+    """WSL bash + Windows 盘符 rm 目标 → 命中，给出 /mnt/d 转换路径。"""
+    d = wsl_delete_diagnosis('rm -f D:\\old-build', "C:\\Windows\\System32\\bash.exe")
+    assert d is not None
+    assert "映射诊断" in d
+    assert "/mnt/d/old-build" in d
+
+
+def test_wsl_diagnosis_unix_bash() -> None:
+    """WSL 内嵌 Linux bash（/usr/bin/bash）同样命中。"""
+    d = wsl_delete_diagnosis("rm -rf D:/Projects/old", "/usr/bin/bash")
+    assert d is not None
+    assert "/mnt/d/Projects/old" in d
+
+
+def test_wsl_diagnosis_git_bash_skipped() -> None:
+    """Git Bash（盘符路径可见）→ 不诊断（避免误报）。"""
+    d = wsl_delete_diagnosis("rm -rf D:\\old-build", "C:\\Program Files\\Git\\bin\\bash.exe")
+    assert d is None
+
+
+def test_wsl_diagnosis_no_bash_skipped() -> None:
+    """无 bash 可定位 → 不诊断。"""
+    assert wsl_delete_diagnosis("rm -rf D:\\x", None) is None
+
+
+def test_wsl_diagnosis_non_drive_target_skipped() -> None:
+    """非盘符路径（Linux 路径）→ 不命中。"""
+    d = wsl_delete_diagnosis("rm -rf /tmp/build", "/usr/bin/bash")
+    assert d is None
+
+
+def test_wsl_diagnosis_non_rm_skipped() -> None:
+    """非 rm 命令 → 不命中（避免无关诊断）。"""
+    d = wsl_delete_diagnosis("ls -la D:\\x", "/usr/bin/bash")
+    assert d is None

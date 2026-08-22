@@ -524,14 +524,24 @@ class Agent:
         max_tokens = self._config.extra.get("max_tokens")
         if not isinstance(max_tokens, int):
             max_tokens = 4096
-        # 08 §3.3 静默读：记忆索引随 CLAUDE.md 走同一管线注入（此处挂在 system，
-        # 索引是动态增长的——build 时注入会过期，payload 组装时现取）。
+        # 08 §3.3 静默读：记忆索引随 CLAUDE.md 走同一管线注入（索引是动态增长的——
+        # build 时注入会过期，payload 组装时现取）。索引用 `<system-reminder>` 醒目注入
+        # （与 09 §3.5 延迟工具/§3.9 Skill 同机制：改 reminder 不改 system → 前缀缓存
+        # 不受影响）。只注入索引指针不注入全文——模型按需 ReadFile 取详情，省 token。
         # 08 §3.5 主动线：记忆使用说明随索引一起注入，让模型知道何时翻记忆。
         system = self._system_prompt
         if self._memory_store is not None:
             index = self._memory_store.index_markdown()
             if index:
-                system = f"{system}\n\n{index}\n\n{MEMORY_USAGE_INSTRUCTION}"
+                memory_reminder = (
+                    "<system-reminder>\n记忆索引已随初始上下文加载（KDAgent 四类 "
+                    "Markdown 记忆）。涉及过往工作/决策/用户偏好/待办时，第一轮就直"
+                    "接用 ReadFile 读取下方指针指向的 `.md` 文件取详情，无需在文件系统"
+                    "里重新探索记忆目录。\n"
+                    + index
+                    + "\n</system-reminder>"
+                )
+                system = f"{system}\n\n{memory_reminder}\n\n{MEMORY_USAGE_INSTRUCTION}"
         # 09 §3.5 延迟加载：MCP 工具不进 tools 字段（数量不可控、token 省 ~85%），
         # 名字进 system-reminder 提示用 ToolSearch 加载。改 reminder 不改 system
         # → 前缀缓存不受影响。
@@ -596,18 +606,31 @@ class Agent:
         self._pending_tool_uses = []
 
     async def _execute_batch(self, batch: Batch) -> list[ToolResult]:
-        """并发批 gather（带 CONCURRENCY_LIMIT 信号量）；串行批逐个执行。"""
+        """并发批 gather（带 CONCURRENCY_LIMIT 信号量）；串行批逐个执行。
+
+        单个调用异常（HITL/权限/hook 等非工具本体抛）兜底为 errorResult——否则
+        gather 整批抛、`for batch in batches:` 中断，剩余批 tool_result 缺失，
+        历史留下 assistant(tool_calls) 无对应 tool_result（发请求 HTTP 400）。
+        """
+        async def run_one_safe(tc: ToolUseBlock) -> ToolResult:
+            try:
+                return await self._exec_one(tc)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return self._error_result(tc, f"工具执行异常：{exc}")
+
         if batch.is_concurrency_safe:
             sem = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
             async def run_one(tc: ToolUseBlock) -> ToolResult:
                 async with sem:
-                    return await self._exec_one(tc)
+                    return await run_one_safe(tc)
 
             return list(await asyncio.gather(*[run_one(tc) for tc in batch.calls]))
         results: list[ToolResult] = []
         for tc in batch.calls:
-            results.append(await self._exec_one(tc))
+            results.append(await run_one_safe(tc))
         return results
 
     async def _exec_one(self, tool_use: ToolUseBlock) -> ToolResult:

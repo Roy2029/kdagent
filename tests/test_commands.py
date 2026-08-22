@@ -14,7 +14,7 @@ from kdagent.engine.conversation import ConversationManager
 from kdagent.mcp.manager import MCPManager
 from kdagent.memory.model import MemoryFile
 from kdagent.memory.store import MemoryStore
-from kdagent.sessions.manager import Session, SessionManager
+from kdagent.sessions.manager import Session, SessionManager, SessionMeta
 from kdagent.skill.manager import SkillManager
 from kdagent.subagent.runner import SubAgentRunner
 from kdagent.subagent.task import TaskManager
@@ -78,6 +78,12 @@ class RecordingUI:
     def request_exit(self) -> None: ...
 
     def set_active_session(self, session: Session | None) -> None: ...
+
+    def open_session_picker(
+        self, metas: list[SessionMeta], current: Session | None
+    ) -> bool:
+        # 测试替身：不弹窗，返回 False 走命令侧降级文本列表。
+        return False
 
     def set_permission_mode(self, mode: str) -> None: ...
 
@@ -386,6 +392,25 @@ def test_permissions_switch_mode(tmp_path: Path) -> None:
     cmd.handler(_ctx(tmp_path, ui, args="plan"))  # type: ignore[union-attr]
     assert ui.mode == "plan"
     assert any("已切换到权限模式：plan" in m for m in ui.messages)
+
+
+def test_permissions_switch_camelcase_modes(tmp_path: Path) -> None:
+    """camelCase 模式名（acceptEdits/bypassPermissions）可切换，不被小写化误伤。"""
+    for args, expect in (("acceptEdits", "acceptEdits"), ("bypassPermissions", "bypassPermissions")):
+        ui = _PermissionUI()
+        cmd = build_default_commands().find("permissions")
+        cmd.handler(_ctx(tmp_path, ui, args=args))  # type: ignore[union-attr]
+        assert ui.mode == expect
+        assert any(f"已切换到权限模式：{expect}" in m for m in ui.messages)
+
+
+def test_permissions_switch_mode_lowercase_aliases(tmp_path: Path) -> None:
+    """小写别名（acceptedits/bypasspermissions）同样命中，回传规范 camelCase。"""
+    for args, expect in (("acceptedits", "acceptEdits"), ("bypasspermissions", "bypassPermissions")):
+        ui = _PermissionUI()
+        cmd = build_default_commands().find("permissions")
+        cmd.handler(_ctx(tmp_path, ui, args=args))  # type: ignore[union-attr]
+        assert ui.mode == expect
 
 
 def test_permissions_unknown_mode_guides(tmp_path: Path) -> None:

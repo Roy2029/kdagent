@@ -16,6 +16,13 @@ import re
 # bash 模式集（规格 06 §3.3 表，正则按 bash 语法）。
 _BASH: list[tuple[str, str]] = [
     ("递归删除根目录", r"rm\s+(-[a-z]*[rf][a-z]*\s+)*/\s*$"),
+    # WSL 挂载点删除：`/mnt/[a-z]` 是 Windows 盘符在 WSL 的视图，删除即真删 Windows
+    # 文件。Bash 无路径沙箱（L2 不拦命令），黑名单兜底拦挂载点级删除——work_dir 内
+    # 删除应走文件工具（有沙箱 + HITL），不走 Bash。`/mnt/[a-z]` 后须跟 `/`/空白/结尾，
+    # 避免误伤 `/mnt/data` 这类多字母挂载点。
+    ("递归删除WSL挂载点", r"rm\s+(-[a-z]*[rf][a-z]*\s+)*/mnt/[a-z]([/\s]|$)"),
+    # 盘符路径删除（Git Bash / Windows 语义）：`D:\` 或 `D:/` 开头。
+    ("递归删除Windows盘符路径", r"rm\s+(-[a-z]*[rf][a-z]*\s+)*[A-Za-z]:[\\/]"),
     ("格式化磁盘", r"mkfs\."),
     ("直接写磁盘设备", r"dd\s+if=.*of=/dev/"),
     ("递归改根目录权限", r"chmod\s+-R\s+777\s+(/|\./)?$"),

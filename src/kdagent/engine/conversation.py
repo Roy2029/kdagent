@@ -68,33 +68,44 @@ class ConversationManager:
         规格 02 §3.3 要求"补缺失的 tool_result、剔除孤立块、保证交替合法"。
         悬空 tool_use（assistant 请求了工具但从未返回结果，如会话中断/取消）若不补，
         发请求时 OpenAI 兼容 API 会因 tool_call 无对应 `role=tool` 响应而拒收（HTTP 400）。
+
+        另处理两类实测损坏（2026-08 用户核验发现，长对话/resume 触发）：
+        - 同 id 重复：assistant 内重复 tool_call_id、user 内重复 tool_use_id
+          （含跨消息重复）——流式响应厂商偶发重复 → 保第一个。
+        - 孤立 tool_result：tool_use_id 无对应 assistant tool_call → 剔除。
         """
-        tool_use_ids: set[str] = set()
-        for msg in self._messages:
-            for block in msg.content:
-                if isinstance(block, ToolUseBlock):
-                    tool_use_ids.add(block.id)
-        answered_ids = {
-            block.tool_use_id
+        # 1) 全量 tool_use id（孤立 tool_result 判定基准）
+        tool_use_ids = {
+            block.id
             for msg in self._messages
             for block in msg.content
-            if isinstance(block, ToolResultBlock)
+            if isinstance(block, ToolUseBlock)
         }
+        seen_tool_use: set[str] = set()
+        seen_tool_result: set[str] = set()
         repaired: list[Message] = []
         for msg in self._messages:
-            blocks = [
-                block
-                for block in msg.content
-                if not (
-                    isinstance(block, ToolResultBlock)
-                    and block.tool_use_id not in tool_use_ids
-                )
-            ]
+            blocks: list[ContentBlock] = []
+            for block in msg.content:
+                if isinstance(block, ToolUseBlock):
+                    if block.id in seen_tool_use:
+                        continue  # 重复 tool_call → 保第一个
+                    seen_tool_use.add(block.id)
+                    blocks.append(block)
+                elif isinstance(block, ToolResultBlock):
+                    if block.tool_use_id not in tool_use_ids:
+                        continue  # 孤立 tool_result → 剔除
+                    if block.tool_use_id in seen_tool_result:
+                        continue  # 重复 tool_result（含跨消息）→ 保第一个
+                    seen_tool_result.add(block.tool_use_id)
+                    blocks.append(block)
+                else:
+                    blocks.append(block)
             if blocks:
                 repaired.append(Message(role=msg.role, content=blocks))
         self._messages = repaired
-        # 悬空 tool_use → 补一条 errorResult（合并进最后一条 user 消息或追加一条）
-        missing = tool_use_ids - answered_ids
+        # 2) 悬空 tool_use → 补一条 errorResult（合并进最后一条 user 消息或追加一条）
+        missing = seen_tool_use - seen_tool_result
         if missing:
             blocks = [
                 ToolResultBlock(

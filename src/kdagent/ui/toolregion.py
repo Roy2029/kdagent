@@ -1,52 +1,120 @@
-"""工具调用活动区（规格 05 §3.1）："正在执行 X" 活动条 + 结果折叠一行。
+"""工具调用活动区（规格 05 §3.1）：每条工具调用一个可展开/收起的详情条目。
 
-避免工具调用刷屏对话区；ToolResultEvent 折叠为首行，成功绿/失败红 + 耗时。
+「正在执行 X」活动条 + 结果折叠一行；点击条目展开完整参数 + 输出全文。
+历史保留（U1：LoopComplete 后仍可回看，超上限裁剪最老条目，防无限增长）。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Static
+from textual.widgets import Collapsible, Static
+
+# U1：工具区保留最近条目数（超出丢最老；配合 `#tools` max-height 不爆屏）。
+_MAX_ENTRIES = 10
+
+
+@dataclass(slots=True)
+class ToolEntry:
+    """一条工具调用：running 中只有参数；结果到达后补输出全文。"""
+
+    name: str
+    args: str  # 完整参数文本
+    content: str = ""  # 完整输出
+    is_error: bool = False
+    duration_ms: int = 0
+    running: bool = True
 
 
 class ToolRegion(Vertical):
-    """工具调用活动条（05 §3.1）。border 标题固定，内容行内堆叠。"""
+    """工具调用活动条（05 §3.1）：Collapsible 条目，点击展开完整内容。"""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._lines: list[str] = []
+        self._entries: list[ToolEntry] = []
 
     def on_mount(self) -> None:
         self.border_title = "工具"
         self.display = False  # Claude Code 风格：初始收起，有活动才展开
 
-    def _update_lines(self) -> None:
-        # 注意：不能用 `_render` 命名——那是 Textual Widget 内部渲染方法，覆盖会崩。
-        self.query_one("#tool-lines", Static).update("\n".join(self._lines))
+    def _summarize(self, e: ToolEntry) -> str:
+        """一行摘要（可含 Rich markup）：执行中 ⚙ / 结果 ✓✗ + 首行。"""
+        if e.running:
+            return f"[bold yellow]⚙ {e.name}[/bold yellow] {e.args}"
+        color = "red" if e.is_error else "green"
+        symbol = "✗" if e.is_error else "✓"
+        first = e.content.splitlines()[0] if e.content else ""
+        return f"[{color}]{symbol} {e.name}[/{color}] ({e.duration_ms}ms) {first}"
+
+    def _detail(self, e: ToolEntry) -> str:
+        """详情体：完整参数 + 输出全文（可含 Rich markup）。"""
+        parts = [f"[bold]参数：[/bold]{e.args}"]
+        parts.append(f"[bold]输出：[/bold]{e.content}" if e.content else "[dim]（执行中…）[/dim]")
+        return "\n".join(parts)
+
+    def _rebuild(self) -> None:
+        """全量重建 Collapsible 列表（条目数 ≤ 10，开销可接受）。"""
+        container = self.query_one("#tool-items", Vertical)
+        container.remove_children()
+        for e in self._entries:
+            # 摘要行常显，点击展开完整内容（U1 详情页）。
+            coll = Collapsible(
+                Static(self._detail(e), classes="tool-detail"),
+                title=self._summarize(e),
+                collapsed=True,
+            )
+            container.mount(coll)
+        self.border_title = f"工具（{len(self._entries)}）"
+        self.display = True  # 有活动展开；历史保留不清空（U1 可回看）
 
     def show_running(self, name: str, input: dict[str, object]) -> None:
-        """模型请求调用工具：活动条显示正在执行（ToolUseEvent）。"""
+        """模型请求调用工具：追加一条 running 条目（ToolUseEvent）。"""
         args = " ".join(f"{k}={v}" for k, v in input.items())
-        self._lines.append(f"[bold yellow]⚙ {name}[/bold yellow] {args}")
-        self.display = True  # Claude Code 风格：有活动才展开
-        self._update_lines()
+        self._entries.append(ToolEntry(name=name, args=args, running=True))
+        self._trim()
+        self._rebuild()
 
     def show_result(self, name: str, content: str, is_error: bool, duration_ms: int) -> None:
-        """结果折叠为一行：成功绿 ✓ / 失败红 ✗ + 耗时（ToolResultEvent）。"""
-        color = "red" if is_error else "green"
-        symbol = "✗" if is_error else "✓"
-        first = content.splitlines()[0] if content else ""
-        self._lines.append(f"[{color}]{symbol} {name}[/{color}] ({duration_ms}ms) {first}")
-        self._update_lines()
+        """结果填充到最后一个同名 running 条目（C1 并行工具配对），一行折叠。
+
+        找不到配对（结果先到 / 单测直接发结果）时自建结果条目，不丢信息。
+        """
+        for e in reversed(self._entries):
+            if e.running and e.name == name:
+                e.content = content
+                e.is_error = is_error
+                e.duration_ms = duration_ms
+                e.running = False
+                break
+        else:
+            self._entries.append(
+                ToolEntry(
+                    name=name,
+                    args="",
+                    content=content,
+                    is_error=is_error,
+                    duration_ms=duration_ms,
+                    running=False,
+                )
+            )
+        self._trim()
+        self._rebuild()
 
     def reset(self) -> None:
-        """一轮结束收起活动区（LoopCompleteEvent）。"""
-        self._lines.clear()
-        self.display = False
-        self._update_lines()
+        """一轮结束（LoopCompleteEvent）：保留历史回看，仅修剪孤儿 running 条目。
+
+        不再清空区（U1：完成后工具详情仍可展开查看）；`_trim` 防无限增长。
+        """
+        self._entries = [e for e in self._entries if not e.running]
+        self._trim()
+        self._rebuild()
+
+    def _trim(self) -> None:
+        if len(self._entries) > _MAX_ENTRIES:
+            self._entries = self._entries[-_MAX_ENTRIES:]
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="tool-lines")
+        yield Vertical(id="tool-items")

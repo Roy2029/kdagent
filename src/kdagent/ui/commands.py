@@ -20,7 +20,7 @@ from kdagent.engine.conversation import ConversationManager
 from kdagent.mcp.manager import MCPManager
 from kdagent.memory.model import MEMORY_TYPES, MemoryFile
 from kdagent.memory.store import MemoryStore
-from kdagent.sessions.manager import Session, SessionManager
+from kdagent.sessions.manager import Session, SessionManager, SessionMeta
 from kdagent.skill.manager import SkillManager
 from kdagent.subagent.task import TaskManager
 from kdagent.subagent.worktree import WorktreeManager
@@ -47,6 +47,10 @@ class UIController(Protocol):
     def open_eval_report(self, run_id: str) -> None: ...
     # 07 §3.7 T9：/metrics 打开聚合指标面板（Textual Screen，只读）。
     def open_metrics(self) -> None: ...
+    # U3：/session list 弹会话切换选单。返回是否接管（False = 命令侧降级文本列表）。
+    def open_session_picker(
+        self, metas: list[SessionMeta], current: Session | None
+    ) -> bool: ...
 
 
 @dataclass
@@ -233,11 +237,15 @@ def _cmd_session(ctx: CommandContext) -> None:
         if not metas:
             ctx.ui.add_system_message("暂无历史会话。")
             return
-        lines = ["历史会话（按最后活跃倒序）："]
-        for m in metas[:10]:
-            active = datetime.fromtimestamp(m.last_active_ts).strftime("%m-%d %H:%M")
-            lines.append(f"  {m.sid}  活跃 {active}")
-        ctx.ui.add_system_message("\n".join(lines))
+        # U3：弹选单（ListView 上下键选择，Enter 切换，Esc 取消）。
+        # 无 picker 能力（测试 stub UI）时降级为文本列表。
+        if not ctx.ui.open_session_picker(metas, ctx.session):
+            lines = ["历史会话（按最后活跃倒序，/session resume <id> 切换）："]
+            for m in metas[:10]:
+                title = f"「{m.title}」 " if m.title else ""
+                active = datetime.fromtimestamp(m.last_active_ts).strftime("%m-%d %H:%M")
+                lines.append(f"  {m.sid} {title}活跃 {active}")
+            ctx.ui.add_system_message("\n".join(lines))
     elif sub == "new":
         session = mgr.create()
         ctx.ui.set_active_session(session)
@@ -520,12 +528,16 @@ def _cmd_permissions(ctx: CommandContext) -> None:
         lines = [f"当前权限模式：{mode}", f"可切换：{options}"]
         ctx.ui.add_system_message("\n".join(lines))
         return
-    target = ctx.args.strip().lower()
-    if target not in _PERMISSION_MODES:
+    # 模式名含 camelCase（acceptEdits/bypassPermissions），参数统一小写后
+    # 与规范名比对，命中回传规范 camelCase——避免 /permissions acceptEdits 误报未知。
+    target = ctx.args.strip()
+    by_lower = {m.lower(): m for m in _PERMISSION_MODES}
+    canonical = by_lower.get(target.lower())
+    if canonical is None:
         ctx.ui.add_system_message(f"未知权限模式：{ctx.args}（可选：{'、'.join(_PERMISSION_MODES)}）")
         return
-    ctx.ui.set_permission_mode(target)
-    ctx.ui.add_system_message(f"已切换到权限模式：{target}")
+    ctx.ui.set_permission_mode(canonical)
+    ctx.ui.add_system_message(f"已切换到权限模式：{canonical}")
 
 
 def build_default_commands() -> CommandRegistry:

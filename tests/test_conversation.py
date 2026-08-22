@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from kdagent.engine.conversation import ConversationManager
-from kdagent.engine.messages import TextBlock, ToolResultBlock, ToolUseBlock
+from kdagent.engine.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock
 from kdagent.tools.base import ToolResult
 
 
@@ -82,3 +82,62 @@ def test_repair_chain_keeps_paired_tool_results() -> None:
     cm.add_tool_results([ToolResult(tool_use_id="keep", name="Bash", content="ok")])
     cm.repair_chain()
     assert cm.messages[-1].content[0].tool_use_id == "keep"
+
+
+def test_repair_chain_dedups_duplicate_tool_use_in_assistant() -> None:
+    """同一条 assistant 消息内重复 tool_call_id（流式偶发）→ 去重保第一个。"""
+    cm = _manager()
+    cm.restore(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ToolUseBlock(id="dup", name="Bash", input={}),
+                    ToolUseBlock(id="dup", name="Bash", input={}),
+                ],
+            )
+        ]
+    )
+    cm.repair_chain()
+    tool_uses = [
+        b for m in cm.messages for b in m.content if isinstance(b, ToolUseBlock)
+    ]
+    assert [b.id for b in tool_uses] == ["dup"]
+    # 去重后仍补一条 errorResult（assistant 请求了工具）
+    results = [
+        b for m in cm.messages for b in m.content if isinstance(b, ToolResultBlock)
+    ]
+    assert [b.tool_use_id for b in results] == ["dup"]
+    assert results[0].is_error is True
+
+
+def test_repair_chain_dedups_duplicate_tool_result_across_messages() -> None:
+    """跨消息重复 tool_use_id（C2 场景：同一 tool_result 出现两次）→ 保第一个。"""
+    cm = _manager()
+    cm.restore(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ToolUseBlock(id="call_A", name="Bash", input={}),
+                    ToolUseBlock(id="call_B", name="Glob", input={}),
+                ],
+            ),
+            Message(role="user", content=[ToolResultBlock(tool_use_id="call_A", content="r1")]),
+            Message(
+                role="user",
+                content=[
+                    ToolResultBlock(tool_use_id="call_A", content="r1-dup"),
+                    ToolResultBlock(tool_use_id="call_B", content="r2"),
+                ],
+            ),
+        ]
+    )
+    cm.repair_chain()
+    results = [
+        (b.tool_use_id, b.content)
+        for m in cm.messages
+        for b in m.content
+        if isinstance(b, ToolResultBlock)
+    ]
+    assert results == [("call_A", "r1"), ("call_B", "r2")]

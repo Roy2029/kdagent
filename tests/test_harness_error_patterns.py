@@ -20,6 +20,7 @@ from kdagent.harness.error_patterns import (
     pattern_dedup_key,
     pattern_memory,
 )
+from kdagent.memory.model import MemoryFile
 from kdagent.memory.store import MemoryStore
 from kdagent.tools import build_default_registry
 
@@ -231,3 +232,30 @@ async def test_different_kinds_each_precipitate(tmp_path: Path) -> None:
     names = _list_memory_names(store)
     assert "error-pattern-edit-target-missing" in names
     assert "error-pattern-edit-no-match" in names
+
+
+# ---- M1 静默读：记忆索引注入 system-reminder ----
+
+def test_assemble_payload_injects_memory_index(tmp_path: Path) -> None:
+    """新会话 payload：记忆索引以 `<system-reminder>` 注入 system，并提示直接 ReadFile。
+
+    M1 修复：索引不再埋在 system 中间，而是醒目 system-reminder（与 09 §3.5 延迟工具
+    同机制，改 reminder 不改 system → 前缀缓存不受影响）。只注索引指针不注全文。
+    """
+    store = MemoryStore(tmp_path / "user", tmp_path / "proj")
+    store.create(MemoryFile(name="沙箱环境", description="记录沙箱约束", type="project", content="body"))
+    agent = _make_agent([_done()], tmp_path, memory_store=store)
+    system = agent._assemble_payload().system
+    assert "<system-reminder>" in system
+    assert "记忆索引已随初始上下文加载" in system
+    assert "沙箱环境.md" in system  # 索引指针在
+    assert "记录沙箱约束" in system  # 索引行描述在
+    assert "body" not in system  # 不注全文（省 token）
+
+
+def test_assemble_payload_skips_memory_without_store(tmp_path: Path) -> None:
+    """无 memory_store（08 未启用）→ 不注入记忆索引。"""
+    agent = _make_agent([_done()], tmp_path)
+    system = agent._assemble_payload().system
+    assert "记忆索引已随初始上下文加载" not in system
+    assert "<system-reminder>" not in system  # 本用例无 skills/mcp 时无 reminder

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -44,7 +45,9 @@ from kdagent.engine.events import (
     TurnCompleteEvent,
     UsageEvent,
 )
-from kdagent.engine.llm.base import LLMClient, Usage
+from kdagent.engine.llm.base import LLMClient, Payload, Usage
+from kdagent.engine.messages import Message as EngineMessage
+from kdagent.engine.messages import TextBlock
 from kdagent.hooks.engine import HookEngine
 from kdagent.hooks.engine_types import HookContext
 from kdagent.mcp.manager import MCPManager
@@ -54,7 +57,7 @@ from kdagent.memory.store import MemoryStore
 from kdagent.obs import OTLPSpanExporter, SpanExporter, Telemetry
 from kdagent.permission.checker import PermissionChecker
 from kdagent.permission.modes import Mode
-from kdagent.sessions.manager import Session, SessionManager
+from kdagent.sessions.manager import Session, SessionManager, SessionMeta
 from kdagent.sessions.records import todo_items_from_raw
 from kdagent.skill.manager import SkillManager
 from kdagent.subagent.agent_tool import Agent as SubAgentTool
@@ -70,7 +73,12 @@ from kdagent.ui.commands import (
     parse_command,
     register_skill_commands,
 )
-from kdagent.ui.confirm import ConfirmDialog, ExitDialog, PermissionDialog
+from kdagent.ui.confirm import (
+    ConfirmDialog,
+    ExitDialog,
+    PermissionDialog,
+    SessionPickerDialog,
+)
 from kdagent.ui.evalreport import EvalReportScreen
 from kdagent.ui.metricsscreen import MetricsScreen
 from kdagent.ui.statusbar import StatusBar
@@ -87,7 +95,7 @@ _CSS = """
 #chat { height: 1fr; border: round $primary; margin: 0 1; }
 #todo { height: auto; max-height: 8; border: round $accent; margin: 0 1; }
 #tools { height: auto; max-height: 10; border: round $secondary; margin: 0 1; }
-#input { height: 3; margin: 0 1; }
+#input { height: 4; margin: 0 1; }
 #status { height: 1; background: $panel; color: $text; padding: 0 1; }
 """
 
@@ -100,11 +108,19 @@ class ChatInput(TextArea):
     ctrl+c/ctrl+v 用 TextArea 内置绑定（经 app 系统剪贴板）。
     """
 
+    # 输入框高度上下限（U2）：至少 4 行，最多 10 行，随内容自动扩展。
+    _HEIGHT_MIN = 4
+    _HEIGHT_MAX = 10
+
     BINDINGS = [
         Binding("enter", "submit", "提交", priority=True),
         Binding("shift+enter", "newline", "换行", priority=True),
         Binding("ctrl+j", "newline", "换行", priority=True),
         Binding("tab", "complete", "补全", priority=True),
+        # U4：↑/↓ 历史输入切换（类似 shell history）。光标在首行/末行时才翻历史，
+        # 中间行保留 TextArea 的光标上下移动——避免劫持多行编辑的光标导航。
+        Binding("up", "history_prev", "上一条输入", priority=True),
+        Binding("down", "history_next", "下一条输入", priority=True),
         # M1-i2：禁用 Kitty（compat.py）后 Windows 传统模式 backspace 发 \x08 → Textual
         # 解析为 key='ctrl+h'，而 TextArea 只有 backspace(=\x7f) 绑定 → 加 ctrl+h 兜底，
         # \x08 与 \x7f 两路都能删除。Textual BINDINGS 会合并父类（dom._merge_bindings），
@@ -129,6 +145,10 @@ class ChatInput(TextArea):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._leak_buf = ""
+        # U4 历史输入：提交过的命令队列 + 浏览游标（-1 = 未浏览，回退到草稿）。
+        self._history: list[str] = []
+        self._hist_index = -1
+        self._draft = ""
 
     def _flush_leak_buf(self) -> None:
         """priority 绑定（enter/newline/tab）绕过 _on_key，需在此回补残留缓冲。"""
@@ -182,18 +202,77 @@ class ChatInput(TextArea):
     def on_mount(self) -> None:
         self.border_title = "输入"
         self.placeholder = "输入消息，/ 开头为命令（/help 查看）"
+        self._apply_height()
+
+    @on(TextArea.Changed)
+    def _on_text_changed(self, event: TextArea.Changed) -> None:
+        """U2：内容变化 → 按行数自动扩展高度（下限 4 行、上限 10 行）。"""
+        self._apply_height()
+
+    def _apply_height(self) -> None:
+        """根据当前行数设定输入框高度（TextArea height 需手动跟随内容）。
+
+        行数 = 换行符数量 + 1；长行不换行（TextArea 横向滚动），故只按硬换行计。
+        """
+        lines = len(self.text.split("\n"))
+        target = min(max(lines + 1, self._HEIGHT_MIN), self._HEIGHT_MAX)
+        self.styles.height = target
 
     def action_submit(self) -> None:
         self._flush_leak_buf()
         text = self.text.strip()
         if not text:
             return  # 空输入不发 API，防误触（05 §3.3）
+        # U4：非重复输入才入历史（同文本连续提交去重），浏览游标复位。
+        if not self._history or self._history[-1] != text:
+            self._history.append(text)
+        self._hist_index = -1
+        self._draft = ""
         self.post_message(self.Submitted(text))
         self.text = ""
+        self._apply_height()
 
     def action_newline(self) -> None:
         self._flush_leak_buf()
         self.insert("\n")
+        self._apply_height()
+
+    def _line_count(self) -> int:
+        """当前文本行数（按硬换行计；长行横向滚动不换行）。"""
+        return len(self.text.split("\n"))
+
+    def action_history_prev(self) -> None:
+        """U4 ↑：光标在首行翻上一条历史；否则仅移动光标到首行（保留编辑）。"""
+        row, _ = self.cursor_location
+        if row > 0:
+            self.move_cursor((0, 0), select=False)
+            return
+        if not self._history:
+            return
+        if self._hist_index == -1:
+            self._draft = self.text  # 首次进入历史浏览，暂存当前草稿
+        if self._hist_index < len(self._history) - 1:
+            self._hist_index += 1
+            self.text = self._history[len(self._history) - 1 - self._hist_index]
+            self.cursor_location = (self._line_count() - 1, 0)
+            self._apply_height()
+
+    def action_history_next(self) -> None:
+        """U4 ↓：光标在末行翻下一条/回草稿；否则仅移动光标到末行。"""
+        row, _ = self.cursor_location
+        if row < self._line_count() - 1:
+            self.move_cursor((self._line_count() - 1, 0), select=False)
+            return
+        if not self._history:
+            return
+        if self._hist_index > 0:
+            self._hist_index -= 1
+            self.text = self._history[len(self._history) - 1 - self._hist_index]
+        elif self._hist_index == 0:
+            self._hist_index = -1
+            self.text = self._draft  # 回到底部 → 恢复最初草稿
+        self.cursor_location = (self._line_count() - 1, 0)
+        self._apply_height()
 
     def action_complete(self) -> None:
         """Tab：发出 TabComplete 消息，App 侧做 / 前缀补全。"""
@@ -270,6 +349,7 @@ class KDApp(App[None]):
         # 同名会覆盖冲突（启动即崩）。
         self._commands = build_default_commands()
         self._tools = tools  # 10 M5-a：Agent 工具父对话绑定（SubAgentTool 取回）
+        self._llm = llm  # U3 自动标题：轻量单次 LLM 调用（无工具）
         self._agent = Agent(
             config=config,
             llm=llm,
@@ -405,6 +485,7 @@ class KDApp(App[None]):
             chat.append_system(f"✔ 完成（{ev.turns} 轮）")
             tools.reset()
             chat.scroll_end(animate=False)
+            self._maybe_auto_title()  # U3：会话无标题时后台一次性总结
         elif isinstance(ev, ErrorEvent):
             chat.finish_stream()
             chat.append_error(ev.error)
@@ -562,6 +643,65 @@ class KDApp(App[None]):
             if chat is not None:
                 chat.append_error(f"Agent 异常：{exc}")
 
+    # ---- U3：自动会话标题（LoopComplete 一次性轻量总结） --------------------
+
+    def _maybe_auto_title(self) -> None:
+        """LoopComplete 且会话无标题时触发标题 worker（不打断主循环）。"""
+        if self._session.title:
+            return  # 已有标题不覆盖（人工/先前自动生成）
+        if not any(m.role == "user" for m in self._agent.conversation.messages):
+            return  # 无用户消息，不值得起标题
+        self._auto_title_worker()
+
+    @work(group="agent", exclusive=False)
+    async def _auto_title_worker(self) -> None:
+        """轻量标题总结：无工具单次 LLM 调用，收集 text_delta 拼标题。
+
+        输入只取最近 ~4000 字符的 user/assistant 文本（重建为单条 user 消息，
+        不传完整历史避免 API 校验/超长）；失败静默（标题是增强信息，不打扰）。
+        """
+        try:
+            conv = self._agent.conversation
+            chunks: list[str] = []
+            total = 0
+            for msg in reversed(conv.messages):
+                text = " ".join(
+                    b.text for b in msg.content if isinstance(b, TextBlock)
+                ).strip()
+                if not text:
+                    continue
+                line = f"{'用户' if msg.role == 'user' else '助手'}：{text}"
+                total += len(line)
+                chunks.append(line)
+                if total > 4000:
+                    break
+            if not chunks:
+                return
+            payload = Payload(
+                system=(
+                    "你是会话标题生成器。根据对话内容用一句话（不超过 15 个字）概括"
+                    "会话主题。只输出标题本身：不要引号、不要句号、不要解释。"
+                ),
+                messages=[
+                    EngineMessage(role="user", content=[TextBlock("\n".join(reversed(chunks)))])
+                ],
+                tools=[],
+                max_tokens=30,
+            )
+            parts: list[str] = []
+            async for ev in self._llm.stream_chat(payload):
+                if ev.type == "error" and ev.error:
+                    return
+                if ev.type == "text_delta" and ev.text:
+                    parts.append(ev.text)
+            title = "".join(parts).strip().strip('"').strip("'").strip()
+            title = title.splitlines()[0][:40].strip() if title else ""
+            if title:
+                self._session.set_title(title)
+                self.refresh_status()
+        except Exception:
+            pass  # 标题是增强信息，失败静默
+
     # ---- 确认钩子（05 §3.4）：Y/N 前置 ------------------------------------
 
     async def _confirm(self, tool_name: str, tool_input: dict[str, Any]) -> bool:
@@ -682,6 +822,45 @@ class KDApp(App[None]):
             else:
                 todo_region.reset()
         self.refresh_status()
+
+    def open_session_picker(
+        self, metas: list[SessionMeta], current: Session | None
+    ) -> bool:
+        """U3：/session list 弹会话切换选单（ListView 上下键 + Enter 切换）。
+
+        返回 True（已接管弹窗）；回调里按选中 sid resume 并切换。会话全部位于
+        当前 session_manager 时才有意义——无 manager 直接返回 False 降级。
+        """
+        if not metas:
+            return False
+        current_sid = current.id if current is not None else ""
+        items = [
+            (
+                m.sid,
+                f"{m.title}  「{m.sid}」 活跃 "
+                + datetime.fromtimestamp(m.last_active_ts).strftime("%m-%d %H:%M")
+                if m.title
+                else f"{m.sid}  活跃 "
+                + datetime.fromtimestamp(m.last_active_ts).strftime("%m-%d %H:%M"),
+            )
+            for m in metas[:20]
+        ]
+
+        def _on_picked(sid: str | None) -> None:
+            if sid is None or self._session_manager is None:
+                return
+            try:
+                session = self._session_manager.resume(sid, compact=self._schedule_resume_compact)
+            except Exception as exc:
+                chat = self._chat
+                if chat is not None:
+                    chat.append_error(f"恢复会话失败：{exc}")
+                return
+            self.set_active_session(session)
+            self.add_system_message(f"已切换会话：{sid}")
+
+        self.push_screen(SessionPickerDialog(items, current_sid), _on_picked)
+        return True
 
     def request_exit(self) -> None:
         self.push_screen(ExitDialog(), self._maybe_exit)

@@ -164,3 +164,31 @@ def test_create_with_existing_conversation(tmp_path: Path) -> None:
     s = mgr.create(conversation=conv)
     assert s.conversation is conv
     assert s.conversation.messages[0].content[0].text == "已有输入"
+
+
+def test_set_title_persists_to_meta_and_list_reads_back(tmp_path: Path) -> None:
+    """U3：set_title 写 `.meta.json` 伴生文件，`title()`/`list()` 能读回。"""
+    mgr = _make_manager(tmp_path)
+    s = mgr.create()
+    assert s.title == ""  # 初始无标题
+    s.set_title("重构权限模块")
+    assert s.title == "重构权限模块"
+    assert mgr.title(s.id) == "重构权限模块"
+    metas = mgr.list()
+    assert metas[0].sid == s.id
+    assert metas[0].title == "重构权限模块"
+    # 伴生文件确实落盘（不污染 JSONL 逐行格式）
+    meta_file = s.file.with_suffix(".meta.json")
+    assert meta_file.exists()
+    data = json.loads(meta_file.read_text(encoding="utf-8"))
+    assert data["title"] == "重构权限模块"
+    assert data["updated"] > 0
+
+
+def test_title_missing_or_corrupt_meta_returns_empty(tmp_path: Path) -> None:
+    """U3：meta 缺失 / 损坏（非 JSON）时 title 返回空串，不崩。"""
+    mgr = _make_manager(tmp_path)
+    s = mgr.create()
+    s.file.with_suffix(".meta.json").write_text("{not-json", encoding="utf-8")
+    assert mgr.title(s.id) == ""
+    assert mgr.list()[0].title == ""

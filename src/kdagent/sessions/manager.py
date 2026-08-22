@@ -44,6 +44,7 @@ class SessionMeta:
     sid: str
     created_ts: int
     last_active_ts: int
+    title: str = ""  # U3：自动生成/手设的会话标题（.meta.json，无则空）
 
 
 # 方法名 `list` 遮蔽 builtin，方法内不能用 `list[...]`，用模块级别名规避
@@ -65,6 +66,8 @@ class Session:
         self.file = file
         self._conversation = conversation
         self._todos = todos
+        # U3 标题：`.meta.json` 旁路文件（不动 JSONL 逐行格式）；构造时读入。
+        self._title = _load_title(file)
 
     @property
     def conversation(self) -> ConversationManager:
@@ -73,6 +76,18 @@ class Session:
     @property
     def todos(self) -> list[TodoItemRecord] | None:
         return self._todos
+
+    @property
+    def title(self) -> str:
+        return self._title
+
+    def set_title(self, title: str) -> None:
+        """设置会话标题（自动生成或手动），持久化到 `.meta.json`。"""
+        title = title.strip()
+        if not title:
+            return
+        self._title = title
+        _save_title(self.file, title)
 
     def set_todos(self, todos: list[TodoItemRecord]) -> None:
         """会话级 todo 状态（`03` TodoWrite 接线，M1-f 落地；`12` 时点④重灌快照）。"""
@@ -190,8 +205,25 @@ class SessionManager:
         for file in self._dir.glob("*.jsonl"):
             sid = file.stem
             created_ts = _parse_created_ts(sid)
-            metas.append(SessionMeta(sid=sid, created_ts=created_ts, last_active_ts=_last_ts(file)))
+            metas.append(
+                SessionMeta(
+                    sid=sid,
+                    created_ts=created_ts,
+                    last_active_ts=_last_ts(file),
+                    title=_load_title(file),
+                )
+            )
         return sorted(metas, key=lambda m: m.last_active_ts, reverse=True)
+
+    def set_title(self, sid: str, title: str) -> None:
+        """给历史会话设置标题（U3：/session rename / 自动生成后持久化）。"""
+        file = self._dir / f"{sid}.jsonl"
+        if file.exists():
+            _save_title(file, title)
+
+    def title(self, sid: str) -> str:
+        """读历史会话标题（无则空串）。"""
+        return _load_title(self._dir / f"{sid}.jsonl")
 
     def delete(self, sid: str) -> None:
         """删 .jsonl + 同名目录（如 tool-results）+ 关联 obs trace 目录。"""
@@ -253,3 +285,24 @@ def _last_ts(file: Path) -> int:
     except OSError:
         pass
     return ts
+
+
+def _title_path(file: Path) -> Path:
+    """标题旁路文件：`{sid}.meta.json`（与 `.jsonl` 同目录同 stem）。"""
+    return file.with_suffix(".meta.json")
+
+
+def _load_title(file: Path) -> str:
+    """读会话标题；meta 缺失/损坏返回空串（不崩，标题是增强信息）。"""
+    try:
+        data = json.loads(_title_path(file).read_text(encoding="utf-8"))
+        title = str(data.get("title", "")).strip()
+        return title
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        return ""
+
+
+def _save_title(file: Path, title: str) -> None:
+    """写会话标题到 `.meta.json`（`{title, updated}`）。"""
+    data = {"title": title, "updated": int(time.time())}
+    _title_path(file).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")

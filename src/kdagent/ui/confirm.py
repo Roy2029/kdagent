@@ -13,20 +13,22 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Button, Label, ListItem, ListView, Static
 
 # ModalScreen 子内容默认贴左上角；`ConfirmDialog/ExitDialog/PermissionDialog` 类
 # 选择器让 dialog 居中。
 # 注意：不能用 `Screen`/`ModalScreen` 基类选择器——Textual 8.2.8 下其 DEFAULT_CSS
 # 会覆盖 align（实测基类选择器不生效，具体类选择器才居中）。
 _DIALOG_CSS = """
-ConfirmDialog, ExitDialog, PermissionDialog { align: center middle; }
+ConfirmDialog, ExitDialog, PermissionDialog, SessionPickerDialog { align: center middle; }
 #dialog { width: 60; height: auto; min-height: 9; max-height: 18;
           border: thick $primary; background: $surface; padding: 1 2; }
 #dialog-title { text-align: center; }
 #dialog-args { margin: 1 0; color: $text-muted; text-align: center; }
 #dialog-actions { align: center middle; padding-top: 1; }
 #dialog-actions Button { margin: 0 1; }
+#session-picker { width: 100%; height: 14; border: round $primary; }
+#session-hint { margin-top: 1; color: $text-muted; text-align: center; }
 """
 
 # 工具参数过长时截断显示，避免长命令把按钮挤出弹窗（M1-i 用户反馈）。
@@ -163,3 +165,54 @@ class ExitDialog(ModalScreen[bool]):
 
     def action_focus_no(self) -> None:
         self.query_one("#no", Button).focus()
+
+
+class SessionPickerDialog(ModalScreen[str]):
+    """会话切换选单（U3）：ListView 上下键选会话，Enter 切换，Esc 取消。
+
+    结果经 dismiss 回传 sid；None = 取消（不切换）。
+    """
+
+    CSS = _DIALOG_CSS
+    BINDINGS = [
+        Binding("escape", "cancel", "取消", show=False),
+        Binding("enter", "confirm", "切换", show=False),
+    ]
+
+    def __init__(self, items: list[tuple[str, str]], current_sid: str) -> None:
+        """`items`：(sid, 显示行)。current_sid 高亮当前会话。"""
+        super().__init__()
+        self._items = items
+        self._current_sid = current_sid
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static("切换会话（↑/↓ 选择，Enter 切换，Esc 取消）", id="dialog-title")
+            initial = 0
+            children: list[ListItem] = []
+            for i, (sid, line) in enumerate(self._items):
+                marker = "●" if sid == self._current_sid else " "
+                children.append(ListItem(Label(f"{marker} {line}"), id=f"item-{sid}"))
+                if sid == self._current_sid:
+                    initial = i
+            yield ListView(*children, id="session-picker", initial_index=initial)
+            yield Static("Enter=切换 · Esc=取消", id="session-hint")
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Enter 选中 → 由 item id 反查 sid（id 前缀 `item-`）。"""
+        assert event.item is not None  # ListView.Selected 必带选中项
+        item_id = event.item.id or ""
+        sid = item_id[5:] if item_id.startswith("item-") else ""
+        self.dismiss(sid or None)
+
+    def action_confirm(self) -> None:
+        # Enter 绑定兜底：命中高亮项（与 Selected 等效）。
+        item = self.query_one("#session-picker", ListView).highlighted_child
+        if item is None:
+            return
+        item_id = item.id or ""
+        sid = item_id[5:] if item_id.startswith("item-") else ""
+        self.dismiss(sid or None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
