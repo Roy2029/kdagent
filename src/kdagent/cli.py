@@ -32,6 +32,7 @@ from kdagent.memory.consolidator import MemoryConsolidator
 from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.store import build_memory_store
 from kdagent.permission.checker import build_permission_checker
+from kdagent.permission.modes import MODE_MATRIX
 from kdagent.skill import BUILTIN_SKILLS_DIR, LoadSkill, SkillCreator, SkillManager
 from kdagent.subagent import (
     BUILTIN_AGENTS_DIR,
@@ -137,12 +138,24 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     else:
         llm = _MissingKeyClient()
     kd_dir = work_dir / (config.kdagent_dir or ".kdagent")
-    # 06 M3 可控档：五层裁决器（默认模式来自 config.permissions.mode）+ Hook 引擎
-    # （config.hooks 列表）。本地规则 learn 目标 = 项目级 permissions.local.yaml。
+    # 06 M3 可控档：五层裁决器 + Hook 引擎（config.hooks 列表）。本地规则
+    # learn 目标 = 项目级 permissions.local.yaml。
+    # N2：模式默认来自 config.permissions.mode，但上次 /permissions 切换已落盘
+    # `{项目}/.kdagent/permissions.mode`——持久化文件优先，重启不重置回 default。
     permission_mode = config.permissions.get("mode", "default")
+    if not isinstance(permission_mode, str) or permission_mode not in MODE_MATRIX:
+        permission_mode = "default"
+    saved_mode_path = kd_dir / "permissions.mode"
+    if saved_mode_path.is_file():
+        try:
+            saved = saved_mode_path.read_text(encoding="utf-8").strip()
+            if saved in MODE_MATRIX:
+                permission_mode = saved
+        except OSError:
+            pass
     permission_checker = build_permission_checker(
         work_dir,
-        mode=permission_mode if isinstance(permission_mode, str) else "default",
+        mode=permission_mode,
         kdagent_dirs=[kd_dir],
     )
     hooks = HookEngine()

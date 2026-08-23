@@ -140,6 +140,11 @@ def translate_key_event(vkey: int, control_state: int, unicode_char: str) -> str
     特殊键（UnicodeChar 为空）按 VK 码 → xterm 序列；修饰键本身无输出。
     返回 ``None`` 表示无输出（丢弃）。
     """
+    # U2：Shift+Enter → CSI-u shift+enter（`\x1b[13;2u`，Textual 解析为 shift+enter，
+    # ChatInput 命中 newline 绑定插入换行）。必须**先于** UnicodeChar 直读判断——
+    # 传统模式下 Enter 的 UnicodeChar 恒为 \r，不携带 Shift 修饰信息，只有 VK+修饰符可辨。
+    if vkey == VK_RETURN and control_state & _SHIFT_PRESSED:
+        return "\x1b[13;2u"
     if unicode_char not in ("", "\x00"):
         return unicode_char
     mod = _modifier_code(control_state)

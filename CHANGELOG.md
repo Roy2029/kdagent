@@ -2,6 +2,24 @@
 
 KDAgent 版本对应档位里程碑（版本路线见 `docs/技术规格/00-总览与路线图.md`，docs 本地维护不随仓库分发）。
 
+## [0.5.1] - 2026-08-23 — 实测反馈修复批次（N1-N3 + R2/U1-U3/U5 + M1 排查）
+
+### 权限与交互修复
+- **N1 弹窗位置**：HITL/确认弹窗改贴输入框上方（`align: center bottom` + `margin-bottom`），不再居中遮挡 Chat 最新消息——对照上下文判断允许/拒绝
+- **N2 权限模式持久化**：`/permissions` 切换落盘 `{项目}/.kdagent/permissions.mode`，cli 启动读回、优先于 `config.permissions.mode`，重启不重置回 default
+- **N3 acceptEdits 只读免弹**：D10 命令级只读判断落地——acceptEdits 下 Bash **单条**只读命令（grep/find/ls/cat…）自动放行；含重定向/管道/命令组合仍按 L4 shell=ask（规则优先、黑名单先行不变）
+- **R2 黑名单漏拦根因**：Agent 执行 `rm` 时给路径加双引号（`rm "/mnt/c/…"`），原正则要求 `rm ` 后直接跟路径，引号破坏匹配 → 挂载点/盘符删除全部漏拦。正则路径前容忍可选引号 `["']?` + 结尾字符类含引号 + `\b` 防误伤；带引号/不带引号/单引号/盘符路径均有测试覆盖
+- **U1 工具区滚动+顺序**：容器改 `VerticalScroll`（展开详情可滚动）；摘要加全局递增序号 `#N`，调用顺序可辨
+- **U2 Shift+Enter 换行**：`compat.py` 对 VK_RETURN+Shift 输出 CSI-u `\x1b[13;2u`（Textual 解析为 shift+enter），换行后 TextArea 自动长高（4→10 行）
+- **U3 选单焦点**：`/session list` 初始焦点固定列表顶部 = 最新会话项（原按 current_sid 定位，切回旧会话后焦点落底）
+- **U5 删当前会话**：`/session delete <当前sid>` 自动新建并切换会话，UI 历史清空、继续发消息落新会话
+
+### 排查结论（无代码改动）
+- **M1 记忆"不生效"**：注入链路正常（`_assemble_payload` 注入 582 字符索引、Agent 主动 ReadFile 读记忆文件）；答不出 `pytest` 是因为记忆里无该条目——静默记忆写入有双门槛（≥10min + ≥20K 增量），显式"请记住"不触发落盘；正确用法是 `/memory add` 显式写入
+
+### 验收基线
+738 passed + 5 skipped · mypy 93 源文件 · ruff 干净
+
 ## [0.5.0] - 2026-08-16 — M5 生产级：SubAgent + Worktree + 评估 MVP
 
 ### 主里程碑（M5-a → M5-e）

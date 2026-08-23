@@ -7,14 +7,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 from typing import Any
 
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Collapsible, Static
 
 # U1：工具区保留最近条目数（超出丢最老；配合 `#tools` max-height 不爆屏）。
 _MAX_ENTRIES = 10
+
+# U1：全局递增序号（跨 trim 不重置），条目摘要显示 `#N` 使调用顺序可辨。
+_SEQ = count(1)
 
 
 @dataclass(slots=True)
@@ -27,6 +31,7 @@ class ToolEntry:
     is_error: bool = False
     duration_ms: int = 0
     running: bool = True
+    seq: int = 0  # U1：调用序号（显示顺序标识）
 
 
 class ToolRegion(Vertical):
@@ -41,13 +46,14 @@ class ToolRegion(Vertical):
         self.display = False  # Claude Code 风格：初始收起，有活动才展开
 
     def _summarize(self, e: ToolEntry) -> str:
-        """一行摘要（可含 Rich markup）：执行中 ⚙ / 结果 ✓✗ + 首行。"""
+        """一行摘要（可含 Rich markup）：序号 + 执行中 ⚙ / 结果 ✓✗ + 首行。"""
+        tag = f"#{e.seq} " if e.seq else ""
         if e.running:
-            return f"[bold yellow]⚙ {e.name}[/bold yellow] {e.args}"
+            return f"[bold yellow]⚙ {tag}{e.name}[/bold yellow] {e.args}"
         color = "red" if e.is_error else "green"
         symbol = "✗" if e.is_error else "✓"
         first = e.content.splitlines()[0] if e.content else ""
-        return f"[{color}]{symbol} {e.name}[/{color}] ({e.duration_ms}ms) {first}"
+        return f"[{color}]{symbol} {tag}{e.name}[/{color}] ({e.duration_ms}ms) {first}"
 
     def _detail(self, e: ToolEntry) -> str:
         """详情体：完整参数 + 输出全文（可含 Rich markup）。"""
@@ -57,7 +63,7 @@ class ToolRegion(Vertical):
 
     def _rebuild(self) -> None:
         """全量重建 Collapsible 列表（条目数 ≤ 10，开销可接受）。"""
-        container = self.query_one("#tool-items", Vertical)
+        container = self.query_one("#tool-items", VerticalScroll)
         container.remove_children()
         for e in self._entries:
             # 摘要行常显，点击展开完整内容（U1 详情页）。
@@ -73,7 +79,9 @@ class ToolRegion(Vertical):
     def show_running(self, name: str, input: dict[str, object]) -> None:
         """模型请求调用工具：追加一条 running 条目（ToolUseEvent）。"""
         args = " ".join(f"{k}={v}" for k, v in input.items())
-        self._entries.append(ToolEntry(name=name, args=args, running=True))
+        self._entries.append(
+            ToolEntry(name=name, args=args, running=True, seq=next(_SEQ))
+        )
         self._trim()
         self._rebuild()
 
@@ -98,6 +106,7 @@ class ToolRegion(Vertical):
                     is_error=is_error,
                     duration_ms=duration_ms,
                     running=False,
+                    seq=next(_SEQ),
                 )
             )
         self._trim()
@@ -117,4 +126,5 @@ class ToolRegion(Vertical):
             self._entries = self._entries[-_MAX_ENTRIES:]
 
     def compose(self) -> ComposeResult:
-        yield Vertical(id="tool-items")
+        # U1：VerticalScroll 使展开后的长输出可滚动（超出 #tools max-height 可见）。
+        yield VerticalScroll(id="tool-items")

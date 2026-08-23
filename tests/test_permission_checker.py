@@ -98,7 +98,8 @@ def test_l3_rule_ask(tmp_path: Path) -> None:
     ("mode", "write_effect", "bash_effect"),
     [
         ("default", "ask", "ask"),
-        ("acceptEdits", "allow", "ask"),
+        # N3：acceptEdits 下 Bash 只读命令（ls）经 D10 命令级判断放行。
+        ("acceptEdits", "allow", "allow"),
         ("plan", "ask", "ask"),
         ("bypassPermissions", "allow", "allow"),
     ],
@@ -111,6 +112,10 @@ def test_l4_mode_matrix(tmp_path: Path, mode: str, write_effect: str, bash_effec
     assert d.effect == write_effect
     d = ck.check(Bash(), {"command": "ls"})
     assert d.effect == bash_effect
+    # N3 兜底：破坏性 Bash（非只读，如 rm -rf）不因只读判断放行——
+    # default/acceptEdits/plan 按矩阵 shell=ask，bypass 全放行。
+    d = ck.check(Bash(), {"command": "rm -rf /tmp/foo"})
+    assert d.effect == ("allow" if mode == "bypassPermissions" else "ask")
 
 
 def test_planning_tool_always_allow(tmp_path: Path) -> None:

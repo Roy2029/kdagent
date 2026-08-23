@@ -747,11 +747,25 @@ class KDApp(App[None]):
         self.push_screen(MetricsScreen(obs_dir, self._session.id))
 
     def set_permission_mode(self, mode: str) -> None:
-        """切换五层裁决器模式（/permissions 命令；无 checker 时静默忽略）。"""
+        """切换五层裁决器模式（/permissions 命令；无 checker 时静默忽略）。
+
+        N2：切换成功即落盘 `{项目}/.kdagent/permissions.mode`，重启恢复
+        （见 cli 启动装配——持久化文件优先于 config.permissions.mode）。
+        """
         checker = self._permission_checker
         if checker is not None:
             checker.set_mode(cast(Mode, mode))
+            self._persist_permission_mode(mode)
             self.refresh_status()
+
+    def _persist_permission_mode(self, mode: str) -> None:
+        """N2：把当前模式写入 `{work_dir}/.kdagent/permissions.mode`。"""
+        try:
+            kd_dir = self._work_dir / (self._config.kdagent_dir or ".kdagent")
+            kd_dir.mkdir(parents=True, exist_ok=True)
+            (kd_dir / "permissions.mode").write_text(mode, encoding="utf-8")
+        except OSError:
+            pass  # 落盘失败不阻塞切换（内存模式已生效）
 
     def get_permission_mode(self) -> str:
         """当前权限模式（无 checker 时显示 default 占位）。"""

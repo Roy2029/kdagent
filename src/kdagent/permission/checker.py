@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,42 @@ _SENSITIVE_FILENAMES = frozenset(
     {"config.yaml", "config.local.yaml", "permissions.yaml", "permissions.local.yaml"}
 )
 _SENSITIVE_DIRNAMES = frozenset({"skills"})
+
+# D10 命令级只读判断（N3）：纯只读命令集合。文件工具只读类（Glob/Grep/ReadFile）
+# 在 L4 已是 read=allow；但 Bash 执行 `grep/find/ls/cat` 一律归 shell → ask，
+# 用户在 acceptEdits 下看到"只读命令也弹窗"。这里对**单条**只读命令放行。
+# 只收录明确无写变体的命令（排除 sed -i、awk、tr 等有破坏性变体的）；
+# 复杂形态（重定向/管道/命令组合）不走此判断，仍按 L4 矩阵 ask，安全优先。
+_READONLY_COMMANDS = frozenset(
+    {
+        "ls", "find", "grep", "cat", "head", "tail", "wc", "pwd", "echo",
+        "printf", "which", "type", "diff", "file", "strings", "du", "df",
+        "free", "whoami", "dirname", "basename", "date", "stat", "realpath",
+        "tree", "sort", "uniq", "cut", "env", "printenv",
+    }
+)
+
+
+def _is_readonly_bash(command: str) -> bool:
+    """单条只读命令（无重定向/管道/命令替换）→ True。
+
+    首 token 经 ``Path(name).name`` 容忍 `/usr/bin/grep` 全路径；含
+    ``> | < ; & $() ` `` 任一即不视为纯只读（可能改写外部状态）。
+    """
+    if not command or not command.strip():
+        return False
+    for ch in ">|<;&":
+        if ch in command:
+            return False
+    if "$(" in command or "`" in command:
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    return Path(tokens[0]).name in _READONLY_COMMANDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +154,11 @@ class PermissionChecker:
             effect, rule_str = self._rules.evaluate(tool.name, content)
             if effect is not None:
                 return Decision(effect, "权限规则命中", rule=rule_str)
+
+        # D10 命令级只读判断（N3）：acceptEdits 下 Bash 单条只读命令免审批。
+        # 置于 L3 之后（规则优先：用户显式 deny 的仍拦）、L4 之前（只读不落矩阵 ask）。
+        if tool.name == "Bash" and self._mode == "acceptEdits" and _is_readonly_bash(content):
+            return Decision("allow", "只读命令（acceptEdits 免审批）")
 
         # L4 模式矩阵。
         cls = tool_class(tool)

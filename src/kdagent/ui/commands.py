@@ -267,8 +267,18 @@ def _cmd_session(ctx: CommandContext) -> None:
         if not arg:
             ctx.ui.add_system_message("/session delete <id>：删除指定会话。")
             return
+        current_sid = ctx.session.id if ctx.session is not None else ""
         mgr.delete(arg)
-        ctx.ui.add_system_message(f"已删除会话：{arg}")
+        if arg == current_sid:
+            # 删除的是当前活跃会话：自动新建并切换，避免残留已删会话的
+            # UI 历史与不明确状态（迭代需求 2 #6）——继续发消息落新会话。
+            fresh = mgr.create()
+            ctx.ui.set_active_session(fresh)
+            ctx.ui.add_system_message(
+                f"已删除当前会话：{arg}，已自动新建并切换到：{fresh.id}"
+            )
+        else:
+            ctx.ui.add_system_message(f"已删除会话：{arg}")
     else:
         ctx.ui.add_system_message(
             "/session 支持：无参（概要）、list、new、resume <id>、delete <id>。"

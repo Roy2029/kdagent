@@ -16,13 +16,16 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Label, ListItem, ListView, Static
 
 # ModalScreen 子内容默认贴左上角；`ConfirmDialog/ExitDialog/PermissionDialog` 类
-# 选择器让 dialog 居中。
+# 选择器让 dialog 定位。
+# N1：弹窗贴屏幕底部、悬于输入框上方（margin-bottom=输入框高 4 + 边距 1），
+# 不再居中遮挡 Chat 最新消息——用户需对照上下文判断允许/拒绝。
 # 注意：不能用 `Screen`/`ModalScreen` 基类选择器——Textual 8.2.8 下其 DEFAULT_CSS
 # 会覆盖 align（实测基类选择器不生效，具体类选择器才居中）。
 _DIALOG_CSS = """
-ConfirmDialog, ExitDialog, PermissionDialog, SessionPickerDialog { align: center middle; }
+ConfirmDialog, ExitDialog, PermissionDialog, SessionPickerDialog { align: center bottom; }
 #dialog { width: 60; height: auto; min-height: 9; max-height: 18;
-          border: thick $primary; background: $surface; padding: 1 2; }
+          border: thick $primary; background: $surface; padding: 1 2;
+          margin-bottom: 5; }
 #dialog-title { text-align: center; }
 #dialog-args { margin: 1 0; color: $text-muted; text-align: center; }
 #dialog-actions { align: center middle; padding-top: 1; }
@@ -188,14 +191,13 @@ class SessionPickerDialog(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Static("切换会话（↑/↓ 选择，Enter 切换，Esc 取消）", id="dialog-title")
-            initial = 0
+            # U3：初始焦点固定列表顶部 = 最新会话项（metas 新→旧排列）。
+            # 此前按 current_sid 定位，用户切回早期会话后再开选单焦点落到底部。
             children: list[ListItem] = []
-            for i, (sid, line) in enumerate(self._items):
+            for sid, line in self._items:
                 marker = "●" if sid == self._current_sid else " "
                 children.append(ListItem(Label(f"{marker} {line}"), id=f"item-{sid}"))
-                if sid == self._current_sid:
-                    initial = i
-            yield ListView(*children, id="session-picker", initial_index=initial)
+            yield ListView(*children, id="session-picker", initial_index=0)
             yield Static("Enter=切换 · Esc=取消", id="session-hint")
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
