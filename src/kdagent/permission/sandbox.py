@@ -40,8 +40,11 @@ class PathSandbox:
     ) -> None:
         self._work_dir = Path.cwd() if work_dir is None else work_dir
         roots: list[Path] = [*allowed_roots]
+        # 项目根（work_dir）总是允许目录（docstring 既有设计）——此前漏加导致
+        # 项目内文件全被 L2 拦成 HITL（M1 实测：项目记忆 ReadFile 判 ask）。
         # 相对路径以 work_dir 为基准归一；系统临时目录总是放行（L1 落盘等中间产物）。
         # include_tempdir=False 供测试隔离（tmp_path 本身就在系统临时目录下）。
+        roots.append(self._work_dir)
         if include_tempdir:
             roots.append(Path(tempfile.gettempdir()))
         self._roots = [str(_resolve(r)) for r in roots]

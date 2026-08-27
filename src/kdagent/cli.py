@@ -157,6 +157,9 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
         work_dir,
         mode=permission_mode,
         kdagent_dirs=[kd_dir],
+        # M1：用户级记忆根进沙箱——索引注入的全局记忆绝对路径（~/.kdagent/
+        # memory/…）在 work_dir 外，不加会被 L2 沙箱拦成 HITL 弹窗读不到。
+        extra_roots=[Path.home() / ".kdagent" / "memory"],
     )
     hooks = HookEngine()
     if config.hooks:

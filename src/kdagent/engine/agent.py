@@ -536,7 +536,8 @@ class Agent:
                 memory_reminder = (
                     "<system-reminder>\n记忆索引已随初始上下文加载（KDAgent 四类 "
                     "Markdown 记忆）。涉及过往工作/决策/用户偏好/待办时，第一轮就直"
-                    "接用 ReadFile 读取下方指针指向的 `.md` 文件取详情，无需在文件系统"
+                    "接用 ReadFile 读取下方指针指向的 `.md` 文件取详情（指针已是"
+                    "绝对路径，直接作为 ReadFile 的 path 参数即可），无需在文件系统"
                     "里重新探索记忆目录。\n"
                     + index
                     + "\n</system-reminder>"

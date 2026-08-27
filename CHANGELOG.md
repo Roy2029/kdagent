@@ -2,6 +2,19 @@
 
 KDAgent 版本对应档位里程碑（版本路线见 `docs/技术规格/00-总览与路线图.md`，docs 本地维护不随仓库分发）。
 
+## [0.5.2] - 2026-08-27 — M1 记忆实测修复批（模型端读不到记忆的真根因）
+
+### 记忆修复（M1 闭环）
+用户实测：项目级 + 全局级「用户偏好」都记录了称呼约定，但新会话询问称呼不按约定回答。0.5.1 排查结论只验证了「注入链路正常」，漏了**模型端能否读到指针指向的文件**——本轮实测复验定位到三层真根因：
+
+- **相对指针解析错**：`index_markdown()` 注入的索引行是 `](用户偏好.md)` 相对路径，模型 ReadFile 以 work_dir 为基准解析到 `{work_dir}/用户偏好.md`（不存在，实际在 `.kdagent/memory/` 下）→ 读不到。修复：注入前把相对指针补全为**绝对路径**（`store.py`，正则 `\]\(([^()\s]*?\.md)\)` 按 scope 根拼全）
+- **全局记忆在沙箱外**：全局记忆绝对路径（`~/.kdagent/memory/…`）在 work_dir 外，即使补全绝对路径也会被 L2 沙箱拦成 HITL。修复：`build_permission_checker` 加 `extra_roots=[~/.kdagent/memory]`（`cli.py`）
+- **PathSandbox work_dir 未进 roots（重大 bug）**：沙箱 docstring 明确「允许目录：项目根（work_dir）+ 系统临时目录 + 白名单」，但实现只 append 了传入 roots 和 tempdir，**work_dir 漏加** → default 模式下**所有项目内文件**（含项目记忆）都被 L2 拦成 ask。此 bug 此前被测试掩盖（pytest tmp_path 恰在系统临时目录下放行）。修复：`__init__` 内把 `self._work_dir` 并入 roots（`sandbox.py`）
+- **reminder 文案**：标注「指针已是绝对路径，直接作为 ReadFile 的 path 参数」（`agent.py`）
+
+### 验收基线
+738 passed + 5 skipped · mypy 93 源文件 · ruff 干净
+
 ## [0.5.1] - 2026-08-23 — 实测反馈修复批次（N1-N3 + R2/U1-U3/U5 + M1 排查）
 
 ### 权限与交互修复
@@ -14,8 +27,8 @@ KDAgent 版本对应档位里程碑（版本路线见 `docs/技术规格/00-总�
 - **U3 选单焦点**：`/session list` 初始焦点固定列表顶部 = 最新会话项（原按 current_sid 定位，切回旧会话后焦点落底）
 - **U5 删当前会话**：`/session delete <当前sid>` 自动新建并切换会话，UI 历史清空、继续发消息落新会话
 
-### 排查结论（无代码改动）
-- **M1 记忆"不生效"**：注入链路正常（`_assemble_payload` 注入 582 字符索引、Agent 主动 ReadFile 读记忆文件）；答不出 `pytest` 是因为记忆里无该条目——静默记忆写入有双门槛（≥10min + ≥20K 增量），显式"请记住"不触发落盘；正确用法是 `/memory add` 显式写入
+### 排查结论（仅验证注入链路；模型端读文件路径问题见 0.5.2）
+- **M1 记忆"不生效"**：注入链路正常（`_assemble_payload` 注入 582 字符索引、Agent 主动 ReadFile 读记忆文件）；答不出 `pytest` 是因为记忆里无该条目——静默记忆写入有双门槛（≥10min + ≥20K 增量），显式"请记住"不触发落盘；正确用法是 `/memory add` 显式写入。**后续实测复验发现模型端另有根因**（索引相对指针 + 沙箱拦截，见 0.5.2）
 
 ### 验收基线
 738 passed + 5 skipped · mypy 93 源文件 · ruff 干净

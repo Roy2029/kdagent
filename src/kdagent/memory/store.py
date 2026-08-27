@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -142,13 +143,25 @@ class MemoryStore:
     # ---- 注入 ----
 
     def index_markdown(self) -> str:
-        """注入上下文用：两个 MEMORY.md 索引拼接（08 §3.3 静默读）。"""
+        """注入上下文用：两个 MEMORY.md 索引拼接（08 §3.3 静默读）。
+
+        M1 修复：索引行里的相对指针 `](名.md)` 补全为**绝对路径**。模型
+        ReadFile 以 work_dir 为相对基准，裸相对指针会解析到 work_dir 根而
+        找不到记忆文件（实测：新会话问称呼答不出约定）。补全后模型可
+        直接 ReadFile 绝对路径取详情；全局级在 `~/.kdagent/memory`（沙箱
+        extra_roots 已含，见 cli 装配）。
+        """
         parts: list[str] = []
-        for root in (self._user_root, self._project_root):
+        for root in (self._project_root, self._user_root):
             idx = root / _INDEX_FILENAME
             if idx.is_file():
                 text = idx.read_text(encoding="utf-8").strip()
                 if text:
+                    text = re.sub(
+                        r"\]\(([^()\s]*?\.md)\)",
+                        lambda m, root=root: f"]({root / m.group(1)})",
+                        text,
+                    )
                     parts.append(text)
         if not parts:
             return ""
