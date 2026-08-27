@@ -125,7 +125,7 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     config = load_config()
     work_dir = (work_dir or Path.cwd()).resolve()
     api_key = load_api_key()
-    model = config.model or "deepseek-chat"
+    model = config.model or "deepseek-v4-flash"
     if api_key:
         llm: LLMClient = OpenAICompatClient(
             ProviderConfig(

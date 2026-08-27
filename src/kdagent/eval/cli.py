@@ -120,7 +120,7 @@ def run_eval_cli(tasks_file: Path, workers: int = 1) -> int:
     llm = OpenAICompatClient(
         ProviderConfig(
             protocol="openai",
-            model=config.model or "deepseek-chat",
+            model=config.model or "deepseek-v4-flash",
             base_url="https://api.deepseek.com/v1",
             api_key=api_key,
         )

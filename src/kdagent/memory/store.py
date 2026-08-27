@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from kdagent.memory.model import (
@@ -28,6 +29,11 @@ _USER_TYPES: frozenset[str] = frozenset({"user", "feedback"})
 _PROJECT_TYPES: frozenset[str] = frozenset({"project", "reference"})
 
 _INDEX_FILENAME = "MEMORY.md"
+
+
+def _absolute_index_link(m: re.Match[str], *, base: Path) -> str:
+    """索引行相对指针 → 绝对路径：`](名.md)` 补全为 `]({base}/名.md)`。"""
+    return f"]({base / m.group(1)})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +148,25 @@ class MemoryStore:
 
     # ---- 注入 ----
 
+    def user_memory_markdown(self) -> str:
+        """user/feedback 类记忆**全文**注入（08 §3.3 静默读的增强）。
+
+        称呼/身份/用户偏好是短小高频关键信息，靠「索引指针 → 模型主动 ReadFile」
+        不可靠——实测被问「你叫什么名字」时模型直接凭基础身份自我介绍
+        （自称 Claude/DeepSeek），不会翻记忆。全文直接进上下文，模型无论如何
+        回答都能看到约定。内容按 name 排序、单条 trim，超 4KB 截断防滥用。
+        """
+        parts: list[str] = []
+        for f in self.list_all():
+            if f.type in _USER_TYPES and f.content.strip():
+                parts.append(f"### {f.name}\n{f.content.strip()}")
+        if not parts:
+            return ""
+        joined = "\n\n".join(parts)
+        if len(joined) > 4096:
+            joined = joined[:4096] + "\n…（截断）"
+        return "## 用户偏好记忆全文\n" + joined + "\n"
+
     def index_markdown(self) -> str:
         """注入上下文用：两个 MEMORY.md 索引拼接（08 §3.3 静默读）。
 
@@ -159,7 +184,7 @@ class MemoryStore:
                 if text:
                     text = re.sub(
                         r"\]\(([^()\s]*?\.md)\)",
-                        lambda m, root=root: f"]({root / m.group(1)})",
+                        partial(_absolute_index_link, base=root),
                         text,
                     )
                     parts.append(text)
