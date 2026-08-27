@@ -17,6 +17,15 @@ class PromptTooLongError(RuntimeError):
     """API 返回上下文超长（prompt too long）——01 §6 ③ 紧急压缩触发点。"""
 
 
+class ToolTruncatedError(RuntimeError):
+    """工具参数不完整（arguments JSON 解析失败，通常因输出被 max_tokens 截断）。
+
+    区别于 PromptTooLongError（输入侧超长）：这是**输出侧**被截断，工具参数
+    不可用。agent 收到后应反馈模型拆小输出、丢弃残缺 tool_use 并重试，而不是
+    把空参数当合法调用执行——实测写大文件场景会因误导性「参数校验失败」死循环。
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
     """Provider 配置，分发到对应 adapter（D9 多 provider 抽象）。"""

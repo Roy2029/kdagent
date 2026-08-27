@@ -25,6 +25,7 @@ from kdagent.engine.llm.base import (
     PromptTooLongError,
     ProviderConfig,
     ToolSchema,
+    ToolTruncatedError,
     Usage,
 )
 from kdagent.engine.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock
@@ -169,6 +170,7 @@ class _OpenAIStreamParser:
     def _flush_tool_calls(self) -> list[LLMStreamEvent]:
         events: list[LLMStreamEvent] = []
         seen_ids: set[str] = set()
+        truncated = self._stop_reason == "length"  # 输出被 max_tokens 截断 → arguments 必不完整
         for index in sorted(self._tool_calls):
             entry = self._tool_calls[index]
             if not entry["name"]:
@@ -180,7 +182,20 @@ class _OpenAIStreamParser:
             try:
                 arguments = json.loads(entry["arguments"]) if entry["arguments"] else {}
             except json.JSONDecodeError:
-                arguments = {}
+                # A：不再静默吞错为 {} —— 否则工具报「参数校验失败」误导模型以为
+                # 是格式问题，反复重试同样超长输出（实测：贪吃蛇 HTML 被 4096
+                # token 截断 → 空参数 → 无限死循环）。丢弃残缺 tool_use，向上抛
+                # 明确错误，agent 反馈模型拆小输出后再重试。
+                events.append(
+                    LLMStreamEvent(
+                        type="error",
+                        error=ToolTruncatedError(
+                            f"工具 {entry['name']} 的参数不完整，JSON 解析失败"
+                            + ("（输出被 max_tokens 截断）" if truncated else "（可能被截断）")
+                        ),
+                    )
+                )
+                continue
             events.append(
                 LLMStreamEvent(
                     type="tool_use",

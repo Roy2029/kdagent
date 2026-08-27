@@ -41,7 +41,13 @@ from kdagent.engine.events import (
     TurnCompleteEvent,
     UsageEvent,
 )
-from kdagent.engine.llm.base import LLMClient, Payload, PromptTooLongError, Usage
+from kdagent.engine.llm.base import (
+    LLMClient,
+    Payload,
+    PromptTooLongError,
+    ToolTruncatedError,
+    Usage,
+)
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
 from kdagent.harness.checkpoints import (
     LARGE_CHANGE_THRESHOLD,
@@ -89,9 +95,23 @@ DEFAULT_SYSTEM_PROMPT = (
     "你是 KDAgent，一个终端编码助手。自主完成任务，按需调用工具。"
     "修改代码后应运行测试自测（TestRunner 工具）；测试失败必须基于失败信息"
     "修复后重跑，不得绕开测试或伪造通过。"
+    "你的名字与用户对你的称呼以记忆中的用户偏好为准（可能不叫 KDAgent）；"
+    "被问及身份/名字时先查记忆，不要自称 Claude 或其他通用身份。"
 )
 
 _CIRCUIT_REMINDER = "[system-reminder] 已连续失败 3 次，需重新评估策略再继续"
+
+# B：输出截断反馈（写文件场景实测死循环：模型把整个 HTML 塞进 WriteFile 参数被
+# max_tokens 截断，旧实现静默解析失败成空参数 → 误导性「参数校验失败」→ 反复重试
+# 同样超长输出）。显式告知截断 + 引导分段写，打破死循环。
+_TRUNCATED_FEEDBACK = (
+    "[system] 你的上一条回复的工具参数不完整（JSON 解析失败，通常因单次输出达到 "
+    "max_tokens 上限被截断），已丢弃。\n"
+    "解决办法：把长内容拆小输出。写大文件（完整 HTML/长代码）时先用 WriteFile "
+    "写入开头一段，再用 Edit 逐段追加其余内容，不要一次性把整个文件塞进 "
+    "WriteFile 参数。重新尝试。\n"
+    "（原因：{reason}）"
+)
 
 
 @dataclass(slots=True)
@@ -334,11 +354,24 @@ class Agent:
         self._pending_text = []
         self._pending_tool_uses = []
         # 阶段 B（01 §6 ③）：prompt_too_long 撞墙 → 紧急压缩 → 重建 payload 重试一次。
-        retry = 0
+        retry = 0  # PromptTooLong 重试计数（输入侧，紧急压缩后限重试一次）
+        truncate_retry = 0  # 输出截断重试计数（B：反馈模型拆小输出，限 2 次防死循环）
         while True:
             err = await self._stream_llm(payload)
             if err is None:
                 break
+            if isinstance(err, ToolTruncatedError):
+                # B：截断已反馈模型（_stream_llm 内写入 conversation）。重建 payload
+                # 让反馈进入下一轮；连续截断 2 次视为模型无法收敛 → 终止防死循环。
+                truncate_retry += 1
+                if truncate_retry >= 2:
+                    self._stop_reason = "error"
+                    self._flush_partial()
+                    self._events(ErrorEvent(error=str(err)))
+                    self._run_hook("error", HookContext(event="error", error=str(err)))
+                    return "TERMINAL"
+                payload = self._assemble_payload()
+                continue
             if (
                 not isinstance(err, PromptTooLongError)
                 or retry >= 1
@@ -479,6 +512,18 @@ class Agent:
                             )
                         self._events(UsageEvent(ev.usage))
                     elif ev.type == "error" and ev.error is not None:
+                        if isinstance(ev.error, ToolTruncatedError):
+                            # B：输出侧截断——残缺 tool_use 不可执行。清半截缓冲，
+                            # 把截断原因反馈模型（写入 conversation），返回异常让
+                            # _loop_iteration_inner 重建 payload 重试（限次）。
+                            # 不落 assistant 消息，避免悬空 tool_use。
+                            self._pending_text = []
+                            self._pending_tool_uses = []
+                            self._conversation.add_user_message(
+                                _TRUNCATED_FEEDBACK.format(reason=ev.error)
+                            )
+                            self._notify_conversation_change()
+                            return ev.error
                         raise ev.error
             except Exception as exc:
                 if llm_span is not None and telemetry is not None:
@@ -533,13 +578,18 @@ class Agent:
         if self._memory_store is not None:
             index = self._memory_store.index_markdown()
             if index:
+                # 08 §3.3 静默读增强：user/feedback 类记忆（称呼/身份/偏好）全文注入
+                # ——模型被问「你叫什么」时凭基础身份自我介绍不读文件，全文直接
+                # 进上下文才可靠（store.user_memory_markdown）。
+                prefs = self._memory_store.user_memory_markdown()
                 memory_reminder = (
                     "<system-reminder>\n记忆索引已随初始上下文加载（KDAgent 四类 "
-                    "Markdown 记忆）。涉及过往工作/决策/用户偏好/待办时，第一轮就直"
+                    "Markdown 记忆）。涉及过往工作/决策/待办时，第一轮就直"
                     "接用 ReadFile 读取下方指针指向的 `.md` 文件取详情（指针已是"
                     "绝对路径，直接作为 ReadFile 的 path 参数即可），无需在文件系统"
                     "里重新探索记忆目录。\n"
                     + index
+                    + prefs
                     + "\n</system-reminder>"
                 )
                 system = f"{system}\n\n{memory_reminder}\n\n{MEMORY_USAGE_INSTRUCTION}"

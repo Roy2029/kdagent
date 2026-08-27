@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from kdagent.engine.llm.base import Payload, ProviderConfig
+from kdagent.engine.llm.base import Payload, ProviderConfig, ToolTruncatedError
 from kdagent.engine.llm.openai import OpenAICompatClient, _OpenAIStreamParser, _serialize_messages
 from kdagent.engine.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock
 
@@ -142,6 +142,41 @@ def test_parser_keeps_distinct_tool_call_ids() -> None:
     events = _feed_all(_OpenAIStreamParser(), lines)
     tool_uses = [e.tool_use for e in events if e.type == "tool_use"]
     assert sorted(tu.id for tu in tool_uses) == ["call_A", "call_B"]
+
+
+def test_parser_truncated_arguments_emits_error_not_empty_tool() -> None:
+    """输出被 max_tokens 截断 → arguments JSON 不完整 → 发 error 事件而非空 tool_use。
+
+    旧行为：JSONDecodeError 被静默吞成 `{}` → 工具收到空参数报「参数校验失败」，
+    误导模型反复重试同样超长输出（实测：贪吃蛇 HTML 死循环）。A 修复后显式抛
+    ToolTruncatedError，agent 可反馈模型拆小输出。
+    """
+    lines = [
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_W","function":{"name":"WriteFile","arguments":"{\\"path\\": \\"game.html\\", \\"content\\": \\"<html>...."}}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+        "data: [DONE]",
+    ]
+    events = _feed_all(_OpenAIStreamParser(), lines)
+    tool_uses = [e.tool_use for e in events if e.type == "tool_use"]
+    errors = [e.error for e in events if e.type == "error"]
+    assert tool_uses == []  # 残缺 tool_use 不发
+    assert len(errors) == 1
+    assert isinstance(errors[0], ToolTruncatedError)
+    assert "WriteFile" in str(errors[0]) and "截断" in str(errors[0])
+
+
+def test_parser_complete_arguments_with_length_still_emits_tool() -> None:
+    """finish_reason=length 但 arguments 完整闭合 → 仍正常发 tool_use（不误伤）。"""
+    lines = [
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_B","function":{"name":"Bash","arguments":"{\\"command\\": \\"echo hi\\"}"}}]},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+        "data: [DONE]",
+    ]
+    events = _feed_all(_OpenAIStreamParser(), lines)
+    tool_uses = [e.tool_use for e in events if e.type == "tool_use"]
+    assert len(tool_uses) == 1
+    assert tool_uses[0].input == {"command": "echo hi"}
+    assert not [e for e in events if e.type == "error"]
 
 
 # ---------- 可选真实调用 ----------

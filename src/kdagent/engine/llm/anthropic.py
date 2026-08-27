@@ -24,6 +24,7 @@ from kdagent.engine.llm.base import (
     Payload,
     ProviderConfig,
     ToolSchema,
+    ToolTruncatedError,
     Usage,
 )
 from kdagent.engine.messages import (
@@ -146,7 +147,21 @@ class _AnthropicStreamParser:
                 try:
                     arguments = json.loads(self._input_buffer) if self._input_buffer else {}
                 except json.JSONDecodeError:
-                    arguments = {}
+                    # A：同 openai adapter——不静默吞错为 {}（否则空参数执行 →
+                    # 误导性「参数校验失败」→ 模型反复重试死循环）。丢弃残缺
+                    # tool_use 抛明确错误，agent 反馈模型拆小输出。
+                    # stop_reason 在 message_delta 才到，此处无法精确判定截断，
+                    # 统一用「可能被截断」。
+                    self._input_buffer = ""
+                    return [
+                        LLMStreamEvent(
+                            type="error",
+                            error=ToolTruncatedError(
+                                f"工具 {block['name']} 的参数不完整，JSON 解析失败"
+                                "（可能被 max_tokens 截断）"
+                            ),
+                        )
+                    ]
                 self._input_buffer = ""
                 return [
                     LLMStreamEvent(
