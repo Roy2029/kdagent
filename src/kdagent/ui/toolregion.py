@@ -14,6 +14,8 @@ from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Collapsible, Static
 
+from kdagent.ui._markup import escape_text
+
 # U1：工具区保留最近条目数（超出丢最老；配合 `#tools` max-height 不爆屏）。
 _MAX_ENTRIES = 10
 
@@ -46,19 +48,24 @@ class ToolRegion(Vertical):
         self.display = False  # Claude Code 风格：初始收起，有活动才展开
 
     def _summarize(self, e: ToolEntry) -> str:
-        """一行摘要（可含 Rich markup）：序号 + 执行中 ⚙ / 结果 ✓✗ + 首行。"""
+        """一行摘要（可含 Rich markup）：序号 + 执行中 ⚙ / 结果 ✓✗ + 首行。
+
+        动态文本（参数/输出首行）一律 `escape`——实测 Bash 参数含 `checks = [`
+        时 `[` 被当 markup 开标签解析，tokenizer 抛 MarkupError，经事件派发
+        杀死整个 agent 循环（见 be21512c 会话）。
+        """
         tag = f"#{e.seq} " if e.seq else ""
         if e.running:
-            return f"[bold yellow]⚙ {tag}{e.name}[/bold yellow] {e.args}"
+            return f"[bold yellow]⚙ {tag}{escape_text(e.name)}[/bold yellow] {escape_text(e.args)}"
         color = "red" if e.is_error else "green"
         symbol = "✗" if e.is_error else "✓"
-        first = e.content.splitlines()[0] if e.content else ""
-        return f"[{color}]{symbol} {tag}{e.name}[/{color}] ({e.duration_ms}ms) {first}"
+        first = escape_text(e.content.splitlines()[0]) if e.content else ""
+        return f"[{color}]{symbol} {tag}{escape_text(e.name)}[/{color}] ({e.duration_ms}ms) {first}"
 
     def _detail(self, e: ToolEntry) -> str:
-        """详情体：完整参数 + 输出全文（可含 Rich markup）。"""
-        parts = [f"[bold]参数：[/bold]{e.args}"]
-        parts.append(f"[bold]输出：[/bold]{e.content}" if e.content else "[dim]（执行中…）[/dim]")
+        """详情体：完整参数 + 输出全文（动态文本一律 escape_text，防 markup 解析破坏）。"""
+        parts = [f"[bold]参数：[/bold]{escape_text(e.args)}"]
+        parts.append(f"[bold]输出：[/bold]{escape_text(e.content)}" if e.content else "[dim]（执行中…）[/dim]")
         return "\n".join(parts)
 
     def _rebuild(self) -> None:

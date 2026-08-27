@@ -12,6 +12,8 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Static
 
+from kdagent.ui._markup import escape_text
+
 from kdagent.sessions.records import TodoItemRecord
 
 _COMPLETED = "completed"
@@ -51,15 +53,19 @@ class TodoRegion(Vertical):
         current_group = ""
         for item in self._items:
             if item.group and item.group != current_group:
-                lines.append(f"[bold]{item.group}[/bold]")
+                lines.append(f"[bold]{escape_text(item.group)}[/bold]")
                 current_group = item.group
             mark = "x" if item.status == _COMPLETED else " "
-            lines.append(f"  [{mark}] {item.content}")
+            # item.content 是模型生成文本，可能含 `[`（代码片段等）——必须
+            # escape_text，否则 `[` 被当 markup 开标签解析抛 MarkupError。
+            lines.append(f"  [{mark}] {escape_text(item.content)}")
             for step in item.steps or []:
                 criteria = (
-                    f" [dim][判据: {step.accept_criteria}][/dim]" if step.accept_criteria else ""
+                    f" [dim]\\[判据: {escape_text(step.accept_criteria or '')}][/dim]"
+                    if step.accept_criteria
+                    else ""
                 )
-                lines.append(f"    - {step.description}{criteria}")
+                lines.append(f"    - {escape_text(step.description)}{criteria}")
         return "\n".join(lines)
 
     def compose(self) -> ComposeResult:

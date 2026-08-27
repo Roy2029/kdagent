@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from conftest import FakeLLM
+from textual.markup import to_content
 from textual.widgets import Collapsible, ListView, Static
 
 from kdagent.config import Config
@@ -469,3 +470,103 @@ async def test_tool_region_keeps_history_and_trims(tmp_path: Path) -> None:
         await pilot.pause()
         assert len(tools._entries) == 10
         assert tools._entries[-1].content == "结果11"
+
+
+# ---- MarkupError 回归（2026-08-27 be21512c 会话实测崩溃） -----------------
+# Bash 参数含 `checks = [`（`[` 后是换行/括号）时，旧代码把参数原样拼进 markup
+# Static，`[` 被当 markup 开标签解析抛 MarkupError，经事件派发杀死整个 agent 循环。
+# 修复：`ui/_markup.py` escape_text 全量转义 `[`，四个渲染点统一使用。
+
+async def test_tool_region_escapes_bracket_args(tmp_path: Path) -> None:
+    """崩溃复现路径：含 `[`+换行的 Bash 参数不再抛 MarkupError，详情渲染字面量。"""
+    app = _make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        tools = app.query_one("#tools", ToolRegion)
+        # 贪吃蛇收尾场景：heredoc 里的 Python 列表 `checks = [`
+        cmd = (
+            "cd /snake-game && python3 - <<'PYEOF'\n"
+            "checks = [\n"
+            "    ('有 <canvas id=\"board\">', 'id=\"board\"' in html),\n"
+            "]\nPYEOF"
+        )
+        app._on_event(ToolUseEvent(id="t_mark", name="Bash", input={"command": cmd}))
+        app._on_event(
+            ToolResultEvent(
+                name="Bash", content="✓ 有 <canvas id=\"board\">\n[17:32] done", is_error=False, duration_ms=2
+            )
+        )
+        await pilot.pause()
+        assert len(tools._entries) == 1
+        colls = list(tools.query(Collapsible))
+        colls[0].collapsed = False
+        await pilot.pause()
+        body = colls[0].query_one(".tool-detail", Static)
+        rendered = str(body.render())
+        # 字面量完整保留：`[` 没有被吃掉或报错
+        assert "checks = [" in rendered
+        assert 'id="board"' in rendered
+        assert "[17:32]" in rendered
+
+
+async def test_permission_dialog_escapes_bracket_summary(tmp_path: Path) -> None:
+    """PermissionDialog 参数摘要含 `[` → 正常渲染不抛 MarkupError。"""
+    app = _make_app(tmp_path)
+    future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    ev = PermissionRequestEvent(
+        tool_name="Bash",
+        summary="command=python3 - <<'PYEOF'\nchecks = [\n('a', 'b'),\n]\nPYEOF",
+        future=future,
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app._on_event(ev)
+        await pilot.pause()
+        await pilot.pause()  # 对话框 compose 挂载完成
+        dialog = next(
+            (s for s in app.screen_stack if isinstance(s, PermissionDialog)), None
+        )
+        assert dialog is not None
+        args = dialog.query_one("#dialog-args", Static)
+        rendered = str(args.render())
+        assert "checks = [" in rendered
+        await pilot.press("n")  # 关掉对话框，避免悬挂 future
+        await pilot.pause()
+        assert future.done()
+
+
+async def test_todo_region_escapes_bracket_content(tmp_path: Path) -> None:
+    """todo 内容/判据含 `[`（代码片段）→ 面板渲染不抛 MarkupError，字面量保留。"""
+    app = _make_app(tmp_path)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        todo = app.query_one("#todo", TodoRegion)
+        app._on_todos(
+            [
+                {
+                    "content": "规划并开发贪吃蛇游戏",
+                    "status": "in_progress",
+                    "active_form": "",
+                    "tasks": [
+                        {
+                            "content": "验证 [实现] 阶段",
+                            "status": "pending",
+                            "active_form": "",
+                            "steps": [
+                                {
+                                    "description": "检查 game.js [核心] 循环",
+                                    "accept_criteria": "有 [x, y]",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )
+        await pilot.pause()
+        # `_render_lines()` 返回转义后的 markup 源码；`to_content` 还原渲染结果
+        # （Static 内部同样走 to_content）——字面量方括号完整保留即证明不炸。
+        rendered = to_content(todo._render_lines()).plain
+        assert "验证 [实现] 阶段" in rendered
+        assert "检查 game.js [核心] 循环" in rendered
+        assert "判据: 有 [x, y]" in rendered

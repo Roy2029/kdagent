@@ -15,6 +15,8 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, ListItem, ListView, Static
 
+from kdagent.ui._markup import escape_text
+
 # ModalScreen 子内容默认贴左上角；`ConfirmDialog/ExitDialog/PermissionDialog` 类
 # 选择器让 dialog 定位。
 # N1：弹窗贴屏幕底部、悬于输入框上方（margin-bottom=输入框高 4 + 边距 1），
@@ -63,7 +65,9 @@ class ConfirmDialog(ModalScreen[bool]):
             args = " ".join(f"{k}={v}" for k, v in self._tool_input.items()) or "（无参数）"
             if len(args) > _MAX_ARGS_LEN:
                 args = args[:_MAX_ARGS_LEN] + "…"
-            yield Static(args, id="dialog-args")
+            # escape：工具参数可能含 `[`（如 heredoc 里的 Python 列表），
+            # 不转义会被当 markup 解析抛 MarkupError。
+            yield Static(escape_text(args), id="dialog-args")
             with Horizontal(id="dialog-actions"):
                 yield Button("允许", variant="success", id="yes")
                 yield Button("拒绝", variant="error", id="no")
@@ -111,7 +115,8 @@ class PermissionDialog(ModalScreen[str]):
             args = self._summary or "（无参数）"
             if len(args) > _MAX_ARGS_LEN:
                 args = args[:_MAX_ARGS_LEN] + "…"
-            yield Static(args, id="dialog-args")
+            # escape：见 ConfirmDialog 同款——summary 可含 `[`（工具参数摘要）。
+            yield Static(escape_text(args), id="dialog-args")
             with Horizontal(id="dialog-actions"):
                 yield Button("允许 (y)", variant="success", id="allow")
                 yield Button("拒绝 (n)", variant="error", id="deny")

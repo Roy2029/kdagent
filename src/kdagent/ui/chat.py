@@ -2,7 +2,8 @@
 
 - 流式：text_delta 累积到同一 Static（纯文本实时显示），流结束/工具调用前
   一次性渲染成 Markdown（代码块/加粗/列表着色）。
-- 转义安全：Static 内容一律 `markup.escape`，防止 `[`/`]` 被当 markup 解析破坏布局。
+- 转义安全：Static 内容一律 `escape_text`（`_markup` 完整转义 `[`，Textual
+  自带 `markup.escape` 对 `[`+非字母 漏网），防止被当 markup 解析破坏布局。
 - `messages` 列表为测试/调试辅助，与渲染内容同源。
 """
 
@@ -11,10 +12,10 @@ from __future__ import annotations
 from typing import Any
 
 from textual.containers import VerticalScroll
-from textual.markup import escape
 from textual.widgets import Markdown, Static
 
 from kdagent.engine.messages import Message, TextBlock
+from kdagent.ui._markup import escape_text
 
 
 class ChatView(VerticalScroll):
@@ -30,7 +31,7 @@ class ChatView(VerticalScroll):
 
     def append_user(self, text: str) -> None:
         self.messages.append(text)
-        self.mount(Static(f"[bold cyan]❯ {escape(text)}[/bold cyan]", classes="chat-user"))
+        self.mount(Static(f"[bold cyan]❯ {escape_text(text)}[/bold cyan]", classes="chat-user"))
         self.scroll_end(animate=False)
 
     def append_assistant(self, text: str) -> None:
@@ -47,7 +48,7 @@ class ChatView(VerticalScroll):
             self._stream_widget = Static("", classes="chat-ai")
             self.mount(self._stream_widget)
         self._stream_text += text
-        self._stream_widget.update(escape(self._stream_text))
+        self._stream_widget.update(escape_text(self._stream_text))
         self.scroll_end(animate=False)
 
     def finish_stream(self) -> None:
@@ -63,12 +64,12 @@ class ChatView(VerticalScroll):
 
     def append_system(self, text: str) -> None:
         self.messages.append(text)
-        self.mount(Static(f"[dim italic]{escape(text)}[/dim italic]", classes="chat-system"))
+        self.mount(Static(f"[dim italic]{escape_text(text)}[/dim italic]", classes="chat-system"))
         self.scroll_end(animate=False)
 
     def append_error(self, text: str) -> None:
         self.messages.append(text)
-        self.mount(Static(f"[bold red]✗ {escape(text)}[/bold red]", classes="chat-error"))
+        self.mount(Static(f"[bold red]✗ {escape_text(text)}[/bold red]", classes="chat-error"))
         self.scroll_end(animate=False)
 
     def append_testing(
@@ -88,12 +89,12 @@ class ChatView(VerticalScroll):
             "regression_detected": ("⚠", "回归检测"),
         }.get(status, ("·", "测试"))
         color = "green" if status == "passed" else "red" if status == "failed" else "yellow"
-        lines = [f"[bold {color}]{marker} {label}[/bold {color}] · {escape(test_cmd)}"]
+        lines = [f"[bold {color}]{marker} {label}[/bold {color}] · {escape_text(test_cmd)}"]
         if failed_tests:
-            lines.append("失败用例：" + "、".join(escape(t) for t in failed_tests))
+            lines.append("失败用例：" + "、".join(escape_text(t) for t in failed_tests))
         tail = summary.splitlines()[-1] if summary else ""
         if tail:
-            lines.append(f"[dim]{escape(tail)}[/dim]")
+            lines.append(f"[dim]{escape_text(tail)}[/dim]")
         text = "\n".join(lines)
         self.messages.append(text)
         self.mount(Static(text, classes="chat-test"))
