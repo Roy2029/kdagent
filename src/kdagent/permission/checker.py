@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,6 +134,16 @@ class PermissionChecker:
             if reason is not None:
                 return Decision("deny", reason)
 
+        # B3+B4 修复（2026-08-29）：Bash 命令的写目标同样受 §3.8 敏感禁写。
+        # 此前只拦 filesystem 写工具，Agent 实测 `rm .kdagent/permissions.local.yaml`
+        # （相对路径普通删除，不命中 L1 黑名单）成功绕过删掉权限文件。黑名单只兜底
+        # 递归删根/挂载点/盘符，此处补上"删除/移动/覆盖写 kdagent 系统文件"的通道。
+        if tool.name == "Bash":
+            for tgt in self._bash_write_targets(content):
+                reason = self._sensitive_write(tgt)
+                if reason is not None:
+                    return Decision("deny", reason)
+
         # bypassPermissions：跳过 L2-L5（黑名单与敏感禁写仍生效）。
         if self._mode == "bypassPermissions":
             return Decision("allow", "bypassPermissions 模式")
@@ -182,6 +193,27 @@ class PermissionChecker:
         field = _CONTENT_FIELDS.get(tool_name, "")
         value = input.get(field)
         return str(value) if isinstance(value, str) else ""
+
+    def _bash_write_targets(self, command: str) -> list[str]:
+        """提取 Bash 写操作的目标路径（rm/mv/cp 参数 + 重定向目标），供敏感禁写判定。
+
+        只做保守提取——多提取几个路径交给 `_sensitive_write` 精确判断（命中才 DENY），
+        不会误伤只读命令（无 rm/mv/cp/`>` 就返回空）。`rm -rf x` 的 flag 不参与。
+        """
+        targets: list[str] = []
+        for m in re.finditer(r"\b(?:rm|mv|cp)\s+", command):
+            rest = command[m.end():]
+            for token in rest.split():
+                tok = token.strip("\"'").rstrip(";&|")
+                if tok and not tok.startswith("-"):
+                    targets.append(tok)
+        for m in re.finditer(r"[0-9]*>+\s*(\S+)", command):
+            # `echo x > /path` 的 `>` 后常带空格（非 `>path`），`\S+` 从 token 首非空
+            # 开始捕获；尾部可能粘命令分隔符（`config.yaml; rm x`）→ rstrip。
+            tok = m.group(1).strip("\"'").rstrip(";&|")
+            if tok:
+                targets.append(tok)
+        return targets
 
     def _sensitive_write(self, raw_path: str) -> str | None:
         """命中 kdagent 目录内敏感路径 → 返回禁写原因，否则 None。"""

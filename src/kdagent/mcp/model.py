@@ -37,11 +37,17 @@ class MCPClient(Protocol):
 
 
 def extract_text(content: list[Any]) -> str:
-    """从 MCP 返回的 content 块数组提取全部 text 块拼接（09 §3.4 extract_text）。"""
+    """从 MCP 返回的 content 块数组提取全部 text 块拼接（09 §3.4 extract_text）。
+
+    C4 修复（2026-08-29）：mcp 2.0 的 content 块是 pydantic `TextContent` 对象而非
+    dict（实测 `isinstance(block, dict)` 为 False，此前恒返回空串）。同时兼容两者。
+    """
     parts: list[str] = []
     for block in content:
-        if isinstance(block, dict) and block.get("type") == "text":
-            text = block.get("text")
-            if isinstance(text, str):
-                parts.append(text)
+        if isinstance(block, dict):
+            text = block.get("text") if block.get("type") == "text" else None
+        else:
+            text = getattr(block, "text", None) if getattr(block, "type", "") == "text" else None
+        if isinstance(text, str):
+            parts.append(text)
     return "\n".join(parts)

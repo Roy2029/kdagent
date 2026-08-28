@@ -127,6 +127,12 @@ _EMPTY_TRUNCATED_FEEDBACK = (
     "（原因：{reason}）"
 )
 
+# B5 修复（2026-08-29）：prompt 型 hook 注入提示词的 user 消息标记。HookEngine 的
+# `prompt_inject` 回调（engine.py 预留、此前从未接线）由 Agent 构造时接上——prompt
+# 内容作为 user 消息进 conversation，随本轮 payload 发送（turn_start 在 assemble
+# 之前触发，本论生效）。
+HOOK_PROMPT_MARKER = "[system-reminder] Hook 注入提示词"
+
 
 @dataclass(slots=True)
 class Batch:
@@ -185,6 +191,9 @@ class Agent:
         # 10 M5-a SubAgent：实例级迭代上限（子 Agent 用定义文件 maxTurns；None =
         # 运行时读模块级 MAX_ITERATIONS=50，保证测试 monkeypatch 生效）。
         max_iterations: int | None = None,
+        # B5：prompt 型 hook 注入接线开关。主 Agent 接线（注入自己的 conversation）；
+        # 子 Agent（SubAgentRunner）共享主 HookEngine，传 False 不覆盖主注入目标。
+        wire_hook_prompt: bool = True,
     ) -> None:
         self._config = config
         self._llm = llm
@@ -233,6 +242,16 @@ class Agent:
         self._circuit_breaker_triggers = 0
         # 08 §3.3 错误模式沉淀（T33-3）：本会话已沉淀的根因 name（防同轮重复写）。
         self._seen_patterns: set[str] = set()
+        # B5 接线：prompt 型 hook 注入本 Agent conversation（主 Agent 开启、子 Agent
+        # 关）。hooks None / 关闭 → 跳过；构造时已自定义 prompt_inject（测试/用户
+        # 传入）→ 不覆盖，保留外部回调优先。engine.py `prompt_inject` 靠此 setter
+        # 在 Agent 装配后接上注入目标。
+        if (
+            self._hooks is not None
+            and wire_hook_prompt
+            and self._hooks.prompt_inject is None
+        ):
+            self._hooks.set_prompt_inject(self._inject_hook_prompt)
 
     def set_session_id(self, sid: str) -> None:
         """切换会话时更新 trace 关联的 session_id + 上下文落盘目录（04 /session new/resume）。"""
@@ -288,6 +307,24 @@ class Agent:
         """每次对话落一条消息后触发（UI 层由此把最新一条实时落盘，04 §3.2）。"""
         if self._on_conversation_change is not None:
             self._on_conversation_change()
+
+    def _inject_hook_prompt(self, text: str) -> None:
+        """prompt 型 hook 注入回调（B5）：提示词作为 user 消息进 conversation。
+
+        HookEngine `_dispatch` 同步调用（prompt 分支）。带 HOOK_PROMPT_MARKER 前缀，
+        与既有 system-reminder 注入（TODO 快照/时间跨度）同通道；notify 让 UI 落盘。
+        空文本跳过（hook 配置 prompt 为空串时 `_inject_prompt` 仍会调用）。hook 是
+        辅助机制，注入失败按「尾巴摇狗」不抛（错误兜底见 06 §3.10）。
+        """
+        if not text:
+            return
+        try:
+            self._conversation.add_user_message(
+                "", extra_blocks=[TextBlock(f"{HOOK_PROMPT_MARKER}\n{text}")]
+            )
+            self._notify_conversation_change()
+        except Exception:
+            return
 
     async def run(self, user_input: str) -> None:
         """跑完整循环直到终止；用户取消或超限也干净返回。"""
@@ -507,6 +544,9 @@ class Agent:
         with llm_cm as llm_span:
             log_full = bool(self._config.debug.get("log_full_prompt", False))
             if llm_span is not None and telemetry is not None:
+                # D98 埋点：记录本次请求配置的 max_tokens——与 usage.output_tokens 对照，
+                # 一眼可辨「配置未生效」vs「输出真的撞上限」（配合 llm.call span 落盘）。
+                llm_span.attributes["max_tokens"] = payload.max_tokens
                 text = payload_text(payload)
                 telemetry.add_log(
                     llm_span.span_id,

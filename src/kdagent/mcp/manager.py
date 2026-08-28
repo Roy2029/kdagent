@@ -52,14 +52,24 @@ class _SDKClient:
             MCPToolDef(
                 name=t.name,
                 description=t.description or "",
-                input_schema=dict(t.inputSchema or {}),
+                # C4 修复（2026-08-29）：mcp 2.0 把 Tool 属性从 `inputSchema` 改名
+                # `input_schema`（wire 名 inputSchema 只是序列化 alias，属性访问必须用
+                # 新名）。1.x 用旧名。实测 `t.inputSchema` 抛 AttributeError → 整个
+                # server 连接被判失败 → `/mcp` 工具 0 个。
+                input_schema=dict(
+                    getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}
+                ),
             )
             for t in listing.tools
         ]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPCallResult:
         result = await self._session.call_tool(name, arguments)
-        return MCPCallResult(content=result.content or [], is_error=bool(result.isError))
+        # C4 修复：mcp 2.0 CallToolResult 属性 `is_error`（isError 只是构造 alias）。
+        return MCPCallResult(
+            content=result.content or [],
+            is_error=bool(getattr(result, "is_error", None) or getattr(result, "isError", False)),
+        )
 
 
 class MCPManager:

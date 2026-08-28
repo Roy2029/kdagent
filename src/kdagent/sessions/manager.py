@@ -110,15 +110,51 @@ class Session:
         self._flush_last()
 
     def _flush_last(self) -> None:
-        """§3.5 顺序：先写文件、再更新内存计数。最新一条消息落盘为一行。"""
-        if not self._conversation.messages:
+        """§3.5 顺序：先写文件、再更新内存计数。每条逻辑消息只落盘一次。
+
+        E2 修复（2026-08-29）：此前无条件 append `messages[-1]`，而 `_append`
+        合并（并行结果分批 add_tool_results、checkpoint system-reminder 注入）会
+        替换最后一条 → 同一 tool_result 被重复写行，resume 读回重复 → 序列化
+        重复 role=tool → DeepSeek 400（/compact 摘要调用现场）。现按文件实际行数
+        与内存 diff：新消息追加、最后一条被合并扩展则覆盖重写最后一行。
+        """
+        msgs = self._conversation.messages
+        n = len(msgs)
+        if n == 0:
             return
-        msg = self._conversation.messages[-1]
+        written = self._count_written()
+        if n > written:
+            with self.file.open("a", encoding="utf-8") as f:
+                for m in msgs[written:]:
+                    f.write(self._record_line(m))
+        elif n == written:
+            self._rewrite_last(msgs[-1])
+
+    def _record_line(self, msg: Message) -> str:
         record = SessionRecord.from_message(msg, int(time.time()))
         if self._todos is not None:
             record = replace(record, todos=list(self._todos))
-        with self.file.open("a", encoding="utf-8") as f:
-            f.write(record.to_json() + "\n")
+        return record.to_json() + "\n"
+
+    def _count_written(self) -> int:
+        """文件已落盘消息行数（实时统计；compact 全量重写文件后自动跟随，无失准）。"""
+        if not self.file.exists():
+            return 0
+        with self.file.open("r", encoding="utf-8") as f:
+            return sum(1 for _ in f)
+
+    def _rewrite_last(self, msg: Message) -> None:
+        """覆盖重写最后一行（`_append` 合并扩展了 messages[-1]，行数未增）。"""
+        line = self._record_line(msg)
+        with self.file.open("r+b") as f:
+            data = f.read()
+            end = len(data)
+            if end > 0 and data.endswith(b"\n"):
+                end -= 1
+            start = data.rfind(b"\n", 0, end) + 1
+            f.seek(start)
+            f.truncate()
+            f.write(line.encode("utf-8"))
 
 
 class SessionManager:
@@ -148,7 +184,13 @@ class SessionManager:
         compact_threshold: int | None = AUTO_COMPACT_TRIGGER,
         compact: Callable[[ConversationManager], None] | None = None,
     ) -> Session:
-        """恢复四步：①逐行解析 →（②链修复在出口）→ ③token 检查 → ④上下文重灌。
+        """恢复四步：①逐行解析 → ②链修复 → ③token 检查 → ④上下文重灌。
+
+        ② 在此处实际执行 `repair_chain`（E2 修复 2026-08-29）：旧会话文件因
+        `_flush_last` 重复写盘可能带同一 tool_call_id 的重复 tool_result，read 回来
+        若不去重，序列化出现重复 role=tool 无前置 tool_calls → DeepSeek 400。
+        此前「链修复在出口」（agent 主流程发请求前）能兜住主调用，但 /compact
+        摘要调用不走该出口，故恢复时去重一次，两种路径都安全。
 
         ③ 超 `compact_threshold`（默认 01 的 AUTO_COMPACT_TRIGGER）且注入 `compact`
         回调时触发压缩——回调由调用方接线（App 走异步压缩、测试用同步桩），压缩失败
@@ -177,6 +219,7 @@ class SessionManager:
                     last_ts = max(last_ts, record.ts)
         conversation = ConversationManager()
         conversation.restore(messages)
+        conversation.repair_chain()  # 恢复②：剔除重复/孤立 tool_result、补悬空 tool_use
         # 恢复③：token 超阈 → 触发压缩（01 §5.4 全量估算口径；未接线回调则跳过）。
         if (
             compact is not None

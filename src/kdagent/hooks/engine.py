@@ -24,7 +24,7 @@ from kdagent.hooks.engine_types import HookContext, HookReject
 
 ActionType = Literal["command", "prompt", "http", "agent"]
 
-# 可控档实现集（规格 §3.10 表 ✅ 行）：11 个事件，其余（pre_send/post_receive、
+# 可控档实现集（规格 §3.10 表 ✅ 行）：12 个事件，其余（post_receive、
 # file_change/command_execute）预留。
 EVENT_SET: frozenset[str] = frozenset(
     {
@@ -32,6 +32,7 @@ EVENT_SET: frozenset[str] = frozenset(
         "session_end",
         "turn_start",
         "turn_end",
+        "pre_send",
         "pre_tool_use",
         "post_tool_use",
         "permission_request",
@@ -80,6 +81,21 @@ class HookEngine:
         self._error_cb = on_error
         self._errors: list[str] = []
 
+    def set_prompt_inject(self, cb: Callable[[str], None] | None) -> None:
+        """运行期接线/解绑 prompt 注入回调（B5 修复 2026-08-29）。
+
+        此前 `prompt_inject` 只在构造时接受；cli 构造 `HookEngine()` 未传 → prompt
+        型 hook 全库静默丢弃（实测 B5：prompt hook「没生效」）。Agent 构造后经此
+        把自己 conversation 的注入器接上来；子 Agent 共享引擎但传 None（不覆盖主
+        Agent 注入目标，见 subagent/runner.py）。传 None 解绑。
+        """
+        self._prompt_inject = cb
+
+    @property
+    def prompt_inject(self) -> Callable[[str], None] | None:
+        """当前 prompt 注入回调（Agent 接线前先看是否已自定义，避免覆盖用户/测试的回调）。"""
+        return self._prompt_inject
+
     # ---- 配置 ----
 
     def load(self, data: list[dict[str, Any]] | dict[str, Any], *, source: str = "") -> None:
@@ -106,6 +122,10 @@ class HookEngine:
     @property
     def hooks(self) -> list[HookConfig]:
         return list(self._hooks)
+
+    def has_event(self, event: str) -> bool:
+        """是否注册了该事件的 hook（pre_send 落盘等按需开销的前置判定）。"""
+        return any(h.event == event for h in self._hooks)
 
     @property
     def error_log(self) -> list[str]:

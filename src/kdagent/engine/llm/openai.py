@@ -50,6 +50,7 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
     关键：ToolResultBlock 拆成独立 `role=tool` 消息（OpenAI 中 tool_result 是独立 role）。
     """
     out: list[dict[str, Any]] = []
+    seen_tool_result: set[str] = set()
     for msg in messages:
         if msg.role == "assistant":
             text = "".join(b.text for b in msg.content if isinstance(b, TextBlock))
@@ -82,6 +83,12 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
             # 混合消息（text+tool_result 被 `_append` 合并）若先输出 user 文本会打断
             # tool 配对，触发 "insufficient tool messages following tool_calls" 400。
             for tr in tool_results:
+                # E2 兜底（2026-08-29）：同一 tool_call_id 只输出一次 role=tool。
+                # 旧会话文件（_flush_last 重复写盘）resume 后可能带重复 tool_result，
+                # 重复的 role=tool 无前置 assistant tool_calls → DeepSeek 400。
+                if tr.tool_use_id in seen_tool_result:
+                    continue
+                seen_tool_result.add(tr.tool_use_id)
                 out.append({"role": "tool", "tool_call_id": tr.tool_use_id, "content": tr.content})
             if text_parts:
                 out.append({"role": "user", "content": "".join(text_parts)})
@@ -266,9 +273,15 @@ class OpenAICompatClient:
             yield event
 
     def _build_body(self, payload: Payload) -> dict[str, Any]:
+        messages = _serialize_messages(payload.messages)
+        # C3 修复（2026-08-29）：system 放 messages[0]（role=system）——docstring 明写
+        # 但此前从未实现，`payload.system`（含记忆索引/MCP/Skill 注入）整体被丢弃，
+        # 模型从没收到记忆索引。anthropic.py 对照实现正确发送，此处补齐。
+        if payload.system:
+            messages = [{"role": "system", "content": payload.system}, *messages]
         body: dict[str, Any] = {
             "model": self._config.model,
-            "messages": _serialize_messages(payload.messages),
+            "messages": messages,
             "max_tokens": payload.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},

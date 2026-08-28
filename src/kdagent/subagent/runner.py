@@ -269,6 +269,7 @@ class SubAgentRunner:
             parent_trace_id=parent_trace_id,
             parent_span_id=parent_span_id,
             hooks=self._hooks,  # 10 §3.3：共享主 HookEngine，子 Agent hook 同生效
+            wire_hook_prompt=False,  # B5：不覆盖主 Agent 的 prompt 注入目标
         )
         await agent.run(task if not fork else "")
         return self._extract_result(agent, conversation, sink)
