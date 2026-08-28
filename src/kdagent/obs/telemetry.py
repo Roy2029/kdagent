@@ -22,6 +22,13 @@ from kdagent.obs.model import LogLevel, Span, SpanLog, Trace, gen_id, now_ms
 
 _current_span_id: ContextVar[str | None] = ContextVar("_current_span_id", default=None)
 _current_trace: ContextVar[Trace | None] = ContextVar("_current_trace", default=None)
+# begin_trace 的 token 栈（context-local）：一次 Agent.run() = 一次 push/pop。用**不可变
+# tuple** 而非 list——asyncio.create_task 复制 context 时值是浅拷贝，list 原地改会跨任务
+# 串改同一对象，tuple 每次 set 新建对象、子任务改不到父栈。修复 2026-08-28 f45c 实测：
+# 并发子 Agent（各自 context 副本）共享同一 Telemetry 实例，原 `self._trace_token`
+# 被后 begin 的子任务覆盖 → 先 end 的子任务拿别人 Context 的 token 去 reset →
+# RuntimeError「Token ... was created in a different Context」击穿 Agent 主循环。
+_trace_tokens: ContextVar[tuple[Any, ...]] = ContextVar("_trace_tokens", default=())
 # 预置 trace attributes（07 §3.8 eval.run_id/task_id）：contextvar 隔离——每个
 # asyncio.Task 独立上下文副本，并发子代理各自 set 互不覆盖（D60，替代实例级可变状态）。
 # default=None 而非 {}（B039：ContextVar 默认值不可变，可变共享会跨上下文串改）。
@@ -48,7 +55,6 @@ class Telemetry:
         )
         self.log_full_prompt = log_full_prompt
         self._enabled = enabled
-        self._trace_token: Any | None = None
 
     @property
     def enabled(self) -> bool:
@@ -94,7 +100,7 @@ class Telemetry:
             parent_span_id=parent_span_id,
             attributes=merged,
         )
-        self._trace_token = _current_trace.set(trace)
+        _trace_tokens.set(_trace_tokens.get() + (_current_trace.set(trace),))
         self._exporter.export_trace_header(trace)
         return trace
 
@@ -113,10 +119,15 @@ class Telemetry:
         return (trace.trace_id, _current_span_id.get() or "", trace.session_id)
 
     def end_trace(self) -> None:
-        """02 Agent.run() 退出时调用：恢复 trace 上下文。"""
-        if self._trace_token is not None:
-            _current_trace.reset(self._trace_token)
-            self._trace_token = None
+        """02 Agent.run() 退出时调用：恢复 trace 上下文（本 context 栈 pop）。
+
+        token 栈是 context-local：并发子 Agent（create_task 复制 context）各自
+        push/pop 互不干扰，父 trace 上下文不会被子任务覆盖（D60 同思路）。
+        """
+        stack = _trace_tokens.get()
+        if stack:
+            _current_trace.reset(stack[-1])
+            _trace_tokens.set(stack[:-1])
 
     @contextmanager
     def span(

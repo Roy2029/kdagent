@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -140,4 +141,56 @@ def test_current_context_reads_active_trace(tmp_path: Path) -> None:
 def test_current_context_disabled_returns_empty(tmp_path: Path) -> None:
     """未启用 telemetry → current_context 恒空（no-op 零开销）。"""
     telemetry = Telemetry(tmp_path, enabled=False)
+    assert telemetry.current_context() == ("", "", "")
+
+
+# ---- 并发子 Agent：共享实例不串 trace token（2026-08-28 f45c 实测崩溃） ----
+
+async def test_concurrent_subagent_traces_no_cross_context_crash(tmp_path: Path) -> None:
+    """并发子 Agent（create_task 各复制 context）共享同一 Telemetry → 不崩、父 trace 存活。
+
+    复现 f45c「Agent 异常：Token ... was created in a different Context」：原
+    `self._trace_token` 是共享实例属性，后 begin 的子任务覆盖它，先 end 的子任务
+    拿别人 Context 的 token 去 reset → RuntimeError 击穿主循环。改为 context-local
+    token 栈后：每个子任务 push/pop 自己的栈，互不覆盖，父 trace 上下文不受影响。
+    """
+    telemetry = Telemetry(tmp_path)
+    telemetry.begin_trace("parent", "父输入")
+    parent_trace_id = telemetry.current_context()[0]
+
+    async def child(name: str) -> str:
+        telemetry.begin_trace(name, name)
+        # 模拟子 Agent 跑 LLM/工具：让出控制权使 begin/end 跨任务交错
+        for _ in range(3):
+            await asyncio.sleep(0)
+        sub_trace_id = telemetry.current_context()[0]
+        telemetry.end_trace()
+        return sub_trace_id
+
+    tasks = [asyncio.create_task(child(n)) for n in ("c1", "c2", "c3")]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # 子任务均正常完成（旧实现：两个子任务抛「was created in a different Context」）
+    assert all(not isinstance(r, BaseException) for r in results)
+    # 子 trace 各自独立，且与父不同
+    assert len({r for r in results}) == 3
+    assert all(r and r != parent_trace_id for r in results)
+    # 父 trace 上下文在并发子任务后仍存活、id 未被覆盖
+    assert telemetry.current_context()[0] == parent_trace_id
+    telemetry.end_trace()
+    assert telemetry.current_context() == ("", "", "")
+
+
+async def test_nested_begin_trace_same_context_restores(tmp_path: Path) -> None:
+    """同 context 内嵌套 begin/end（父 → 子 → 父）逐层恢复，不丢外层。"""
+    telemetry = Telemetry(tmp_path)
+    telemetry.begin_trace("outer", "外层")
+    outer_id = telemetry.current_context()[0]
+
+    telemetry.begin_trace("inner", "内层")
+    inner_id = telemetry.current_context()[0]
+    assert inner_id != outer_id
+    telemetry.end_trace()  # 弹回外层
+
+    assert telemetry.current_context()[0] == outer_id
+    telemetry.end_trace()
     assert telemetry.current_context() == ("", "", "")
