@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import kdagent.tools.shell as shell_mod
 from kdagent.config import Config
 from kdagent.tools.base import ToolContext
 from kdagent.tools.shell import Bash, wsl_delete_diagnosis
@@ -88,3 +89,118 @@ def test_wsl_diagnosis_non_rm_skipped() -> None:
     """非 rm 命令 → 不命中（避免无关诊断）。"""
     d = wsl_delete_diagnosis("ls -la D:\\x", "/usr/bin/bash")
     assert d is None
+
+
+# ---- UTF-16 解码 + WSL 冷启动重试（2026-08-28 d17c 会话实测） ----
+
+def test_decode_output_utf8() -> None:
+    """普通 UTF-8 文本原样。"""
+    assert shell_mod._decode_output("你好 hello".encode("utf-8")) == "你好 hello"
+
+
+def test_decode_output_utf16le_with_bom() -> None:
+    """WSL 启动器带 BOM 的 UTF-16LE 错误信息 → 可读文本（不再是 \\u0000 乱码）。"""
+    raw = "错误码: Bash/Service/E_UNEXPECTED".encode("utf-16")
+    assert shell_mod._decode_output(raw) == "错误码: Bash/Service/E_UNEXPECTED"
+
+
+def test_decode_output_utf16le_without_bom() -> None:
+    """无 BOM 的 UTF-16LE（空字节启发式命中）。"""
+    raw = "Error code: Bash/Service/E_UNEXPECTED".encode("utf-16-le")
+    assert shell_mod._decode_output(raw) == "Error code: Bash/Service/E_UNEXPECTED"
+
+
+def test_decode_output_ascii_not_misdetected() -> None:
+    """普通 ASCII 输出无空字节 → 不误判 UTF-16。"""
+    assert shell_mod._decode_output(b"ls -la") == "ls -la"
+
+
+def test_decode_output_empty() -> None:
+    assert shell_mod._decode_output(b"") == ""
+
+
+def test_wsl_launcher_failure_detected() -> None:
+    """E_UNEXPECTED / Bash/Service 签名命中。"""
+    assert shell_mod._is_wsl_launcher_failure("错误码: Bash/Service/E_UNEXPECTED") is True
+    assert shell_mod._is_wsl_launcher_failure("E_UNEXPECTED") is True
+
+
+def test_wsl_launcher_failure_not_detected() -> None:
+    assert shell_mod._is_wsl_launcher_failure("hello") is False
+
+
+async def test_bash_retries_on_wsl_cold_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """WSL 启动器冷启动 E_UNEXPECTED → 短等后重试，第二次成功。"""
+    calls: list[str] = []
+    fail = "错误码: Bash/Service/E_UNEXPECTED".encode("utf-16")
+
+    async def fake_run(bash: str | None, command: str, cwd: str):
+        calls.append(command)
+        if len(calls) == 1:
+            return 1, fail, b""
+        return 0, b"hello", b""
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        shell_mod.shutil, "which", lambda name: r"C:\Windows\System32\bash.exe"
+    )
+    monkeypatch.setattr(shell_mod, "_run_command", fake_run)
+    monkeypatch.setattr(shell_mod, "_sleep", fake_sleep)
+
+    result = await Bash().execute(_ctx(tmp_path), {"command": "ls -la"})
+    assert result.is_error is False
+    assert "hello" in result.content
+    assert "[exit] 0" in result.content
+    assert "WSL 冷启动后恢复" in result.content
+    assert len(calls) == 2
+
+
+async def test_bash_retry_exhausts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """重试耗尽 → 返回最后一次错误，且 E_UNEXPECTED 以可读文本出现（非乱码）。"""
+    fail = "错误码: Bash/Service/E_UNEXPECTED".encode("utf-16")
+    calls: list[str] = []
+
+    async def fake_run(bash: str | None, command: str, cwd: str):
+        calls.append(command)
+        return 1, fail, b""
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        shell_mod.shutil, "which", lambda name: r"C:\Windows\System32\bash.exe"
+    )
+    monkeypatch.setattr(shell_mod, "_run_command", fake_run)
+    monkeypatch.setattr(shell_mod, "_sleep", fake_sleep)
+
+    result = await Bash().execute(_ctx(tmp_path), {"command": "ls"})
+    assert result.is_error is True
+    assert "E_UNEXPECTED" in result.content
+    assert len(calls) == 1 + shell_mod._WSL_RETRIES
+
+
+async def test_bash_no_retry_for_non_wsl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Git Bash（非 WSL 启动器）不重试，普通失败原样返回。"""
+    calls: list[str] = []
+
+    async def fake_run(bash: str | None, command: str, cwd: str):
+        calls.append(command)
+        return 1, b"some error", b""
+
+    monkeypatch.setattr(
+        shell_mod.shutil, "which", lambda name: r"C:\Program Files\Git\bin\bash.exe"
+    )
+    monkeypatch.setattr(shell_mod, "_run_command", fake_run)
+
+    result = await Bash().execute(_ctx(tmp_path), {"command": "exit 3"})
+    assert result.is_error is True
+    assert "some error" in result.content
+    assert len(calls) == 1

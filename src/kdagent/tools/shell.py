@@ -39,6 +39,68 @@ def _is_wsl_bash(bash: str | None) -> bool:
     )
 
 
+# WSL 启动器（System32\bash.exe）冷启动失败 E_UNEXPECTED 后的重试参数。
+# memory 实测「稍后重试 Bash 通常恢复」——虚拟机冷启动首次调用必撞
+# Bash/Service/E_UNEXPECTED，等 WSL 起来后重试即可（2026-08-28 d17c 会话）。
+_WSL_RETRIES = 2
+_WSL_RETRY_DELAY = 5.0  # 秒
+
+
+def _decode_output(data: bytes) -> str:
+    """解码子进程输出，自动识别 UTF-16LE。
+
+    WSL 启动器（System32\\bash.exe）冷启动失败时输出的是 UTF-16LE 错误信息
+    （如 `错误码: Bash/Service/E_UNEXPECTED`）。统一按 UTF-8 解码会得到
+    `~p��...\\u0000B\\u0000a...` 式乱码污染模型上下文（实测 2026-08-28 d17c
+    会话）——先检测 UTF-16 特征（BOM 或 ASCII 区段空字节密集）再解码。
+    """
+    if not data:
+        return ""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    # 无 BOM 的 UTF-16LE：ASCII 字符每 2 字节有 1 个 \x00（奇位）。半数以上
+    # 奇位为空字节即判定为 UTF-16LE，避免把普通二进制当文本。
+    n = len(data)
+    if n >= 4 and data[1::2].count(b"\x00") >= max(n // 4, 2):
+        return data.decode("utf-16-le", errors="replace")
+    return data.decode(errors="replace")
+
+
+def _is_wsl_launcher_failure(text: str) -> bool:
+    """判断输出是否命中 WSL 启动器冷启动失败特征（Bash/Service/E_UNEXPECTED）。"""
+    t = text.upper()
+    return "E_UNEXPECTED" in t or "BASH/SERVICE" in t
+
+
+async def _run_command(
+    bash: str | None, command: str, cwd: str
+) -> tuple[int, bytes, bytes]:
+    """启动一个子进程执行命令，返回 (exit_code, stdout, stderr)。"""
+    if bash is not None:
+        proc = await asyncio.create_subprocess_exec(
+            bash,
+            "-c",
+            command,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    else:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout, stderr
+
+
+async def _sleep(seconds: float) -> None:
+    """可被测试 monkeypatch 的休眠点（重试间隔）。"""
+    await asyncio.sleep(seconds)
+
+
 def _extract_rm_target(command: str) -> str | None:
     """提取 rm 命令的第一个目标参数（剥引号、剥 flags）。"""
     match = re.search(r"(?:^|[\s;&|])rm(?:\s+)?", command)
@@ -120,23 +182,24 @@ class Bash:
         # 静默 exit 0 但实际未删除）。
         diagnosis = wsl_delete_diagnosis(command, bash)
         try:
-            if bash is not None:
-                proc = await asyncio.create_subprocess_exec(
-                    bash,
-                    "-c",
-                    command,
-                    cwd=str(ctx.work_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+            exit_code, stdout, stderr = await _run_command(bash, command, str(ctx.work_dir))
+            # WSL 启动器冷启动：首次调用常撞 Bash/Service/E_UNEXPECTED（memory 实测
+            # 「稍后重试通常恢复」）。命中则短等后重试，避免一开场就连败 3 次撞进
+            # 「连续失败」引导（实测 2026-08-28 d17c 会话）。
+            retried = False
+            attempts = 0
+            while (
+                exit_code != 0
+                and attempts < _WSL_RETRIES
+                and _is_wsl_bash(bash)
+                and _is_wsl_launcher_failure(
+                    _decode_output(stdout) + "\n" + _decode_output(stderr)
                 )
-            else:
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    cwd=str(ctx.work_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-            stdout, stderr = await proc.communicate()
+            ):
+                attempts += 1
+                retried = True
+                await _sleep(_WSL_RETRY_DELAY)
+                exit_code, stdout, stderr = await _run_command(bash, command, str(ctx.work_dir))
         except OSError as exc:
             content = f"命令执行失败：{exc}"
             if diagnosis:
@@ -148,15 +211,16 @@ class Bash:
                 is_error=True,
                 duration_ms=int((time.perf_counter() - start) * 1000),
             )
-        out = _ANSI_RE.sub("", stdout.decode(errors="replace")).rstrip()
-        err = _ANSI_RE.sub("", stderr.decode(errors="replace")).rstrip()
-        exit_code = proc.returncode
+        out = _ANSI_RE.sub("", _decode_output(stdout)).rstrip()
+        err = _ANSI_RE.sub("", _decode_output(stderr)).rstrip()
         parts: list[str] = []
         if out:
             parts.append(f"[stdout]\n{out}")
         if err:
             parts.append(f"[stderr]\n{err}")
         parts.append(f"[exit] {exit_code}")
+        if retried and exit_code == 0:
+            parts.append("[重试] WSL 冷启动后恢复")
         if diagnosis:
             parts.append(diagnosis)
         return ToolResult(
