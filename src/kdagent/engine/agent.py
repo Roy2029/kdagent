@@ -17,11 +17,14 @@ M1-c 能跑档范围：
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from kdagent.config import Config
 from kdagent.context.compactor import ContextFullError, estimate_messages_tokens, estimate_tokens
@@ -110,6 +113,17 @@ _TRUNCATED_FEEDBACK = (
     "解决办法：把长内容拆小输出。写大文件（完整 HTML/长代码）时先用 WriteFile "
     "写入开头一段，再用 Edit 逐段追加其余内容，不要一次性把整个文件塞进 "
     "WriteFile 参数。重新尝试。\n"
+    "（原因：{reason}）"
+)
+
+# B2：空回复截断反馈（2026-08-28 21da 会话实测：模型对「全部都做」先输出大量
+# reasoning 思考吃满 max_tokens，content 为空 → parser 零事件 → 旧逻辑静默
+# TERMINAL「没报错但也没反应了」）。引导模型别过度思考、直接输出，与拆小输出
+# （_TRUNCATED_FEEDBACK）是不同场景的两种引导。
+_EMPTY_TRUNCATED_FEEDBACK = (
+    "[system] 你上一条回复未产生任何可见内容（无文本、无工具调用），且输出达到 "
+    "max_tokens 上限被截断——常见原因是思考过程过长、占满输出预算。\n"
+    "解决办法：直接给出简洁文本或直接调用工具，不要输出冗长的推理过程。重新尝试。\n"
     "（原因：{reason}）"
 )
 
@@ -474,6 +488,7 @@ class Agent:
         prompt 日志（07 §3.4 + D9 `debug.log_full_prompt`）：默认只落摘要（长度 + 首尾
         片段），开关打开才落全文。全文含本地业务代码，防误导出泄露。
         """
+        self._fire_pre_send(payload)
         telemetry = self._telemetry
         # 07：一次 LLM 调用 = 一个 llm.call span（model/耗时/tokens）。
         llm_cm: AbstractContextManager[Span | None] = nullcontext(None)
@@ -517,10 +532,17 @@ class Agent:
                             # 把截断原因反馈模型（写入 conversation），返回异常让
                             # _loop_iteration_inner 重建 payload 重试（限次）。
                             # 不落 assistant 消息，避免悬空 tool_use。
+                            # B2：empty 标记区分「纯思考截断」（引导别过度思考）与
+                            # 「工具参数截断」（引导拆小输出）。
                             self._pending_text = []
                             self._pending_tool_uses = []
+                            feedback = (
+                                _EMPTY_TRUNCATED_FEEDBACK
+                                if getattr(ev.error, "empty", False)
+                                else _TRUNCATED_FEEDBACK
+                            )
                             self._conversation.add_user_message(
-                                _TRUNCATED_FEEDBACK.format(reason=ev.error)
+                                feedback.format(reason=ev.error)
                             )
                             self._notify_conversation_change()
                             return ev.error
@@ -530,6 +552,25 @@ class Agent:
                     llm_span.status = "error"
                     telemetry.add_log(llm_span.span_id, "error", f"{type(exc).__name__}: {exc}")
                 return exc
+        # B2 兜底：流正常结束（无 error 事件）但空回复、且输出打满 max_tokens——
+        # parser 未报截断（如 provider 返回 finish_reason=stop 但 usage 显示打满）
+        # 时仍应反馈重试，不再落到 `not blocks: return TERMINAL` 静默吞掉。
+        if (
+            not self._pending_text
+            and not self._pending_tool_uses
+            and self._usage is not None
+            and payload.max_tokens > 0
+            and self._usage.output_tokens >= payload.max_tokens
+        ):
+            err = ToolTruncatedError(
+                "输出达到 max_tokens 上限被截断，且未产生任何文本或工具调用",
+                empty=True,
+            )
+            self._conversation.add_user_message(
+                _EMPTY_TRUNCATED_FEEDBACK.format(reason=err)
+            )
+            self._notify_conversation_change()
+            return err
         return None
 
     def _estimate_context_tokens(self) -> int:
@@ -537,6 +578,30 @@ class Agent:
         return estimate_messages_tokens(self._conversation.messages) + estimate_tokens(
             self._system_prompt
         )
+
+    def _fire_pre_send(self, payload: Payload) -> None:
+        """pre_send hook（06 §3.10 预留事件转正）：payload 组装后、LLM 调用前。
+
+        完整上下文（payload_text 渲染 + 工具清单头）先落临时文件，路径经
+        $PAYLOAD_PATH 展开给 hook 命令——内容超长，不走命令行参数/环境变量。
+        每次 fire 独立临时文件：command 动作在事件循环内是后台调度（ensure_future），
+        复用同名文件会被下一次调用的落盘覆盖。无 pre_send hook 注册时零开销直接返回。
+        """
+        hooks = self._hooks
+        if hooks is None or not hooks.has_event("pre_send"):
+            return
+        try:
+            tools = ", ".join(t.name for t in payload.tools) or "(无)"
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            header = (
+                f"===== {stamp} | turn {self._turn} | tools: {tools} "
+                f"| max_tokens: {payload.max_tokens} =====\n"
+            )
+            path = Path(tempfile.gettempdir()) / f"kdagent-payload-{uuid4().hex[:12]}.txt"
+            path.write_text(header + payload_text(payload), encoding="utf-8")
+        except Exception:
+            return  # hook 辅助机制故障不拖垮主流程（06 §3.10 错误兜底同思路）
+        self._run_hook("pre_send", HookContext(event="pre_send", payload_path=str(path)))
 
     def _compact_span(self, trigger: str) -> AbstractContextManager[Span | None]:
         """context.compact trace span（07 §3.6 T7 标定数据源：触发类型/压缩前 token）。

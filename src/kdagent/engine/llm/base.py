@@ -23,7 +23,16 @@ class ToolTruncatedError(RuntimeError):
     区别于 PromptTooLongError（输入侧超长）：这是**输出侧**被截断，工具参数
     不可用。agent 收到后应反馈模型拆小输出、丢弃残缺 tool_use 并重试，而不是
     把空参数当合法调用执行——实测写大文件场景会因误导性「参数校验失败」死循环。
+
+    `empty`：True = 输出被截断且**未产生任何文本/工具调用**（典型：模型先输出
+    大量 reasoning 思考吃满 max_tokens，content 为空，parser 零事件）。agent
+    应反馈模型「别过度思考、直接输出」，与拆小输出是不同引导（2026-08-28 21da
+    会话实测：3 条用户消息全部静默无响应）。
     """
+
+    def __init__(self, message: str, *, empty: bool = False) -> None:
+        super().__init__(message)
+        self.empty = empty
 
 
 @dataclass(frozen=True, slots=True)

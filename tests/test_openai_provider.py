@@ -179,6 +179,43 @@ def test_parser_complete_arguments_with_length_still_emits_tool() -> None:
     assert not [e for e in events if e.type == "error"]
 
 
+# ---------- B2：reasoning 吃满 max_tokens → 空回复截断不静默（21da 会话实测） ----------
+
+def test_parser_reasoning_only_truncated_emits_error() -> None:
+    """思考内容（reasoning_content）吃满 max_tokens、content 为空 → 不静默，
+    发 ToolTruncatedError（empty=True）。
+
+    21da 会话根因：feed 忽略 reasoning_content 且零 text/tool_use → 零事件 →
+    agent 当「空回复」静默 TERMINAL「没报错但也没反应了」。修复后明确报截断。
+    """
+    lines = [
+        'data: {"choices":[{"delta":{"reasoning_content":"正在思考如何实现五项增强……"},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+        "data: [DONE]",
+    ]
+    events = _feed_all(_OpenAIStreamParser(), lines)
+    errors = [e.error for e in events if e.type == "error"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ToolTruncatedError)
+    assert errors[0].empty is True
+    # 不产生误导性 text_delta / tool_use
+    assert not [e for e in events if e.type == "text_delta"]
+    assert not [e for e in events if e.type == "tool_use"]
+
+
+def test_parser_text_with_length_no_extra_error() -> None:
+    """有可见文本但 finish_reason=length → 正常发 text，不追加额外截断错误。"""
+    lines = [
+        'data: {"choices":[{"delta":{"content":"部分内容"},"finish_reason":null}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+        "data: [DONE]",
+    ]
+    events = _feed_all(_OpenAIStreamParser(), lines)
+    texts = [e.text for e in events if e.type == "text_delta"]
+    assert texts == ["部分内容"]
+    assert not [e for e in events if e.type == "error"]
+
+
 # ---------- 可选真实调用 ----------
 
 def _load_env_key() -> str | None:

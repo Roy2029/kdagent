@@ -122,6 +122,9 @@ class _OpenAIStreamParser:
         self._tool_calls: dict[int, dict[str, str]] = {}
         self._stop_reason: str | None = None
         self._stop_sent = False
+        # B2：是否发过可见文本——finish_reason=length 且零文本零 tool_use 时，
+        # 判定「输出被整体截断」（如 reasoning 吃满 max_tokens），不再静默。
+        self._emitted_text = False
 
     def feed(self, line: str) -> list[LLMStreamEvent]:
         if not line.startswith("data:"):
@@ -137,7 +140,12 @@ class _OpenAIStreamParser:
             delta = choice.get("delta") or {}
             text = delta.get("content")
             if text:
+                self._emitted_text = True
                 events.append(LLMStreamEvent(type="text_delta", text=text))
+            # B2：reasoning_content（思考）静默丢弃但记录在案——它不产生 text/
+            # tool_use 事件，若思考吃满 max_tokens，feed 其余字段全空，靠
+            # _flush_tool_calls 的零内容截断检测兜底报错（21da 实测根因）。
+            # （ThinkingBlock 映射延后，M1 阶段不消费 reasoning_content。）
             for tc in delta.get("tool_calls") or []:
                 self._feed_tool_call(tc)
             if choice.get("finish_reason"):
@@ -170,7 +178,9 @@ class _OpenAIStreamParser:
     def _flush_tool_calls(self) -> list[LLMStreamEvent]:
         events: list[LLMStreamEvent] = []
         seen_ids: set[str] = set()
-        truncated = self._stop_reason == "length"  # 输出被 max_tokens 截断 → arguments 必不完整
+        truncated = self._stop_reason in ("length", "max_tokens")  # 输出被 max_tokens 截断
+        emitted_tool = False
+        emitted_error = False
         for index in sorted(self._tool_calls):
             entry = self._tool_calls[index]
             if not entry["name"]:
@@ -186,6 +196,7 @@ class _OpenAIStreamParser:
                 # 是格式问题，反复重试同样超长输出（实测：贪吃蛇 HTML 被 4096
                 # token 截断 → 空参数 → 无限死循环）。丢弃残缺 tool_use，向上抛
                 # 明确错误，agent 反馈模型拆小输出后再重试。
+                emitted_error = True
                 events.append(
                     LLMStreamEvent(
                         type="error",
@@ -200,6 +211,22 @@ class _OpenAIStreamParser:
                 LLMStreamEvent(
                     type="tool_use",
                     tool_use=ToolUseBlock(id=entry["id"], name=entry["name"], input=arguments),
+                )
+            )
+            emitted_tool = True
+        # B2：finish_reason=length 但既无文本也无可用 tool_use、且无既有错误 →
+        # 输出被整体截断（典型：模型 reasoning 思考吃满 max_tokens，content 为空）。
+        # 旧实现零事件 → agent 当「空回复」静默 TERMINAL（21da 会话实测「没报错但
+        # 也没反应了」）。此处显式抛 empty 截断，agent 反馈「别过度思考」后重试。
+        if truncated and not self._emitted_text and not emitted_tool and not emitted_error:
+            events.append(
+                LLMStreamEvent(
+                    type="error",
+                    error=ToolTruncatedError(
+                        "输出被 max_tokens 截断，且未产生任何文本或工具调用"
+                        "（可能是思考内容过长）",
+                        empty=True,
+                    ),
                 )
             )
         self._tool_calls = {}

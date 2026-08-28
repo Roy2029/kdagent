@@ -6,6 +6,7 @@ from kdagent.engine.llm.anthropic import (
     _AnthropicStreamParser,
     _serialize_messages,
 )
+from kdagent.engine.llm.base import ToolTruncatedError
 from kdagent.engine.messages import (
     Message,
     TextBlock,
@@ -139,3 +140,49 @@ def test_parser_thinking_delta_is_accumulated_not_emitted() -> None:
     events = parser.feed('data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"深思"}}')
     assert events == []  # M1 阶段 thinking 不发射事件
     assert parser._thinking == "深思"  # noqa: SLF001
+
+
+def test_parser_thinking_only_truncated_emits_error() -> None:
+    """thinking 吃满 max_tokens、text/tool_use 皆空 → 不静默，发 ToolTruncatedError。
+
+    与 openai 端 B2 同场景（21da 会话实测「没报错但也没反应了」）：stop_reason=
+    max_tokens 且零可见内容 → 明确报截断，agent 反馈「别过度思考」后重试。
+    """
+    lines = [
+        "event: content_block_start",
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}',
+        "event: content_block_delta",
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"深思……"}}',
+        "event: content_block_stop",
+        'data: {"type":"content_block_stop","index":0}',
+        "event: message_delta",
+        'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}',
+        "event: message_stop",
+        'data: {"type":"message_stop"}',
+    ]
+    events = _feed_all(_AnthropicStreamParser(), lines)
+    errors = [e.error for e in events if e.type == "error"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ToolTruncatedError)
+    assert errors[0].empty is True
+    assert not [e for e in events if e.type == "text_delta"]
+
+
+def test_parser_unclosed_tool_use_emits_error() -> None:
+    """tool_use 块被 max_tokens 截断（content_block_stop 未到）→ 发错误而非静默丢弃。"""
+    lines = [
+        "event: content_block_start",
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_x","name":"WriteFile","input":{}}}',
+        "event: content_block_delta",
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"a"}}',
+        "event: message_delta",
+        'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":4096}}',
+        "event: message_stop",
+        'data: {"type":"message_stop"}',
+    ]
+    events = _feed_all(_AnthropicStreamParser(), lines)
+    errors = [e.error for e in events if e.type == "error"]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ToolTruncatedError)
+    assert errors[0].empty is False  # 有工具调用痕迹 → 拆小输出引导
+    assert not [e for e in events if e.type == "tool_use"]

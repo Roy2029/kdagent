@@ -23,7 +23,7 @@ from kdagent.engine.events import (
     TurnCompleteEvent,
     UsageEvent,
 )
-from kdagent.engine.llm.base import LLMStreamEvent, Payload, Usage
+from kdagent.engine.llm.base import LLMStreamEvent, Payload, ToolTruncatedError, Usage
 from kdagent.engine.messages import TextBlock, ToolResultBlock, ToolUseBlock
 from kdagent.tools import build_default_registry
 
@@ -183,3 +183,51 @@ async def test_provider_error_terminates_with_error_event(tmp_path: Path) -> Non
     await agent.run("hi")
     error_events = [e for e in collected if isinstance(e, ErrorEvent)]
     assert error_events and "连接失败" in error_events[0].error
+
+
+# ---- B2：空回复截断不再静默（2026-08-28 21da 会话「没报错但也没反应了」根因） ----
+
+def _truncated_empty() -> list[LLMStreamEvent]:
+    """只含 usage+stop、无文本无工具、输出打满 max_tokens 的空回复流。"""
+    return [
+        LLMStreamEvent(type="usage", usage=Usage(input_tokens=100, output_tokens=4096)),
+        LLMStreamEvent(type="stop", stop_reason="length"),
+    ]
+
+
+async def test_empty_reply_at_max_tokens_retries_then_succeeds(tmp_path: Path) -> None:
+    """空回复 + 输出打满 max_tokens → 注入「别过度思考」反馈并重试，第二次正常完成。"""
+    responses = [_truncated_empty(), _done("好的，直接做")]
+    agent, conv, collected = _make_agent(responses, tmp_path)
+    await agent.run("全部都做")
+    assert any(isinstance(e, LoopCompleteEvent) for e in collected)
+    assert not any(isinstance(e, ErrorEvent) for e in collected)
+    # 反馈消息注入（空回复截断引导，非工具参数截断引导）
+    texts = [b.text for m in conv.messages for b in m.content if isinstance(b, TextBlock)]
+    assert any("max_tokens" in t and "思考" in t for t in texts)
+    assert conv.messages[-1].role == "assistant"
+    assert conv.messages[-1].content[0].text == "好的，直接做"
+
+
+async def test_empty_reply_at_max_tokens_exhausts_retries_errors(tmp_path: Path) -> None:
+    """连续 2 次空回复截断 → ErrorEvent 终止（有报错，不再静默）。"""
+    responses = [_truncated_empty(), _truncated_empty()]
+    agent, conv, collected = _make_agent(responses, tmp_path)
+    await agent.run("全部都做")
+    error_events = [e for e in collected if isinstance(e, ErrorEvent)]
+    assert error_events and "截断" in error_events[0].error
+    assert not any(isinstance(e, LoopCompleteEvent) for e in collected)
+
+
+async def test_parser_empty_truncated_error_uses_thinking_feedback(tmp_path: Path) -> None:
+    """parser 抛 empty=True 截断错误事件 → 反馈用「别过度思考」而非「拆小输出」。"""
+    responses = [
+        [LLMStreamEvent(type="error", error=ToolTruncatedError("空回复截断", empty=True))],
+        _done("好的，直接做"),
+    ]
+    agent, conv, collected = _make_agent(responses, tmp_path)
+    await agent.run("全部都做")
+    assert any(isinstance(e, LoopCompleteEvent) for e in collected)
+    texts = [b.text for m in conv.messages for b in m.content if isinstance(b, TextBlock)]
+    assert any("思考" in t for t in texts)  # empty 引导
+    assert not any("拆小输出" in t for t in texts)  # 非工具参数引导

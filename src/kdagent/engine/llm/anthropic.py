@@ -99,6 +99,10 @@ class _AnthropicStreamParser:
         self._usage = Usage()
         self._stop_reason: str | None = None
         self._stop_sent = False
+        # B2：是否发过可见文本 / 可用 tool_use——stop_reason=max_tokens 且两者皆空
+        # 时判定「输出被整体截断」（如 thinking 吃满预算），不再静默。
+        self._emitted_text = False
+        self._emitted_tool = False
 
     def feed(self, line: str) -> list[LLMStreamEvent]:
         line = line.strip()
@@ -132,6 +136,7 @@ class _AnthropicStreamParser:
             delta = payload.get("delta") or {}
             dtype = delta.get("type")
             if dtype == "text_delta":
+                self._emitted_text = True
                 return [LLMStreamEvent(type="text_delta", text=delta.get("text", ""))]
             if dtype == "thinking_delta":
                 self._thinking += delta.get("thinking", "")
@@ -163,6 +168,7 @@ class _AnthropicStreamParser:
                         )
                     ]
                 self._input_buffer = ""
+                self._emitted_tool = True
                 return [
                     LLMStreamEvent(
                         type="tool_use",
@@ -190,7 +196,40 @@ class _AnthropicStreamParser:
         if self._stop_sent:
             return []
         self._stop_sent = True
-        return [LLMStreamEvent(type="stop", stop_reason=self._stop_reason)]
+        events: list[LLMStreamEvent] = []
+        if self._tool_use is not None:
+            # content_block_stop 未到 → tool_use 块被 max_tokens 截断，丢弃并报错
+            # （静默丢弃会让 agent 拿到空回复后静默终止，同 openai 端 B2 场景）。
+            block = self._tool_use
+            self._tool_use = None
+            self._input_buffer = ""
+            events.append(
+                LLMStreamEvent(
+                    type="error",
+                    error=ToolTruncatedError(
+                        f"工具 {block['name']} 的参数不完整：tool_use 块未闭合"
+                        "（可能被 max_tokens 截断）"
+                    ),
+                )
+            )
+        elif (
+            self._stop_reason in ("max_tokens", "length")
+            and not self._emitted_text
+            and not self._emitted_tool
+        ):
+            # B2：thinking 吃满 max_tokens，text/tool_use 皆空 → 输出被整体截断。
+            events.append(
+                LLMStreamEvent(
+                    type="error",
+                    error=ToolTruncatedError(
+                        "输出被 max_tokens 截断，且未产生任何文本或工具调用"
+                        "（可能是 thinking 过长）",
+                        empty=True,
+                    ),
+                )
+            )
+        events.append(LLMStreamEvent(type="stop", stop_reason=self._stop_reason))
+        return events
 
 
 class AnthropicClient:
