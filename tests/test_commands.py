@@ -79,6 +79,9 @@ class RecordingUI:
 
     def set_active_session(self, session: Session | None) -> None: ...
 
+    def reload_config(self) -> str:
+        return ""
+
     def open_session_picker(
         self, metas: list[SessionMeta], current: Session | None
     ) -> bool:
@@ -319,6 +322,27 @@ def test_session_new_creates_and_activates(tmp_path: Path) -> None:
     assert ui.active is not None
     assert ui.active.conversation.messages == []
     assert any("已新建会话" in m for m in ui.messages)
+
+
+class _ReloadUI(SwitchingUI):
+    """记录 reload_config 调用的会话切换替身（B 953e：/session new 重载配置）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reload_calls = 0
+
+    def reload_config(self) -> str:
+        self.reload_calls += 1
+        return "（配置已重载：extra.max_tokens 4096 → 100000）"
+
+
+def test_session_new_reloads_config(tmp_path: Path) -> None:
+    """/session new 触发配置重载，变更提示并入系统消息（改配置不必重启进程）。"""
+    ui = _ReloadUI()
+    cmd = build_default_commands().find("session")
+    cmd.handler(_ctx_session(tmp_path, ui, args="new"))  # type: ignore[union-attr]
+    assert ui.reload_calls == 1
+    assert any("已新建会话" in m and "配置已重载" in m for m in ui.messages)
 
 
 def test_session_resume_activates_saved(tmp_path: Path) -> None:

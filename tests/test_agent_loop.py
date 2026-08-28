@@ -231,3 +231,19 @@ async def test_parser_empty_truncated_error_uses_thinking_feedback(tmp_path: Pat
     texts = [b.text for m in conv.messages for b in m.content if isinstance(b, TextBlock)]
     assert any("思考" in t for t in texts)  # empty 引导
     assert not any("拆小输出" in t for t in texts)  # 非工具参数引导
+
+
+# ---- B 953e：/session new 重载配置——set_config 换引用后 max_tokens 惰性生效 ----
+
+
+def test_set_config_reload_propagates_max_tokens(tmp_path: Path) -> None:
+    """/session new 重载配置：Agent 换 Config 引用后，payload 用新 max_tokens。
+
+    953e 实测：进程顶格旧 max_tokens=4096，写大文件 WriteFile 参数被截断、JSON
+    解析失败、任务终止。`_assemble_payload` 组装时现读 `self._config.extra`，
+    换引用即生效（不必重启进程）。
+    """
+    agent, _conv, _collected = _make_agent([_done("ok")], tmp_path)
+    assert agent._assemble_payload().max_tokens == 4096  # 默认
+    agent.set_config(Config(extra={"max_tokens": 100000}))
+    assert agent._assemble_payload().max_tokens == 100000  # 重载后惰性生效

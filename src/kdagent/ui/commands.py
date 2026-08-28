@@ -41,6 +41,9 @@ class UIController(Protocol):
     def clear_chat(self) -> None: ...
     def request_exit(self) -> None: ...
     def set_active_session(self, session: Session | None) -> None: ...
+    # 重载磁盘配置并应用（/session new：config.yaml 改完不必重启进程）。
+    # 返回变更提示（如 extra.max_tokens 4096 → 100000），无变化返回空串。
+    def reload_config(self) -> str: ...
     def set_permission_mode(self, mode: str) -> None: ...
     def get_permission_mode(self) -> str: ...
     # 11 §3.4 TUI 版：/eval report <run_id> 打开评测报告屏（Textual Screen）。
@@ -248,8 +251,11 @@ def _cmd_session(ctx: CommandContext) -> None:
             ctx.ui.add_system_message("\n".join(lines))
     elif sub == "new":
         session = mgr.create()
+        # 重载配置再切会话：改完 config.yaml /session new 即生效，不必重启进程
+        # （B 953e 实测：进程顶格旧 max_tokens=4096 致 WriteFile 参数截断任务失败）。
+        note = ctx.ui.reload_config()
         ctx.ui.set_active_session(session)
-        ctx.ui.add_system_message(f"已新建会话：{session.id}")
+        ctx.ui.add_system_message(f"已新建会话：{session.id}" + note)
     elif sub == "resume":
         if not arg:
             ctx.ui.add_system_message("/session resume <id>：恢复指定会话。")

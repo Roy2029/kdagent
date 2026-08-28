@@ -25,7 +25,7 @@ from textual.message import Message
 from textual.widgets import Header, TextArea
 from textual.worker import Worker
 
-from kdagent.config import Config
+from kdagent.config import Config, load_config
 from kdagent.context.compactor import WINDOW_SIZE, estimate_messages_tokens, estimate_tokens
 from kdagent.context.context_manager import ContextManager
 from kdagent.engine.agent import DEFAULT_SYSTEM_PROMPT, Agent
@@ -818,6 +818,23 @@ class KDApp(App[None]):
         chat = self._chat
         if chat is not None:
             chat.clear_messages()
+
+    def reload_config(self) -> str:
+        """重载磁盘配置并应用（/session new：改完 config.yaml 不必重启进程）。
+
+        2026-08-28 953e 实测：`/session new` 不重载配置，进程一直顶格旧
+        max_tokens=4096——写大文件时 WriteFile 参数被截断、JSON 解析失败、任务
+        终止。Agent 读 `self._config` 是惰性的（`extra.max_tokens` 在组装 payload
+        时读），换引用即生效。返回变更提示（无变化返回空串）。
+        """
+        fresh = load_config()
+        old_max = self._config.extra.get("max_tokens")
+        new_max = fresh.extra.get("max_tokens")
+        self._config = fresh
+        self._agent.set_config(fresh)
+        if new_max != old_max:
+            return f"（配置已重载：extra.max_tokens {old_max} → {new_max}）"
+        return ""
 
     def set_active_session(self, session: Session | None) -> None:
         """切换当前会话（/session new/resume）：换 conversation + 恢复对话/todo。"""

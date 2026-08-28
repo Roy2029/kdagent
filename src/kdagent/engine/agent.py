@@ -244,6 +244,16 @@ class Agent:
         """运行时切换 system prompt（05 /plan 模式切换用）。"""
         self._system_prompt = text
 
+    def set_config(self, config: Config) -> None:
+        """/session new 重载配置：换 Config 引用（改完 config.yaml 不必重启进程）。
+
+        Agent 读 `self._config` 是惰性的——`extra.max_tokens` 在 `_assemble_payload`
+        组装 payload 时才读（2026-08-28 953e 实测：改配置后 `/session new` 不重载，
+        进程一直顶格 4096，写大文件 WriteFile 参数被截断致任务失败）。本方法只换
+        引用不读盘，读盘在 UI 层 `reload_config`。
+        """
+        self._config = config
+
     @property
     def system_prompt(self) -> str:
         """当前 system prompt（05 状态栏/上下文窗口估算用）。"""
