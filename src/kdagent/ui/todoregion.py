@@ -12,9 +12,8 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Static
 
-from kdagent.ui._markup import escape_text
-
 from kdagent.sessions.records import TodoItemRecord
+from kdagent.ui._markup import escape_text
 
 _COMPLETED = "completed"
 

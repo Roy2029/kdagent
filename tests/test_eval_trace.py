@@ -171,3 +171,31 @@ async def test_run_to_completion_without_telemetry_no_trace(tmp_path: Path) -> N
     )
     await runner.run_to_completion(definition, "任务")
     assert load_traces(obs_dir) == []  # 无 telemetry 不落盘（默认行为不变）
+
+
+# ---- D89：span 日志（llm.call 的 prompt 内容）落盘后读回 ----
+
+
+def test_load_traces_reads_span_logs(tmp_path: Path) -> None:
+    """D89 回归：此前只读 attributes 把 logs 丢了，HTML/复核界面看不到 LLM 输入。
+
+    llm.call 的 prompt 内容（默认摘要 / log_full_prompt 开全文）在 debug 日志里，
+    读回后 spans[].logs 可被渲染消费。
+    """
+    telemetry = Telemetry(tmp_path)
+    token = telemetry.set_trace_attributes({"eval.run_id": "run-1", "eval.task_id": "task-log"})
+    try:
+        trace = telemetry.begin_trace("sess-1", "题目")
+        assert trace is not None
+        with telemetry.span("llm.call", "client", {"model": "m"}) as sp:
+            if sp is not None:
+                telemetry.add_log(sp.span_id, "debug", "[system]\n你是助手，负责评估任务", {"full": False})
+        telemetry.end_trace()
+    finally:
+        telemetry.reset_trace_attributes(token)
+    traces = load_traces(tmp_path, run_id="run-1", task_id="task-log")
+    assert len(traces) == 1
+    llm = [s for s in traces[0].spans if s.name == "llm.call"]
+    assert len(llm) == 1
+    assert llm[0].logs and llm[0].logs[0].message == "[system]\n你是助手，负责评估任务"
+    assert llm[0].logs[0].level == "debug"

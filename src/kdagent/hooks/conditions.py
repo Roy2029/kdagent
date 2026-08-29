@@ -115,6 +115,8 @@ def expand_variables(text: str, ctx: HookContext) -> str:
             return ctx.message
         if name == "ERROR":
             return ctx.error
+        if name == "PAYLOAD_PATH":
+            return ctx.payload_path
         if name.startswith("TOOL_ARGS."):
             key = name[len("TOOL_ARGS.") :]
             value = ctx.tool_args.get(key)

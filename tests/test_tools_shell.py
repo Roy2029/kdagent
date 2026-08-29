@@ -95,7 +95,7 @@ def test_wsl_diagnosis_non_rm_skipped() -> None:
 
 def test_decode_output_utf8() -> None:
     """普通 UTF-8 文本原样。"""
-    assert shell_mod._decode_output("你好 hello".encode("utf-8")) == "你好 hello"
+    assert shell_mod._decode_output("你好 hello".encode()) == "你好 hello"
 
 
 def test_decode_output_utf16le_with_bom() -> None:

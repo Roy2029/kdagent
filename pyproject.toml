@@ -42,6 +42,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["E501"]  # 测试 SSE 数据行结构性长
+"src/kdagent/eval/trace_html.py" = ["E501"]  # HTML/CSS 模板行结构性长，拆分破坏可读性
 
 [tool.mypy]
 python_version = "3.11"

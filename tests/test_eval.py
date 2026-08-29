@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from kdagent.eval import (
     seal_copy,
 )
 from kdagent.eval.cli import load_tasks_file
+from kdagent.eval.runner import _force_rmtree
 from kdagent.subagent import BUILTIN_AGENTS_DIR
 from kdagent.subagent.manager import AgentManager
 from kdagent.subagent.runner import SubAgentRunner
@@ -76,6 +78,19 @@ def test_seal_copy_origin_isolation(repo: Path) -> None:
     dest = repo.parent / "sealed"
     seal_copy(repo, _base_commit(repo), dest)
     assert _git(dest, "remote", "-v").strip() == ""  # 无 remote，无上游痕迹
+
+
+def test_force_rmtree_removes_readonly_files(tmp_path: Path) -> None:
+    """Windows 只读文件（git objects 同款属性）普通 rmtree 删不掉 → _force_rmtree 先 chmod 再删。"""
+    target = tmp_path / "readonly"
+    sub = target / "sub"
+    sub.mkdir(parents=True)
+    ro = sub / "ro.txt"
+    ro.write_text("x", encoding="utf-8")
+    os.chmod(ro, stat.S_IREAD)  # 只读属性，等同 git init 后的 objects
+    assert ro.exists()
+    _force_rmtree(target)
+    assert not target.exists()
 
 
 # ---- 补丁提取 ----

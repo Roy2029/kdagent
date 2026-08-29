@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from kdagent.obs.log import make_rules, redact, redact_dict, snapshot
+from kdagent.engine.llm.base import Payload
+from kdagent.engine.messages import Message as EngineMessage
+from kdagent.engine.messages import TextBlock, ToolResultBlock
+from kdagent.obs.log import incremental_payload_text, make_rules, redact, redact_dict, snapshot
+
+
+def _payload(*blocks: tuple[str, object]) -> Payload:
+    """(role, block) → Payload（一条消息一个 block）。"""
+    return Payload(
+        system="SYS", messages=[EngineMessage(role=role, content=[block]) for role, block in blocks]
+    )
 
 
 def test_snapshot_short_text_unchanged() -> None:
@@ -43,3 +53,45 @@ def test_redact_dict_strings_only() -> None:
 def test_redact_dict_no_rules_returns_same_object() -> None:
     d = {"a": "b"}
     assert redact_dict(d, []) is d
+
+
+# ---- D90：增量 prompt 日志（每轮 llm.call 只记新增消息） ----
+
+
+def test_incremental_first_turn_has_system_snapshot_and_all_messages() -> None:
+    p = _payload(("user", TextBlock("题目A")), ("assistant", TextBlock("回复B")))
+    text = incremental_payload_text(p, 0)
+    assert text.startswith("[system]\nSYS")
+    assert "[user]\n题目A" in text
+    assert "[assistant]\n回复B" in text
+
+
+def test_incremental_second_turn_only_delta() -> None:
+    p = _payload(
+        ("user", TextBlock("题目A")),
+        ("assistant", TextBlock("回复B")),
+        ("user", TextBlock("题目C")),
+    )
+    text = incremental_payload_text(p, 2)  # 前两条已记录 → 只出新增
+    assert "[system]" not in text
+    assert "题目A" not in text and "回复B" not in text
+    assert "[user]\n题目C" in text
+
+
+def test_incremental_tool_result_rendered() -> None:
+    p = _payload(("user", ToolResultBlock(tool_use_id="t1", content="工具输出")))
+    text = incremental_payload_text(p, 0)
+    assert "[user:tool_result:t1]\n工具输出" in text
+
+
+def test_incremental_long_block_truncated() -> None:
+    p = _payload(("user", ToolResultBlock(tool_use_id="t1", content="x" * 20000)))
+    text = incremental_payload_text(p, 0)
+    assert "已截断" in text
+    assert len(text) < 20000
+
+
+def test_incremental_no_system_when_include_false() -> None:
+    p = _payload(("user", TextBlock("A")))
+    text = incremental_payload_text(p, 0, include_system=False)
+    assert "[system]" not in text

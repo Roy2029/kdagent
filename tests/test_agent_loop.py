@@ -190,7 +190,7 @@ async def test_provider_error_terminates_with_error_event(tmp_path: Path) -> Non
 def _truncated_empty() -> list[LLMStreamEvent]:
     """只含 usage+stop、无文本无工具、输出打满 max_tokens 的空回复流。"""
     return [
-        LLMStreamEvent(type="usage", usage=Usage(input_tokens=100, output_tokens=4096)),
+        LLMStreamEvent(type="usage", usage=Usage(input_tokens=100, output_tokens=100000)),
         LLMStreamEvent(type="stop", stop_reason="length"),
     ]
 
@@ -244,6 +244,6 @@ def test_set_config_reload_propagates_max_tokens(tmp_path: Path) -> None:
     换引用即生效（不必重启进程）。
     """
     agent, _conv, _collected = _make_agent([_done("ok")], tmp_path)
-    assert agent._assemble_payload().max_tokens == 4096  # 默认
+    assert agent._assemble_payload().max_tokens == 100000  # 默认
     agent.set_config(Config(extra={"max_tokens": 100000}))
     assert agent._assemble_payload().max_tokens == 100000  # 重载后惰性生效

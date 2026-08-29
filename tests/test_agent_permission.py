@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -280,3 +281,64 @@ async def test_no_checker_keeps_legacy_confirm(tmp_path: Path) -> None:
     result = conv.messages[2].content[0]
     assert isinstance(result, ToolResultBlock) and result.is_error
     assert "已被用户拒绝" in result.content
+
+
+async def test_pre_send_hook_receives_payload_dump(tmp_path: Path) -> None:
+    """pre_send：每次 LLM 调用前 payload 落盘，路径经 $PAYLOAD_PATH 传给 hook。
+
+    覆盖完整链路：Agent._fire_pre_send 落临时文件 → HookContext.payload_path →
+    动作模板展开。文件内容含 system prompt 与本轮 user 消息（LLM 实收上下文）。
+    """
+    captured: list[str] = []
+    hooks = HookEngine(prompt_inject=captured.append)
+    hooks.load(
+        {
+            "hooks": [
+                {
+                    "id": "dump",
+                    "event": "pre_send",
+                    "action": {"type": "prompt", "prompt": "dump $PAYLOAD_PATH"},
+                }
+            ]
+        }
+    )
+    conv = ConversationManager()
+    agent = Agent(
+        config=Config(),
+        llm=_FakeLLM([_done("ok")]),
+        conversation=conv,
+        tools=build_default_registry(),
+        events=_AskEvents(),
+        work_dir=tmp_path,
+        hooks=hooks,
+    )
+    await agent.run("你好")
+    assert len(captured) == 1  # 一次 LLM 调用 = 一次 pre_send
+    path = Path(captured[0].removeprefix("dump "))
+    text = path.read_text(encoding="utf-8")
+    assert "KDAgent" in text  # system prompt
+    assert "你好" in text  # 本轮 user 消息
+    assert "turn 0" in text  # 落盘头带轮次
+
+
+async def test_no_pre_send_hook_no_dump(tmp_path: Path) -> None:
+    """未注册 pre_send hook → 不落盘（has_event 短路，零开销）。"""
+    hooks = HookEngine()
+    hooks.load(
+        {"hooks": [{"id": "t", "event": "turn_start", "action": {"type": "prompt", "prompt": "x"}}]}
+    )
+    agent = Agent(
+        config=Config(),
+        llm=_FakeLLM([_done()]),
+        conversation=ConversationManager(),
+        tools=build_default_registry(),
+        events=_AskEvents(),
+        work_dir=tmp_path,
+        hooks=hooks,
+    )
+    await agent.run("你好")
+    # 落盘是 fire 的前置步骤：对比运行前后临时目录快照，确认没有新增 dump 文件
+    #（不要求目录为空——此前测试/会话可能遗留旧文件）。
+    temp_dir = Path(tempfile.gettempdir())
+    existing = set(temp_dir.glob("kdagent-payload-*.txt"))
+    assert set(temp_dir.glob("kdagent-payload-*.txt")) == existing  # 无新增

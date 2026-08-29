@@ -16,6 +16,7 @@ import difflib
 import io
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -66,6 +67,19 @@ def _git(repo: Path, *args: str, check: bool = True) -> str:
     if check and proc.returncode != 0:
         raise EvalError(f"git {args[0]} 失败：{proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout
+
+
+def _force_rmtree(path: Path) -> None:
+    """Windows 兼容强制删除：git init 后 `.git/objects` 设只读位，`shutil.rmtree`
+    默认抛 PermissionError——重跑批时旧封史副本删不掉。onerror 里 chmod 去只读再重试。"""
+    if not path.exists():
+        return
+    shutil.rmtree(path, onerror=_force_rmtree_onerror)
+
+
+def _force_rmtree_onerror(func: Callable[[str], object], p: str, _exc: object) -> None:
+    os.chmod(p, stat.S_IWRITE)  # 去只读位
+    func(p)
 
 
 def seal_copy(source_repo: Path, base_commit: str, dest: Path) -> Path:
@@ -300,7 +314,7 @@ class EvalRunner:
     async def _run_task(self, report: EvalReport, task: EvalTask) -> None:
         work = self._work_dir / task.instance_id
         if work.exists():
-            shutil.rmtree(work)
+            _force_rmtree(work)  # D90：git objects 只读位，Windows 需强制删
         sealed = seal_copy(self._source_repo, task.base_commit, work)
         prompt = self._build_prompt(task)
         # 07 §3.8 eval 标记：contextvar 隔离（D60）——并发跑批各自 set 互不覆盖，

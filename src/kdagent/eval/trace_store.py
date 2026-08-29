@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from kdagent.obs.model import Span, Trace
+from kdagent.obs.model import Span, SpanLog, Trace
 
 _EVAL_RUN_KEY = "eval.run_id"
 _EVAL_TASK_KEY = "eval.task_id"
@@ -122,6 +122,17 @@ def _load_one(path: Path) -> Trace | None:
                     end_ts=int(row.get("end_ts", 0)),
                     duration_ms=int(row.get("duration_ms", 0)),
                     attributes=dict(row.get("attributes") or {}),
+                    # D89：logs 一并读回（llm.call span 的 prompt 摘要/全文在这里——
+                    # 此前只读 attributes 把 logs 丢了，HTML/复核界面看不到 LLM 输入）。
+                    logs=[
+                        SpanLog(
+                            level=str(log.get("level", "info")),
+                            message=str(log.get("message", "")),
+                            ts=int(log.get("ts", 0)),
+                            attributes=dict(log.get("attributes") or {}),
+                        )
+                        for log in (row.get("logs") or [])
+                    ],
                 )
             )
     return trace

@@ -43,7 +43,7 @@ class ProviderConfig:
     model: str
     base_url: str | None = None
     api_key: str = ""  # 从环境变量读取，不进代码
-    max_tokens: int = 4096
+    max_tokens: int = 100_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +72,7 @@ class Payload:
     system: str
     messages: list[Message]
     tools: list[ToolSchema] = field(default_factory=list)
-    max_tokens: int = 4096
+    max_tokens: int = 100_000
 
 
 @dataclass(slots=True)

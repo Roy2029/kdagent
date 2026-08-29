@@ -61,13 +61,20 @@ class Config:
         return int(v) if isinstance(v, (int, float)) else 120_000
 
 
-def load_config() -> Config:
-    """三源合并加载（用户级 → 项目级 → 本地级，后源覆盖前源）。"""
+def load_config(project_dir: Path | None = None) -> Config:
+    """三源合并加载（用户级 → 项目级 → 本地级，后源覆盖前源）。
+
+    project_dir：项目根，优先于 `Path.cwd()`。KDAgent 用 `-d` 指定 work_dir
+    启动时配置必须从 work_dir 加载，否则读的是进程 cwd 的配置——`uv run
+    kdagent -d X` 从项目目录启动会忽略 X 的 config（D98 实测 2026-08-28：
+    kdagent-demo 的 `extra.max_tokens: 100000` 从未生效，进程一直顶格 4096）。
+    """
+    root = (project_dir or Path.cwd()).resolve()
     data: dict[str, Any] = {}
     for path in (
         Path.home() / ".kdagent" / "config.yaml",
-        Path.cwd() / ".kdagent" / "config.yaml",
-        Path.cwd() / ".kdagent" / "config.local.yaml",
+        root / ".kdagent" / "config.yaml",
+        root / ".kdagent" / "config.local.yaml",
     ):
         data = _deep_merge(data, _load_yaml_dict(path))
 

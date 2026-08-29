@@ -13,9 +13,10 @@ import re
 from typing import Any
 
 from kdagent.engine.llm.base import Payload
-from kdagent.engine.messages import TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock
+from kdagent.engine.messages import Message, TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock
 
 SNAPSHOT_LIMIT = 300  # prompt 摘要默认：首尾各半，超限截断
+INCREMENT_BLOCK_CAP = 8000  # 增量日志单条 block 上限（防单轮 tool 输出爆炸）
 
 
 def payload_text(payload: Payload) -> str:
@@ -23,17 +24,50 @@ def payload_text(payload: Payload) -> str:
     parts = [f"[system]\n{payload.system}"]
     for msg in payload.messages:
         for block in msg.content:
-            if isinstance(block, TextBlock):
-                parts.append(f"[{msg.role}]\n{block.text}")
-            elif isinstance(block, ThinkingBlock):
-                parts.append(f"[{msg.role}:thinking]\n{block.thinking}")
-            elif isinstance(block, ToolUseBlock):
-                parts.append(
-                    f"[{msg.role}:tool_use:{block.name}]\n"
-                    f"{json.dumps(block.input, ensure_ascii=False)}"
-                )
-            elif isinstance(block, ToolResultBlock):
-                parts.append(f"[{msg.role}:tool_result:{block.tool_use_id}]\n{block.content}")
+            part = _block_text(msg, block)
+            if part:
+                parts.append(part)
+    return "\n\n".join(parts)
+
+
+def _block_text(msg: Message, block: object) -> str:
+    """单消息块 → 纯文本（role 标记 + 内容），超长截断（INCREMENT_BLOCK_CAP）。"""
+    if isinstance(block, TextBlock):
+        head, body = f"[{msg.role}]\n", block.text
+    elif isinstance(block, ThinkingBlock):
+        head, body = f"[{msg.role}:thinking]\n", block.thinking
+    elif isinstance(block, ToolUseBlock):
+        head, body = (
+            f"[{msg.role}:tool_use:{block.name}]\n",
+            json.dumps(block.input, ensure_ascii=False),
+        )
+    elif isinstance(block, ToolResultBlock):
+        head, body = f"[{msg.role}:tool_result:{block.tool_use_id}]\n", block.content
+    else:
+        return ""
+    if len(body) > INCREMENT_BLOCK_CAP:
+        body = body[:INCREMENT_BLOCK_CAP] + f"\n…[已截断，超出 {INCREMENT_BLOCK_CAP} 字符]…"
+    return head + body
+
+
+def incremental_payload_text(
+    payload: Payload, offset: int, *, include_system: bool = True
+) -> str:
+    """本轮**新增**消息（messages[offset:]）纯文本（D90 增量日志）。
+
+    每轮 llm.call 只记「相对上一轮新加了什么」（用户输入/工具结果/助手回复/反馈），
+    不再每轮记全量上下文再摘要成「共 N 字符，仅摘要」。首轮 offset=0 时
+    `include_system` 把 system 以摘要形式带头（system 静态且常大，看一次即可）；
+    每条 block 截断上限（INCREMENT_BLOCK_CAP），整体不摘要——增量通常小、正文可读。
+    """
+    parts: list[str] = []
+    if include_system and offset == 0:
+        parts.append(f"[system]\n{snapshot(payload.system) if payload.system else ''}")
+    for msg in payload.messages[offset:]:
+        for block in msg.content:
+            part = _block_text(msg, block)
+            if part:
+                parts.append(part)
     return "\n\n".join(parts)
 
 

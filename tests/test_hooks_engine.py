@@ -148,3 +148,63 @@ def test_load_file_missing_is_empty(tmp_path: Path) -> None:
     eng = HookEngine()
     eng.load_file(tmp_path / "nope.yaml")
     assert eng.hooks == []
+
+
+def test_has_event() -> None:
+    eng = HookEngine()
+    eng.load(
+        _hooks_yaml(
+            [
+                {"id": "a", "event": "pre_send", "action": {"type": "prompt", "prompt": "x"}},
+                {"id": "b", "event": "turn_end", "action": {"type": "prompt", "prompt": "y"}},
+            ]
+        )
+    )
+    assert eng.has_event("pre_send") is True
+    assert eng.has_event("turn_end") is True
+    assert eng.has_event("turn_start") is False
+
+
+def test_pre_send_payload_var_command(tmp_path: Path) -> None:
+    """pre_send 事件合法；command 动作里 $PAYLOAD_PATH 展开为落盘文件路径。"""
+    src = tmp_path / "p.txt"
+    src.write_text("CTX", encoding="utf-8")
+    out = tmp_path / "out.log"
+    eng = HookEngine()
+    eng.load(
+        _hooks_yaml(
+            [
+                {
+                    "id": "dump",
+                    "event": "pre_send",
+                    "action": {
+                        "type": "command",
+                        "command": f'type "$PAYLOAD_PATH" >> {out.as_posix()}',
+                    },
+                }
+            ]
+        )
+    )
+    eng.run("pre_send", HookContext(event="pre_send", payload_path=str(src)))
+    assert "CTX" in out.read_text(encoding="utf-8")
+
+
+def test_pre_send_payload_var_prompt(tmp_path: Path) -> None:
+    """prompt 动作同样能展开 $PAYLOAD_PATH（注入的消息带落盘路径）。"""
+    injected: list[str] = []
+    eng = HookEngine(prompt_inject=injected.append)
+    eng.load(
+        _hooks_yaml(
+            [
+                {
+                    "id": "d",
+                    "event": "pre_send",
+                    "action": {"type": "prompt", "prompt": "dump $PAYLOAD_PATH"},
+                }
+            ]
+        )
+    )
+    payload_file = tmp_path / "p.txt"
+    payload_file.write_text("CTX", encoding="utf-8")
+    eng.run("pre_send", HookContext(event="pre_send", payload_path=str(payload_file)))
+    assert injected == [f"dump {payload_file}"]

@@ -76,7 +76,7 @@ from kdagent.memory.consolidator import MemoryConsolidator
 from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.prompt import MEMORY_USAGE_INSTRUCTION
 from kdagent.memory.store import MemoryStore
-from kdagent.obs.log import payload_text, snapshot
+from kdagent.obs.log import incremental_payload_text, payload_text
 from kdagent.obs.model import Span
 from kdagent.obs.telemetry import Telemetry
 from kdagent.permission.checker import PermissionChecker
@@ -229,6 +229,8 @@ class Agent:
         self._usage: Usage | None = None
         self._consecutive_failures = 0
         self._turn = 0
+        # D90 增量 prompt 日志：上一轮已记录的消息数（llm.call span 只记新增段）。
+        self._payload_msg_offset = 0
         self._pending_text: list[str] = []
         self._pending_tool_uses: list[ToolUseBlock] = []
         # 12 §3.3 双层检查点（M5 遗留第二块）：todo 前后快照 + 行为观察冷却计数。
@@ -547,11 +549,17 @@ class Agent:
                 # D98 埋点：记录本次请求配置的 max_tokens——与 usage.output_tokens 对照，
                 # 一眼可辨「配置未生效」vs「输出真的撞上限」（配合 llm.call span 落盘）。
                 llm_span.attributes["max_tokens"] = payload.max_tokens
-                text = payload_text(payload)
+                # D90：默认记**本轮增量**（新增消息，正文可读）；log_full_prompt 才每轮全量。
+                text = (
+                    payload_text(payload)
+                    if log_full
+                    else incremental_payload_text(payload, self._payload_msg_offset)
+                )
+                self._payload_msg_offset = len(payload.messages)
                 telemetry.add_log(
                     llm_span.span_id,
                     "debug",
-                    text if log_full else snapshot(text),
+                    text,
                     {"full": log_full},
                 )
             try:
@@ -683,7 +691,7 @@ class Agent:
     def _assemble_payload(self) -> Payload:
         max_tokens = self._config.extra.get("max_tokens")
         if not isinstance(max_tokens, int):
-            max_tokens = 4096
+            max_tokens = 100_000  # 全局默认（用户拍板：长任务不受 4k 截断）
         # 08 §3.3 静默读：记忆索引随 CLAUDE.md 走同一管线注入（索引是动态增长的——
         # build 时注入会过期，payload 组装时现取）。索引用 `<system-reminder>` 醒目注入
         # （与 09 §3.5 延迟工具/§3.9 Skill 同机制：改 reminder 不改 system → 前缀缓存

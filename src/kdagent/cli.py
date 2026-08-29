@@ -121,9 +121,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_kdapp(work_dir: Path | None = None) -> KDApp:
-    """组装真实依赖：DeepSeek（OpenAI 兼容 adapter）+ 7 工具 + 会话目录 + 07 obs。"""
-    config = load_config()
+    """组装真实依赖：DeepSeek（OpenAI 兼容 adapter）+ 7 工具 + 会话目录 + 07 obs。
+
+    config 从 work_dir 加载（D98：`-d` 指定 work_dir 时配置必须跟 work_dir 走，
+    而不是进程 cwd——否则 `uv run kdagent -d X` 从项目目录启动读到开发项目的
+    config，X 的 config 完全被忽略）。
+    """
     work_dir = (work_dir or Path.cwd()).resolve()
+    config = load_config(work_dir)
     api_key = load_api_key()
     model = config.model or "deepseek-v4-flash"
     if api_key:

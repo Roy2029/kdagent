@@ -20,6 +20,9 @@ class HookContext:
     file_path: str = ""
     message: str = ""
     error: str = ""
+    # pre_send 专用：本次 LLM 调用完整上下文的落盘文件路径（$PAYLOAD_PATH 展开）。
+    # 内容超长，不走命令行参数/环境变量（Windows 命令行长度上限）。
+    payload_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -827,7 +827,7 @@ class KDApp(App[None]):
         终止。Agent 读 `self._config` 是惰性的（`extra.max_tokens` 在组装 payload
         时读），换引用即生效。返回变更提示（无变化返回空串）。
         """
-        fresh = load_config()
+        fresh = load_config(self._work_dir)  # D98：与 build_kdapp 同根，work_dir 而非 cwd
         old_max = self._config.extra.get("max_tokens")
         new_max = fresh.extra.get("max_tokens")
         self._config = fresh
