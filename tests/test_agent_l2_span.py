@@ -12,8 +12,9 @@ from pathlib import Path
 
 from conftest import FakeLLM
 
-from kdagent.context.compactor import L2Compressor
+from kdagent.context.compactor import CostParams, L2Compressor
 from kdagent.context.context_manager import ContextManager
+from kdagent.context.tool_result_handler import ToolResultHandler
 from kdagent.engine.llm.base import LLMStreamEvent, Usage
 from kdagent.obs.telemetry import Telemetry
 from kdagent.tools.base import ToolResult
@@ -94,6 +95,86 @@ async def test_context_manager_passes_telemetry_to_l2(tmp_path: Path) -> None:
     assert out.compressed is not None
     rows = _trace_rows(obs_dir)
     assert any(
+        r.get("name") == "context.l2_compress"
+        for r in rows
+        if r.get("_type") == "span"
+    )
+
+
+def _low_density_log() -> ToolResult:
+    """低密度日志：35.2K 字符 → 8.8K token（在 L2 窗口内，log 类型）。"""
+    return ToolResult(
+        tool_use_id="r2", name="Bash", content="[ERROR] worker-3: timeout connecting to db\n" * 800
+    )
+
+
+async def test_l2_decide_emits_span_with_econ_attrs(tmp_path: Path) -> None:
+    """判定点落 context.l2_decide span：reason/密度/类型 + 经济性中间量齐全（07 T8）。"""
+    obs_dir = tmp_path / "obs"
+    telemetry = Telemetry(obs_dir)
+    llm = _summarize_llm()  # decide 不耗响应；compress 消费 1 批
+    l2 = L2Compressor(
+        llm,
+        persist_dir=tmp_path / "persist",
+        telemetry=telemetry,
+        cost=CostParams(c_in=1.0, c_out=1.0, c_hit=0.1),
+    )
+    handler = ToolResultHandler(tmp_path, l2=l2)
+    telemetry.begin_trace("s-l2d", "l2 decide span test")
+    try:
+        await handler.handle_single(_low_density_log(), p_tokens=50_000)
+    finally:
+        telemetry.end_trace()
+
+    rows = _trace_rows(obs_dir)
+    decide = [
+        r for r in rows if r.get("_type") == "span" and r["name"] == "context.l2_decide"
+    ]
+    assert len(decide) == 1
+    attrs = decide[0]["attributes"]
+    assert attrs["tool_use_id"] == "r2"
+    assert attrs["tool"] == "Bash"
+    assert attrs["reason"] == "compress"
+    assert attrs["info_density"] == "LOW"
+    assert attrs["original_type"] == "log"
+    assert attrs["x_tokens"] > 0
+    assert attrs["break_even_n"] > 0  # 经济性中间量
+    assert attrs["expected_n"] > 0
+    # 判定 accepted → 触发压缩，l2_compress span 也落
+    assert any(
+        r.get("name") == "context.l2_compress"
+        for r in rows
+        if r.get("_type") == "span"
+    )
+
+
+async def test_l2_decide_emits_econ_fail_span(tmp_path: Path) -> None:
+    """经济性不通过（expected ≤ break_even）→ reason=econ_fail，仍落 span。"""
+    obs_dir = tmp_path / "obs"
+    telemetry = Telemetry(obs_dir)
+    l2 = L2Compressor(
+        FakeLLM([]),  # decide 不消费响应；econ_fail 不触发 compress
+        persist_dir=tmp_path / "persist",
+        telemetry=telemetry,
+        cost=CostParams(c_in=1.0, c_out=1.0, c_hit=0.1),
+    )
+    handler = ToolResultHandler(tmp_path, l2=l2)
+    telemetry.begin_trace("s-econ", "l2 econ_fail test")
+    try:
+        # P 接近窗口顶（195K/200K）→ expected≈2 < break_even≈42 → econ_fail
+        await handler.handle_single(_low_density_log(), p_tokens=195_000)
+    finally:
+        telemetry.end_trace()
+
+    rows = _trace_rows(obs_dir)
+    decide = [
+        r for r in rows if r.get("_type") == "span" and r["name"] == "context.l2_decide"
+    ]
+    assert len(decide) == 1
+    assert decide[0]["attributes"]["reason"] == "econ_fail"
+    assert decide[0]["attributes"]["break_even_n"] >= decide[0]["attributes"]["expected_n"]
+    # 未触发压缩 → 无 l2_compress span、无 LLM 调用
+    assert not any(
         r.get("name") == "context.l2_compress"
         for r in rows
         if r.get("_type") == "span"

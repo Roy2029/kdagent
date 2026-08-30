@@ -897,6 +897,11 @@ class Agent:
                 tool_span.attributes["duration_ms"] = result.duration_ms
                 # 11 §3.4 复核「阅读」返回：output 进 span（截断），供 span_detail 逐事件挑出
                 tool_span.attributes["output"] = result.content[: _TRACE_OUTPUT_CAP]
+                # 01 §9.2 T8：X 分布标定数据源——原始长度/估算 token/tool_use_id
+                # （output 已截断，output_chars/output_tokens 记完整原始大小）
+                tool_span.attributes["output_chars"] = len(result.content)
+                tool_span.attributes["output_tokens"] = estimate_tokens(result.content)
+                tool_span.attributes["tool_use_id"] = tool_use.id
                 if result.is_error:
                     tool_span.status = "error"
         if self._hooks is not None:

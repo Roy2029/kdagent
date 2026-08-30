@@ -8,6 +8,7 @@ from pathlib import Path
 from conftest import FakeLLM, done
 
 from kdagent.config import Config
+from kdagent.context.compactor import estimate_tokens
 from kdagent.engine.agent import Agent
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMStreamEvent, Usage
@@ -93,6 +94,13 @@ async def test_agent_run_produces_complete_trace(tmp_path: Path) -> None:
     tool_row = next(s for s in spans if s["name"] == "tool.exec")
     assert tool_row["attributes"]["tool"] == "ReadFile"
     assert tool_row["attributes"]["is_error"] is False
+    assert tool_row["attributes"]["tool_use_id"] == "t1"  # 01 T8：X 分布数据源
+    # ReadFile 输出带行号前缀（"1\thello\n" = 8 字符）；output_chars 记完整原始大小，
+    # 与未截断的 output 一致（内容 < _TRACE_OUTPUT_CAP）
+    assert tool_row["attributes"]["output_chars"] == len(tool_row["attributes"]["output"])
+    assert tool_row["attributes"]["output_tokens"] == estimate_tokens(
+        tool_row["attributes"]["output"]
+    )
     assert tool_row["parent_span_id"] == root["span_id"]  # 父是 trace.run
 
 

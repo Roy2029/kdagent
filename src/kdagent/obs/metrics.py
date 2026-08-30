@@ -14,7 +14,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kdagent.context.compactor import estimate_token_cost
+from kdagent.context.compactor import cost_params_from_table, estimate_token_cost
 
 
 @dataclass(slots=True)
@@ -48,6 +48,9 @@ class SessionMetrics:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # 01 T5-1（D104）：按模型分桶 token（model → [in, out, cache]），
+    # 成本收尾逐桶查内置计价表求和——/metrics 与标定报告不再用统一 DEFAULT 价。
+    tokens_by_model: dict[str, list[int]] = field(default_factory=dict)
     llm_calls: int = 0
     llm_errors: int = 0
     llm_total_ms: int = 0
@@ -104,13 +107,20 @@ def _accumulate(sm: SessionMetrics, span: dict[str, object]) -> None:
         sm.llm_calls += 1
         if span.get("status") == "error":
             sm.llm_errors += 1
-        sm.input_tokens += _int_attr(attrs, "input_tokens")
-        sm.output_tokens += _int_attr(attrs, "output_tokens")
-        sm.cache_read_tokens += _int_attr(attrs, "cache_read_tokens")
+        it = _int_attr(attrs, "input_tokens")
+        ot = _int_attr(attrs, "output_tokens")
+        cr = _int_attr(attrs, "cache_read_tokens")
+        sm.input_tokens += it
+        sm.output_tokens += ot
+        sm.cache_read_tokens += cr
         sm.cache_creation_tokens += _int_attr(attrs, "cache_creation_tokens")
         model = attrs.get("model")
         if isinstance(model, str) and model:
             sm.providers.add(model)
+            bucket = sm.tokens_by_model.setdefault(model, [0, 0, 0])
+            bucket[0] += it
+            bucket[1] += ot
+            bucket[2] += cr
         sm.llm_total_ms += ms
         sm.llm_latencies_ms.append(ms)
     elif name == "tool.exec":
@@ -157,9 +167,19 @@ def aggregate_metrics(obs_dir: Path) -> list[SessionMetrics]:
                 if span.get("_type") == "span":
                     _accumulate(sm, span)
     for sm in buckets.values():
-        sm.cost_cny = estimate_token_cost(
-            sm.input_tokens, sm.output_tokens, sm.cache_read_tokens
-        )
+        if sm.tokens_by_model:
+            # D104：按模型分桶查内置计价表求和（未知模型回退 DEFAULT_COST）
+            sm.cost_cny = sum(
+                estimate_token_cost(
+                    bucket[0], bucket[1], bucket[2],
+                    cost=cost_params_from_table({}, model=model),
+                )
+                for model, bucket in sm.tokens_by_model.items()
+            )
+        else:
+            sm.cost_cny = estimate_token_cost(
+                sm.input_tokens, sm.output_tokens, sm.cache_read_tokens
+            )
     return list(buckets.values())
 
 

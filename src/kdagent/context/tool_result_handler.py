@@ -67,11 +67,13 @@ class ToolResultHandler:
             persisted = self._persist(result.tool_use_id, result.content)
             return ProcessedToolResult(content=_preview_text(persisted), persisted=persisted)
         l2 = self._l2
-        if l2 is not None and l2.should_online_compress(result, p_tokens):
-            try:
-                return await l2.compress(result, prefix)
-            except Exception:
-                return ProcessedToolResult(content=result.content)  # 摘要失败回退原文
+        if l2 is not None:
+            decision = l2.decide(result, p_tokens)  # 07 T8：判定点落 context.l2_decide span
+            if decision.accepted:
+                try:
+                    return await l2.compress(result, prefix)
+                except Exception:
+                    return ProcessedToolResult(content=result.content)  # 摘要失败回退原文
         return ProcessedToolResult(content=result.content)
 
     async def handle_batch(

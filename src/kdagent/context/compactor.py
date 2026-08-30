@@ -103,20 +103,35 @@ class CostParams:
 
 DEFAULT_COST = CostParams()
 
+# 01 T5-1 内置计价表（元/百万 token，D104）：模型名 → CostParams
+# (c_in=输入缓存未命中、c_out=输出、c_hit=缓存命中)。config `cost:` 段可覆盖，
+# 未配回退内置，再退 DEFAULT_COST——零配置也能让 L2 经济性判定与成本估算用真实价目。
+PROVIDER_COST_TABLE: dict[str, CostParams] = {
+    "deepseek-v4-flash": CostParams(c_in=1.5, c_out=4.5, c_hit=0.05),
+    "deepseek-v4-pro": CostParams(c_in=4.5, c_out=13.5, c_hit=0.15),
+    "glm-5.3-flash": CostParams(c_in=0.8, c_out=2.8, c_hit=0.23),
+}
+
 
 def cost_params_from_table(
-    table: dict[str, object], provider: str = ""
+    table: dict[str, object], provider: str = "", model: str = ""
 ) -> CostParams:
-    """按 provider 从配置计价表取 CostParams（01 T5-1 机制部分，D83）。
+    """按 model/provider 从配置计价表取 CostParams（01 T5-1，D83 机制 + D104 内置）。
 
-    `cost:` 配置段两种形态：按 provider 嵌套 `{deepseek: {c_in..}}`（多 provider
-    各自价目）或单一价目 `{c_in, c_out, c_hit}`（作用于当前 provider）。provider
-    精确匹配优先，查不到回退 DEFAULT_COST（多 provider 未配不猜）。数值仍待实测
-    标定（T5-1，M2 收尾时校准）；非法值容错回退，零配置可用。
+    `cost:` 配置段形态：按 model 嵌套 `{deepseek-v4-flash: {c_in..}}`、按 provider
+    嵌套 `{deepseek: {c_in..}}` 或单一价目 `{c_in, c_out, c_hit}`。查找优先级：
+    config（model 精确 → provider 精确 → 单一价目）→ 内置 `PROVIDER_COST_TABLE`
+    （键取 model，无 model 取 provider）→ DEFAULT_COST。非法值容错回退，零配置可用。
+    旧签名（仅 provider）行为不变：`"deepseek"` 等 provider 名不在内置表键内仍回退默认。
     """
     entry: object = table
-    if provider and provider in table and isinstance(table[provider], dict):
-        entry = table[provider]
+    if isinstance(table, dict):
+        if model and model in table and isinstance(table[model], dict):
+            entry = table[model]
+        elif provider and provider in table and isinstance(table[provider], dict):
+            entry = table[provider]
+        elif "c_in" in table or "c_out" in table or "c_hit" in table:
+            entry = table  # 单一价目
     if isinstance(entry, dict) and (
         "c_in" in entry or "c_out" in entry or "c_hit" in entry
     ):
@@ -128,6 +143,9 @@ def cost_params_from_table(
             )
         except (TypeError, ValueError):
             return DEFAULT_COST
+    builtin = PROVIDER_COST_TABLE.get(model or provider)
+    if builtin is not None:
+        return builtin
     return DEFAULT_COST
 
 
@@ -253,7 +271,25 @@ def estimate_remaining_turns(
     return max(1, budget // max(1, avg_growth_per_turn))
 
 
-def should_online_compress(
+@dataclass(slots=True)
+class L2Decision:
+    """L2 判定结果（01 §5.3；供 `context.l2_decide` span 埋点与 T8 标定报告）。
+
+    `reason` 取值：compress / size_too_small / size_too_big / high_density / econ_fail。
+    经济性评估到该步时 `s_tokens_estimate`/`break_even_n`/`expected_n` 非空。
+    """
+
+    accepted: bool
+    reason: str
+    x_tokens: int
+    info_density: str
+    original_type: str
+    s_tokens_estimate: int | None = None
+    break_even_n: float | None = None
+    expected_n: int | None = None
+
+
+def evaluate_l2_decision(
     result: ToolResult,
     p_tokens: int,
     *,
@@ -265,32 +301,57 @@ def should_online_compress(
     save_threshold_tokens: int = TOOL_RESULT_SAVE_THRESHOLD_TOKENS,
     expected_ratio: dict[str, float] | None = None,
     compress_instruction_tokens: int = COMPRESS_INSTRUCTION_TOKENS,
-) -> bool:
-    """L2 三门槛决策（01 §5.3 决策函数）。
+) -> L2Decision:
+    """L2 三门槛决策（01 §5.3 决策函数），返回结构化判定。
 
     1) 作用域：X 太小不值得、太大走 L1 落盘；
     2) 信息密度：高密度文本不压缩；
     3) 经济性：压缩后还需复用 `expected_N` 轮才能回本，否则不值得。
     """
     X = estimate_tokens(result.content)
-    if online_compress_min > X or save_threshold_tokens <= X:
-        return False
-    if info_density(result) == "HIGH":
-        return False
+    density = info_density(result)
+    otype = classify_content(result)
+    if online_compress_min > X:
+        return L2Decision(False, "size_too_small", X, density, otype)
+    if save_threshold_tokens <= X:
+        return L2Decision(False, "size_too_big", X, density, otype)
+    if density == "HIGH":
+        return L2Decision(False, "high_density", X, density, otype)
     alpha = (EXPECTED_RATIO_BY_TYPE if expected_ratio is None else expected_ratio).get(
-        classify_content(result), 0.5
+        otype, 0.5
     )
     S = max(1, int(X * alpha))
     c = DEFAULT_COST if cost is None else cost
     denominator = c.c_hit * (X - S)
     if denominator <= 0:
-        return False
+        return L2Decision(False, "econ_fail", X, density, otype, S)
     break_even = (
         c.c_in * (compress_instruction_tokens + S) + c.c_out * S + c.c_hit * p_tokens
     ) / denominator
     if expected_remaining is None:
         expected_remaining = estimate_remaining_turns(p_tokens, window_size, avg_growth_per_turn)
-    return expected_remaining > break_even
+    return L2Decision(
+        expected_remaining > break_even,
+        "compress" if expected_remaining > break_even else "econ_fail",
+        X,
+        density,
+        otype,
+        S,
+        break_even,
+        expected_remaining,
+    )
+
+
+def should_online_compress(
+    result: ToolResult,
+    p_tokens: int,
+    **kwargs,
+) -> bool:
+    """L2 三门槛决策的 bool 封装（01 §5.3）；签名与语义保持不变，供既有调用方/测试。
+
+    结构化判定走 `evaluate_l2_decision`；本函数只取 `.accepted`。
+    """
+    return evaluate_l2_decision(result, p_tokens, **kwargs).accepted
 
 
 # ---- 落盘 + L2 摘要执行 ----------------------------------------------------
@@ -401,6 +462,45 @@ class L2Compressor:
             expected_ratio=self._expected_ratio,
             compress_instruction_tokens=self._compress_instruction_tokens,
         )
+
+    def decide(self, result: ToolResult, p_tokens: int) -> L2Decision:
+        """L2 三门槛判定并落 `context.l2_decide` span（07 T8：决策分布数据源）。
+
+        只读判定、不执行压缩；`accepted=True` 由调用方决定是否走 `compress()`。
+        `l2` 关闭（本压缩器不存在）时不产 span，由调用方（ToolResultHandler）短路。
+        属性只增标量，供 T8 报告聚合 reason/x/密度/经济性中间量。
+        """
+        decision = evaluate_l2_decision(
+            result,
+            p_tokens,
+            cost=self._cost,
+            window_size=self._window_size,
+            avg_growth_per_turn=self._avg_growth_per_turn,
+            online_compress_min=self._online_compress_min,
+            save_threshold_tokens=self._save_threshold_tokens,
+            expected_ratio=self._expected_ratio,
+            compress_instruction_tokens=self._compress_instruction_tokens,
+        )
+        telemetry = self._telemetry
+        if telemetry is not None:
+            with telemetry.span("context.l2_decide", "context") as span:
+                if span is not None:
+                    span.attributes.update(
+                        tool_use_id=result.tool_use_id,
+                        tool=result.name,
+                        x_chars=len(result.content),
+                        x_tokens=decision.x_tokens,
+                        info_density=decision.info_density,
+                        original_type=decision.original_type,
+                        reason=decision.reason,
+                    )
+                    if decision.s_tokens_estimate is not None:
+                        span.attributes["s_tokens_estimate"] = decision.s_tokens_estimate
+                    if decision.break_even_n is not None:
+                        span.attributes["break_even_n"] = decision.break_even_n
+                    if decision.expected_n is not None:
+                        span.attributes["expected_n"] = decision.expected_n
+        return decision
 
     async def compress(
         self, result: ToolResult, prefix: Payload | None = None
