@@ -136,7 +136,9 @@ def build_tasks_json(
     return {
         "run_id": run_id,
         "repo_dir": str(repo_dir.resolve()),
-        "work_dir": str((work_dir or repo_dir / ".kdagent" / "eval").resolve()),
+        # D96 治理⑤：默认 work_dir = repo_dir（评测工作根），与 load_tasks_file 一致，
+        # 避免 `.kdagent/eval/.kdagent/...` 双层冗余（RUNS.md 经验 6）。
+        "work_dir": str((work_dir or repo_dir).resolve()),
         "tasks": [to_task_dict(r) for r in rows],
     }
 

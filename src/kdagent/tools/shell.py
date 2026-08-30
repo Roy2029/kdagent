@@ -7,8 +7,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
+import signal
+import subprocess
 import time
 from typing import Any
 
@@ -17,6 +20,15 @@ from kdagent.tools.base import ToolContext, ToolResult
 # 终端控制序列（CSI/OSC/其他 ESC 开头）——命令输出里的颜色/光标码必须剥离，
 # 否则 \x1b 序列进入上下文污染模型（工具结果应为纯文本）。
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-_]")
+
+# Bash 命令超时（秒）。D87 踩坑：Agent 找不到测试文件发起 `find /` 全盘扫描
+# 永久挂起（shell.py 原无超时）。超时后杀子进程树防孤儿。进程级固定值，
+# config 接线（tools.bash_timeout_ms）后续补。
+_BASH_TIMEOUT = 300.0
+
+
+class _BashTimeoutError(TimeoutError):
+    """Bash 命令超过 _BASH_TIMEOUT 秒未完成（已终止子进程树）。"""
 
 # Windows 盘符路径：`D:\...` / `D:/...`（WSL 视图下不可见）。
 _WIN_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
@@ -72,10 +84,42 @@ def _is_wsl_launcher_failure(text: str) -> bool:
     return "E_UNEXPECTED" in t or "BASH/SERVICE" in t
 
 
+def _terminate_tree(proc: asyncio.subprocess.Process) -> None:
+    """超时后终止子进程及其后代（防孤儿进程继续吃 CPU）。
+
+    Windows：taskkill /T /F 杀整棵进程树（asyncio 的 proc.kill 只杀主进程，
+    bash -c 的子孙进程会残留）；POSIX：杀主进程组无 setsid 不可靠，先 SIGKILL
+    主进程再 proc.kill 兜底。proc 已退出则 no-op。
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            os.kill(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 async def _run_command(
     bash: str | None, command: str, cwd: str
 ) -> tuple[int, bytes, bytes]:
-    """启动一个子进程执行命令，返回 (exit_code, stdout, stderr)。"""
+    """启动一个子进程执行命令，返回 (exit_code, stdout, stderr)。
+
+    D87/F9：communicate 包 asyncio.wait_for(_BASH_TIMEOUT)——Agent 发起
+    `find /` 全盘扫描等命令不再永久挂起；超时先 _terminate_tree 再收尾读取
+    已缓冲输出，然后抛 _BashTimeoutError。
+    """
     if bash is not None:
         proc = await asyncio.create_subprocess_exec(
             bash,
@@ -92,7 +136,15 @@ async def _run_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_BASH_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        _terminate_tree(proc)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except (asyncio.TimeoutError, OSError):
+            stdout, stderr = b"", b""
+        raise _BashTimeoutError(f"Bash 命令超过 {_BASH_TIMEOUT:.0f}s 未完成") from exc
     return proc.returncode, stdout, stderr
 
 
@@ -200,6 +252,18 @@ class Bash:
                 retried = True
                 await _sleep(_WSL_RETRY_DELAY)
                 exit_code, stdout, stderr = await _run_command(bash, command, str(ctx.work_dir))
+        except _BashTimeoutError as exc:
+            # 必须在 except OSError 之前：Python 3.11+ 内置 TimeoutError 是 OSError 子类
+            content = f"命令执行超时（>{_BASH_TIMEOUT:.0f}s），已终止子进程树：{exc}"
+            if diagnosis:
+                content = f"{content}\n\n{diagnosis}"
+            return ToolResult(
+                tool_use_id=ctx.tool_use_id,
+                name=self.name,
+                content=content,
+                is_error=True,
+                duration_ms=int((time.perf_counter() - start) * 1000),
+            )
         except OSError as exc:
             content = f"命令执行失败：{exc}"
             if diagnosis:

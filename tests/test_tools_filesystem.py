@@ -156,6 +156,39 @@ def test_wsl_path_to_windows() -> None:
     assert _wsl_path_to_windows("/home/user/x.c") is None
 
 
+# ---- MSYS/git-bash 盘符路径转换（D92 实测：git-bash 输出 /d/... 被拼成 D:\d\...） ----
+
+def test_msys_path_to_windows() -> None:
+    from kdagent.tools.filesystem import _msys_path_to_windows
+
+    # 存在的盘符 → 转 Windows 路径
+    drive_d = _msys_path_to_windows("/d/个人开发/benchmark/a.c")
+    assert drive_d is not None
+    assert drive_d.lower().startswith("d:\\")
+    assert drive_d.endswith("个人开发\\benchmark\\a.c")
+    # 大小写归一
+    assert _msys_path_to_windows("/D/x/y") is not None and _msys_path_to_windows("/D/x/y").lower().startswith("d:\\")  # type: ignore[union-attr]
+    # 仅盘符无路径
+    d_root = _msys_path_to_windows("/d")
+    assert d_root is not None and d_root.lower() == "d:\\"  # type: ignore[union-attr]
+    # 不存在的盘符（如 /tmp 的 t）→ 不转（防误伤相对路径）
+    assert _msys_path_to_windows("/tmp/foo") is None
+    # 非 MSYS 路径原样
+    assert _msys_path_to_windows("C:\\Users\\a") is None
+    assert _msys_path_to_windows("/home/user") is None
+
+
+def test_resolve_path_converts_msys_and_wsl() -> None:
+    from kdagent.tools.filesystem import _resolve_path
+
+    # git-bash /d/... → WindowsPath（D 盘存在时）
+    p = _resolve_path("/d/个人开发/x")
+    assert p.is_absolute()
+    assert "个人开发" in str(p) and "\\d\\" not in str(p)
+    # /tmp 单字符路径 → 保持相对（不误转）
+    assert not _resolve_path("/tmp/foo").is_absolute()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="WSL 路径转换仅在 win32 生效")
 def test_validate_accepts_wsl_absolute_path() -> None:
     assert ReadFile().validate_input({"path": "/mnt/c/Users/Roy/x.c"}) == []

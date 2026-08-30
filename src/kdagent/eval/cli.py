@@ -10,7 +10,7 @@ tasks.json 结构：
 {
   "run_id": "eval-1",
   "repo_dir": "path/to/source/git/repo",   # 含 base_commit 的原始仓库（封史来源）
-  "work_dir": "path/to/eval/workspace",    # 封史副本的存放目录（可选，默认 repo_dir/.kdagent/eval）
+  "work_dir": "path/to/eval/workspace",    # 评测工作根：封史副本 + .kdagent 产物（可选，默认 repo_dir）
   "tasks": [ { "instance_id", "base_commit", "problem_statement",
                "fail_to_pass", "pass_to_pass", "gold_patch", "test_cmd", "constraint" } ]
 }
@@ -31,6 +31,7 @@ from typing import cast
 
 from kdagent.config import load_api_key, load_config
 from kdagent.context.compactor import cost_params_from_table
+from kdagent.eval.docker_judge import DockerJudgeConfig
 from kdagent.engine.llm.base import ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
 from kdagent.eval.model import EvalReport, EvalTask, FailureCase, FailureKind
@@ -63,7 +64,10 @@ def load_workspace(path: Path) -> tuple[Path, Path]:
     repo_dir = Path(data.get("repo_dir", "")).resolve()
     if not repo_dir.is_dir():
         raise ValueError(f"repo_dir 不存在：{repo_dir}")
-    work_dir = Path(data.get("work_dir", str(repo_dir / ".kdagent" / "eval"))).resolve()
+    # D96 治理⑤：默认 work_dir = repo_dir（评测工作根），下游 .kdagent/obs、
+    # .kdagent/eval/<run_id>、docker resolve_out 直接拼在根下。此前默认
+    # repo_dir/.kdagent/eval，下游再拼 .kdagent → 双层冗余（RUNS.md 经验 6）。
+    work_dir = Path(data.get("work_dir", str(repo_dir))).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     return repo_dir, work_dir
 
@@ -77,7 +81,8 @@ def load_tasks_file(path: Path) -> tuple[str, Path, Path, list[EvalTask]]:
     repo_dir = Path(data.get("repo_dir", "")).resolve()
     if not repo_dir.is_dir():
         raise ValueError(f"repo_dir 不存在：{repo_dir}")
-    work_dir = Path(data.get("work_dir", str(repo_dir / ".kdagent" / "eval"))).resolve()
+    # D96 治理⑤：默认 work_dir = repo_dir（见 load_workspace 注释）。
+    work_dir = Path(data.get("work_dir", str(repo_dir))).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     tasks: list[EvalTask] = []
     for raw in data.get("tasks", []):
@@ -93,6 +98,10 @@ def load_tasks_file(path: Path) -> tuple[str, Path, Path, list[EvalTask]]:
                 test_cmd=str(raw.get("test_cmd", "")),
                 p2p_cmd=str(raw.get("p2p_cmd", "")),
                 constraint=str(raw.get("constraint", "")),
+                # 官方 Docker harness 判分信息（swebench.py to_task_dict 保留）
+                test_cmds=[str(x) for x in raw.get("test_cmds", [])],
+                test_patch=str(raw.get("test_patch", "")),
+                log_parser=str(raw.get("log_parser", "")),
             )
         )
     if not tasks:
@@ -100,11 +109,44 @@ def load_tasks_file(path: Path) -> tuple[str, Path, Path, list[EvalTask]]:
     return str(data.get("run_id", "eval-default")), repo_dir, work_dir, tasks
 
 
-def run_eval_cli(tasks_file: Path, workers: int = 1) -> int:
+def _build_docker_judge(
+    harness: str | None,
+    venv_python: str | None,
+    namespace: str,
+) -> DockerJudgeConfig | None:
+    """`--docker-harness` 给了才启用 Docker 判分；默认 python 取 harness 同目录
+    `.venv/Scripts/python.exe`（Windows venv 布局），缺失时报错让调用方兜底。"""
+    if harness is None:
+        return None
+    harness_path = Path(harness)
+    if not harness_path.is_file():
+        raise ValueError(f"--docker-harness 不存在：{harness_path}")
+    python = (
+        Path(venv_python)
+        if venv_python
+        else harness_path.parent / ".venv" / "Scripts" / "python.exe"
+    )
+    if not python.is_file():
+        raise ValueError(f"harness venv python 不存在：{python}（--docker-python 指定）")
+    return DockerJudgeConfig(harness_script=harness_path, python=python, namespace=namespace)
+
+
+def run_eval_cli(
+    tasks_file: Path,
+    workers: int = 1,
+    docker_harness: str | None = None,
+    docker_python: str | None = None,
+    docker_namespace: str = "starryzhang",
+    preinstall: bool = False,
+) -> int:
     """跑一轮评测并打印报告（退出码：0 全过 / 1 有失败 / 2 配置错误）。
 
     `workers > 1` 走并发跑批（11 §3.7 可并行）：Semaphore 限并发，单任务异常
     隔离记 harness_fault，不中断整批。
+
+    `docker_harness` 给了则启用 11 §5 224 Docker 判分：跑批只产 patch，判分统一
+    走官方 harness（DockerJudgeConfig）。默认 python 取 harness 同目录
+    `.venv/Scripts/python.exe`（Windows venv 布局）。
     """
     try:
         run_id, repo_dir, work_dir, tasks = load_tasks_file(tasks_file)
@@ -139,6 +181,7 @@ def run_eval_cli(tasks_file: Path, workers: int = 1) -> int:
         print("内置 general-purpose Agent 缺失", file=sys.stderr)
         return 2
     obs_dir = work_dir / ".kdagent" / "obs"  # 07 trace 落盘（评估本地观测）
+    docker = _build_docker_judge(docker_harness, docker_python, docker_namespace)
     eval_runner = EvalRunner(
         runner,
         definition=definition,
@@ -146,8 +189,12 @@ def run_eval_cli(tasks_file: Path, workers: int = 1) -> int:
         work_dir=work_dir,
         task_loader=lambda: tasks,
         obs_dir=obs_dir,
-        # T5-1：计价表按 provider 配置化（D83，None = DEFAULT_COST；数值待实测标定）
-        cost=cost_params_from_table(config.get_cost_table(), config.provider),
+        # T5-1：计价表按 model 取价（D104 内置三档 + config cost 段可覆盖；None = DEFAULT）
+        cost=cost_params_from_table(
+            config.get_cost_table(), config.provider, model=config.model or "deepseek-v4-flash"
+        ),
+        docker=docker,
+        preinstall=preinstall,
     )
     report: EvalReport = asyncio.run(eval_runner.run(run_id, max_workers=workers))
     persist_report(work_dir, run_id, report)

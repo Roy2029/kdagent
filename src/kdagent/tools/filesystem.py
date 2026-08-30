@@ -6,6 +6,7 @@ ReadFile / Glob / Grep 只读 + 并发安全；WriteFile / EditFile 破坏性 + 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shutil
 import sys
@@ -38,6 +39,15 @@ def _result(
 # 得到的文件路径即此风格；Windows Python 的 Path.is_absolute() 会误判为相对）
 _WSL_MNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
 
+# git-bash/MSYS 盘符路径：/d/...（本环境 Bash 工具是 git-bash，pwd 返回此风格，
+# 与 WSL 的 /mnt/d/... 不同——D92 实测 Grep/Glob 收到 /d/... 被拼成 D:\d\... 双重盘符）
+_MSYS_DRIVE_RE = re.compile(r"^/([a-zA-Z])(/|$)")
+
+
+def _drive_exists(drive: str) -> bool:
+    """Windows 盘符是否存在（防把 /tmp 等单字符路径误当 MSYS 盘符路径）。"""
+    return os.path.isdir(f"{drive}:\\")
+
 
 def _wsl_path_to_windows(raw: str) -> str | None:
     """WSL 挂载路径 /mnt/<drive>/... → Windows 路径字符串；非 WSL 路径返回 None。"""
@@ -49,15 +59,28 @@ def _wsl_path_to_windows(raw: str) -> str | None:
     return f"{drive}:\\{rest}"
 
 
+def _msys_path_to_windows(raw: str) -> str | None:
+    """git-bash/MSYS 盘符路径 /d/... → Windows 路径字符串；盘符存在才转防误伤。"""
+    m = _MSYS_DRIVE_RE.match(raw)
+    if not m or not _drive_exists(m.group(1).upper()):
+        return None
+    drive = m.group(1).upper()
+    rest = raw[m.end() :].replace("/", "\\")
+    return f"{drive}:\\{rest}"
+
+
 def _resolve_path(raw: str) -> Path:
-    """解析工具路径参数：win32 下把 WSL 挂载路径转为 Windows 路径后返回。
+    """解析工具路径参数：win32 下把 WSL 挂载路径（/mnt/<drive>/...）与 git-bash
+    盘符路径（/d/...）都转为 Windows 路径后返回。
 
     demo 实测：ReadFile/WriteFile 收到 Agent 从 Bash(pwd) 得到的 /mnt/c/...，
     WindowsPath.is_absolute() 判 False → 工具被拒，Agent 只能改用 Bash 写文件。
-    本函数让 ReadFile/WriteFile/EditFile/Glob/Grep 直接接受 WSL 路径；Linux 原样。
+    D92 实测：git-bash 输出 /d/... 不被 /mnt/ 规则匹配 → 拼 work_dir 成 D:\d\... 双重
+    盘符 → Grep/Glob 全失败。本函数让 ReadFile/WriteFile/EditFile/Glob/Grep 直接接受
+    WSL 与 MSYS 两种盘符路径；Linux 原样。
     """
     if sys.platform == "win32":
-        win = _wsl_path_to_windows(raw)
+        win = _wsl_path_to_windows(raw) or _msys_path_to_windows(raw)
         if win is not None:
             return Path(win)
     return Path(raw)

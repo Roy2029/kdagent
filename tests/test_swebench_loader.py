@@ -98,8 +98,9 @@ def test_build_tasks_json_shape(tmp_path: Path) -> None:
 
 
 def test_build_tasks_json_default_work_dir(tmp_path: Path) -> None:
+    """D96 治理⑤：默认 work_dir = repo_dir（评测工作根），不再拼 `.kdagent/eval`。"""
     data = build_tasks_json([_row("a")], repo_dir=tmp_path)
-    assert data["work_dir"] == str((tmp_path / ".kdagent" / "eval").resolve())
+    assert data["work_dir"] == str(tmp_path.resolve())
 
 
 # ---- fetch_split：分页 / 缓存 / 过滤（mock httpx）----

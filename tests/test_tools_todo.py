@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from kdagent.config import Config
@@ -112,6 +113,26 @@ def test_meta_declarations() -> None:
     assert tool.is_destructive() is False
     assert tool.is_concurrency_safe({}) is False
     assert tool.require_confirm is False
+
+
+async def test_execute_concurrent_no_cross_talk(tmp_path: Path) -> None:
+    """D96 治理④：同一 TodoWrite 实例并发调用互不串扰（无状态化）。
+
+    旧实现共享 self._todos——cli 全局 registry 单例经 filter_tools 注册同一实例
+    引用，并发子 Agent 轮次间隙读到别的 Agent 的计划（B4 实测 KeyError 'status'）。
+    无状态化后每次 execute 用本次 input 快照，gather 交错调用各自回传自己的内容。
+    """
+    tool = TodoWrite()
+    ctx = _ctx(tmp_path)
+
+    async def run(label: str) -> str:
+        await asyncio.sleep(0)  # 制造交错机会
+        result = await tool.execute(ctx, {"todos": [{"content": label}]})
+        return result.content
+
+    content_a, content_b = await asyncio.gather(run("计划A"), run("计划B"))
+    assert "计划A" in content_a and "计划B" not in content_a
+    assert "计划B" in content_b and "计划A" not in content_b
 
 
 async def test_execute_triggers_todos_callback(tmp_path: Path) -> None:

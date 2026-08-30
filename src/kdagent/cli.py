@@ -117,6 +117,53 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="RUN_ID",
         help="单版本报表（11 §3.8 metrics_by_run）：通过率/token/耗时，免 api_key",
     )
+    eval_p.add_argument(
+        "--docker-harness",
+        metavar="RUN_HARNESS_PY",
+        help="11 §5 224 Docker 判分：run_harness.py 路径（官方 harness Windows 启动器）。"
+        "给了则跑批只产 patch，判分统一走官方容器（F2P/P2P 实测）",
+    )
+    eval_p.add_argument(
+        "--docker-python",
+        metavar="VENV_PYTHON",
+        default=None,
+        help="装了官方 swebench 包的 venv python（默认 --docker-harness 同目录 .venv/Scripts/python.exe）",
+    )
+    eval_p.add_argument(
+        "--docker-namespace",
+        default="starryzhang",
+        help="DockerHub 预构建镜像命名空间（默认 starryzhang）",
+    )
+    eval_p.add_argument(
+        "--preinstall",
+        action="store_true",
+        help="D96 治理③：封史副本内建 venv + pip install -e .（模拟容器环境构建）。"
+        "对轻依赖 repo 开——模型可直接 import 工作区源码验证，防 pip download 病。"
+        "C 扩展/重依赖 repo 预装可能失败（不阻断跑批，模型可自装）",
+    )
+    obs_p = sub.add_parser("obs", help="可观测性工具（07）")
+    obs_sub = obs_p.add_subparsers(dest="obs_command")
+    cal_p = obs_sub.add_parser("calibrate", help="L2 在线压缩标定报告（01 §9.2 T8）")
+    cal_p.add_argument(
+        "--obs-dir",
+        default=None,
+        help="obs 根目录（默认 {work_dir}/.kdagent/obs）",
+    )
+    cal_p.add_argument(
+        "--run-id",
+        default=None,
+        help="只统计指定 eval 轮（trace 头 eval.run_id）",
+    )
+    cal_p.add_argument(
+        "--json",
+        action="store_true",
+        help="输出结构化 JSON（机器可读）",
+    )
+    cal_p.add_argument(
+        "--output",
+        default=None,
+        help="写文件（默认 stdout）",
+    )
     return parser
 
 
@@ -274,8 +321,10 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
             kd_dir / "sessions",
             llm=llm,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
-            # T5-1：计价表按 provider 配置化（D83，None = DEFAULT_COST；数值待实测标定）
-            cost=cost_params_from_table(config.get_cost_table(), config.provider),
+            # T5-1：计价表按 model 取价（D104 内置三档 + config cost 段可覆盖；None = DEFAULT）
+            cost=cost_params_from_table(
+                config.get_cost_table(), config.provider, model=model
+            ),
         ),
         permission_checker=permission_checker,
         hooks=hooks,
@@ -308,6 +357,23 @@ def _make_client(api_key: str) -> Callable[[str], LLMClient]:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    # obs 子命令：可观测性工具（01 §9.2 T8 标定），纯读不碰 TUI/IME。
+    if args.command == "obs":
+        from kdagent.obs import l2_calibration
+
+        if args.obs_command == "calibrate":
+            raise SystemExit(
+                l2_calibration.main(
+                    [
+                        *(("--obs-dir", args.obs_dir) if args.obs_dir else ()),
+                        *(("--run-id", args.run_id) if args.run_id else ()),
+                        *(["--json"] if args.json else []),
+                        *(("--output", args.output) if args.output else ()),
+                    ]
+                )
+            )
+        build_parser().print_help()
+        raise SystemExit(2)
     # eval 子命令：长任务后台执行（11 §3.9），不走 TUI/IME 补丁。
     if args.command == "eval":
         from kdagent.eval import (
@@ -330,7 +396,16 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(run_diff_cli(Path(args.tasks), run_a, run_b))
         if args.metrics:
             raise SystemExit(run_metrics_cli(Path(args.tasks), args.metrics))
-        raise SystemExit(run_eval_cli(Path(args.tasks), workers=args.workers))
+        raise SystemExit(
+            run_eval_cli(
+                Path(args.tasks),
+                workers=args.workers,
+                docker_harness=args.docker_harness,
+                docker_python=args.docker_python,
+                docker_namespace=args.docker_namespace,
+                preinstall=args.preinstall,
+            )
+        )
     work_dir = Path(args.dir) if args.dir else None
     # 方案 A：Windows 终端不支持 Kitty 时禁用（对齐 Claude Code 回退传统流），
     # 恢复中文 IME；非 win32 为 no-op（compat.patch_windows_input）。

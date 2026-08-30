@@ -53,7 +53,9 @@ def format_todos(todos: list[dict[str, Any]]) -> str:
     for todo in todos:
         lines.append(f"- {todo['content']}")
         for task in todo["tasks"]:
-            mark = "x" if task["status"] == _COMPLETED else " "
+            # D96 防御：format_todos 是公开纯函数（checkpoints 也会传半结构数据）；
+            # get 兜底防脏输入 KeyError（正常路径 normalize 已保证字段）。
+            mark = "x" if task.get("status", _PENDING) == _COMPLETED else " "
             lines.append(f"  [{mark}] {task['content']}")
             for step in task["steps"]:
                 criteria = str(step.get("accept_criteria", "") or "")
@@ -125,9 +127,6 @@ class TodoWrite:
     category = "planning"
     require_confirm = False
 
-    def __init__(self) -> None:
-        self._todos: list[dict[str, Any]] = []
-
     def is_read_only(self) -> bool:
         return False
 
@@ -144,11 +143,16 @@ class TodoWrite:
         return []
 
     async def execute(self, ctx: ToolContext, input: dict[str, Any]) -> ToolResult:
+        # D96 治理④：无状态化——每次调用用本次 input 的规范化快照，不存跨调用实例
+        # 字段。此前 TodoWrite 是 cli 全局 registry 单例，filter_tools 给并发子 Agent
+        # 注册同一实例引用 → 5 个并发任务共享 self._todos，轮次间隙读到别的 Agent 的
+        # 计划（KeyError 'status' 候选根因，B4 实测 20% 触发）。无状态后共享实例也
+        # 无状态可共享；模型每次本就回传完整 todo 列表（非增量），行为不变。
         start = time.perf_counter()
-        self._todos = normalize_todos(input["todos"])
+        todos = normalize_todos(input["todos"])
         if ctx.todos is not None:
-            ctx.todos(self._todos)  # 03 §3.6 数据流：→ 04 会话状态 + 05 面板渲染
-        content = format_todos(self._todos)
+            ctx.todos(todos)  # 03 §3.6 数据流：→ 04 会话状态 + 05 面板渲染
+        content = format_todos(todos)
         duration_ms = int((time.perf_counter() - start) * 1000)
         return ToolResult(
             tool_use_id=ctx.tool_use_id, name=self.name, content=content, duration_ms=duration_ms

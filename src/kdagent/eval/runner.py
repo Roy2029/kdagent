@@ -18,14 +18,17 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 
 from kdagent.context.compactor import CostParams, estimate_token_cost
+from kdagent.eval.docker_judge import DockerJudgeConfig, DockerJudgeError, judge
 from kdagent.eval.model import (
     EvalReport,
     EvalTask,
@@ -40,7 +43,7 @@ from kdagent.subagent.runner import SubAgentRunner
 _GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
 
 # 补丁提取/判分要排除的运行时目录（不会成为改动的一部分）
-_RUNTIME_DIRS = (".kdagent", ".claude")
+_RUNTIME_DIRS = (".kdagent", ".claude", ".venv")  # .venv：D96 治理③ preinstall 建在副本内的 venv，不进补丁
 # 判分时不参与「改对了」判定的测试文件（回归防护用）
 _TEST_FILE_HINTS = ("test_", "_test", "tests/", "spec.", ".test.")
 
@@ -82,6 +85,48 @@ def _force_rmtree_onerror(func: Callable[[str], object], p: str, _exc: object) -
     func(p)
 
 
+def patch_applies(source_repo: Path, base_commit: str, patch: str) -> str | None:
+    """D96 治理②：patch 前置预检——在 base_commit 干净树里 `git apply --check`。
+
+    返回 None = 可应用；否则返回 git 报错（临时文件 hunk、上下文不匹配、CRLF 等
+    patch 质量问题）。跑批产 patch 后、进 Docker 判分前逐题预检，坏 patch 本地拦截，
+    不再白跑一轮容器（B3 3437 / B4 2322 的 Patch Apply Failed 即此路拦截对象）。
+    只检查不落地；复用 seal_copy 的 git archive 建临时干净树，与容器内 base_commit
+    状态一致。
+    """
+    if not patch.strip():
+        return "空补丁"
+    with tempfile.TemporaryDirectory() as td:
+        dest = Path(td)
+        archive = subprocess.run(
+            ["git", "-C", str(source_repo), "archive", "--format=tar", base_commit],
+            env=_GIT_ENV,
+            capture_output=True,
+            timeout=120,
+        )
+        if archive.returncode != 0:
+            return f"git archive 失败：{archive.stderr.strip() or archive.stdout.strip()}"
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
+            try:
+                tar.extractall(dest, filter="data")  # Python 3.12+（数据过滤）
+            except TypeError:
+                tar.extractall(dest)  # Python 3.11 无 filter 参数
+        # D95 同款行尾归一化：容器内 git checkout 默认 LF，patch 必须 LF 才能 apply
+        proc = subprocess.run(
+            ["git", "apply", "--check", "-"],
+            cwd=dest,
+            input=patch.replace("\r\n", "\n"),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            return None
+        return (proc.stderr or proc.stdout).strip()[:300]
+
+
 def seal_copy(source_repo: Path, base_commit: str, dest: Path) -> Path:
     """封史副本（§3.2 第 2 步，防作弊最关键的防抄）：git archive 抽文件树 → 新目录
     git init 重提一个单提交——Agent 翻 git log 也找不到正确答案。"""
@@ -117,7 +162,49 @@ def extract_patch(work_dir: Path) -> str:
             in_drop = any(f"/{d}/" in line or line.endswith(f"/{d}") for d in _RUNTIME_DIRS)
         if not in_drop:
             keep.append(line)
-    return "\n".join(keep)
+    # D96 治理②：splitlines() 去掉每行（含最后一行）结尾换行，join 后 patch 末行无 `\n`
+    # → 容器 git apply 报 corrupt patch at line N（预检实测，flag.txt patch line 7 corrupt）。
+    # git diff 输出总是以 `\n` 结尾，重建时补回，patch 才可被 git apply 接受。
+    if not keep:
+        return ""
+    return "\n".join(keep) + "\n"
+
+
+def install_repo_deps(sealed: Path, python: str | None = None) -> tuple[bool, str]:
+    """D96 治理③：封史副本内建 venv + `pip install -e .`（模拟容器「环境构建」）。
+
+    解决封史副本无依赖、模型 import 不到工作区源码的根因（B2 urllib3 全灭、
+    B3 pip download 病）。副副本的 venv 是隔离的（不污染全局，并发题互不干扰）；
+    失败不阻断跑批——模型仍可依 prompt 引导在副本内自装。
+    返回 (成功, 消息)。
+    """
+    base_python = python or sys.executable
+    venv = sealed / ".venv"
+    try:
+        proc = subprocess.run(
+            [base_python, "-m", "venv", str(venv)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+        )
+        if proc.returncode != 0:
+            return False, f"venv 创建失败：{proc.stderr.strip()[:200]}"
+        pip = venv / "Scripts" / "pip.exe" if os.name == "nt" else venv / "bin" / "pip"
+        proc = subprocess.run(
+            [str(pip), "install", "-e", str(sealed)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+        )
+        if proc.returncode != 0:
+            return False, f"pip install -e 失败：{proc.stderr.strip()[:200]}"
+        return True, "依赖已预装到副本 .venv"
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"预装异常：{type(exc).__name__}: {exc}"
 
 
 def _touches_test_file(patch: str) -> bool:
@@ -235,6 +322,8 @@ class EvalRunner:
         similarity_threshold: float = _GOLD_SIM_THRESHOLD,
         obs_dir: Path | None = None,
         cost: CostParams | None = None,
+        docker: DockerJudgeConfig | None = None,
+        preinstall: bool = False,
     ) -> None:
         self._runner = runner
         self._definition = definition
@@ -243,11 +332,17 @@ class EvalRunner:
         self._task_loader = task_loader
         self._similarity_threshold = similarity_threshold
         self._cost = cost  # 01 T5-1 计价（D83：config cost 段按 provider 注入，None 用默认）
+        # 11 §5 224：官方 Docker harness 判分。给了则跑批只产 patch，判分统一走
+        # harness（run() 末尾）；None 保持本地 test_cmd/gold 双轨降级。
+        self._docker = docker
         # 07 trace 数据层：子 Agent 全程产 trace，带 eval.run_id/task_id 标记，
         # 供失败定位（11 §3.4/§3.5，trace_store.load_traces / failed_events）。
         self._telemetry = Telemetry(obs_dir) if obs_dir is not None else None
         # 07 §3.8 验收 276：判分后回填 trace 判定（passed/kind/reason）。
         self._obs_dir = obs_dir
+        # D96 治理③：封史副本内建 venv + pip install -e .（模拟容器环境构建）。
+        # 默认关（C 扩展/重依赖 repo 预装可能失败，失败不阻断跑批）；对轻依赖 repo 开。
+        self._preinstall = preinstall
 
     async def run(self, run_id: str, max_workers: int = 1) -> EvalReport:
         """跑批（§3.2 第 2 步）：`max_workers=1` 顺序，>1 并发（§3.7 可并行）。
@@ -283,6 +378,10 @@ class EvalRunner:
 
             await asyncio.gather(*(_guarded(task) for task in valid_tasks))
         report.metrics.wall_s = time.perf_counter() - start
+        # 11 §5 224：Docker 判分模式——跑批只产 patch，判分统一走官方 harness。
+        # 放最后（Agent 跑完）批量判分，harness 一次起容器逐题跑 F2P/P2P。
+        if self._docker is not None:
+            self._docker_judge_report(report)
         sort_report_by_task_order(report, tasks)
         return report
 
@@ -303,20 +402,31 @@ class EvalRunner:
         try:
             await self._run_task(report, task)
         except Exception as exc:  # noqa: BLE001 —— 单任务异常只该记一笔
+            # D95：记完整 traceback——只记 type/exc 丢堆栈，偶发并发 bug（KeyError: 'status'）
+            # 复现两次都抓不到栈；带栈后下次复现直接在 report 定位根因。
             report.failed.append(
                 FailureCase(
                     instance_id=task.instance_id,
                     kind="harness_fault",
-                    reason=f"跑批异常：{type(exc).__name__}: {exc}",
+                    reason=(
+                        f"跑批异常：{type(exc).__name__}: {exc}\n"
+                        f"{traceback.format_exc()}"
+                    ),
                 )
             )
+            # D94：防重复归类——异常题从 report.tasks 摘除，不再进 Docker 判分
+            # （否则 model_patch 空又被 harness 判 empty_patch，同题记两次，B3 实测）。
+            report.tasks = [t for t in report.tasks if t.instance_id != task.instance_id]
 
     async def _run_task(self, report: EvalReport, task: EvalTask) -> None:
         work = self._work_dir / task.instance_id
         if work.exists():
             _force_rmtree(work)  # D90：git objects 只读位，Windows 需强制删
         sealed = seal_copy(self._source_repo, task.base_commit, work)
-        prompt = self._build_prompt(task)
+        # D96 治理③：预装副本依赖（venv + pip install -e .）——失败不阻断（模型可自装）。
+        if self._preinstall:
+            install_repo_deps(sealed)
+        prompt = self._build_prompt(task, sealed)  # D96：传封史副本真实路径 → prompt 环境说明
         # 07 §3.8 eval 标记：contextvar 隔离（D60）——并发跑批各自 set 互不覆盖，
         # try/finally reset 防跨任务残留。
         token = (
@@ -334,6 +444,8 @@ class EvalRunner:
             if token is not None and self._telemetry is not None:
                 self._telemetry.reset_trace_attributes(token)
         model_patch = extract_patch(sealed)
+        # 判分/复核共享数据：本地判分用、Docker 判分（predictions.jsonl）与 trace 复核用。
+        task.model_patch = model_patch
         usage = result.usage
         report.metrics.total_turns += result.turns
         report.metrics.total_tokens += usage.input_tokens + usage.output_tokens
@@ -347,6 +459,10 @@ class EvalRunner:
             usage.cache_read_tokens,
             cost=self._cost,  # T5-1：配置计价表按 provider 注入（None = DEFAULT_COST）
         )
+        if self._docker is not None:
+            # 11 §5 224：Docker 判分模式——本地双轨判分跳过（test_cmd 环境与官方
+            # 容器不一致，判分口径以 harness 为准），统一在 run() 末尾批量判分。
+            return
         test_passed: bool | None = None
         if task.test_cmd:
             test_passed = self._run_test(sealed, task.test_cmd)
@@ -408,9 +524,98 @@ class EvalRunner:
             return
         backfill_verdict(self._obs_dir, report.run_id, task.instance_id, passed, kind, reason)
 
+    def _docker_judge_report(self, report: EvalReport) -> None:
+        """11 §5 224：Docker 判分批量执行 + 报告回填。
+
+        调官方 harness 判分全部已跑完的题 → 逐题更新 report：
+        - resolved → 移入 report.resolved + 回填 passed=True；
+        - 失败 → classify 归类（error/empty_patch 直接 harness_fault）→ failed + 回填。
+        harness 整体失败（镜像缺失/Docker 未起/超时）→ 全部归 harness_fault，
+        report 不为空（metrics.total 已在 _safe_task 计过，resolved=0 可读）。
+        """
+        assert self._docker is not None
+        # D96 治理②：patch 前置预检——质量差的 patch（临时文件 hunk/上下文不匹配/CRLF）
+        # 本地 git apply --check 拦截，不进 Docker 判分白跑一轮容器（B3 3437/B4 2322 实录）。
+        kept: list[EvalTask] = []
+        for task in report.tasks:
+            apply_err = patch_applies(self._source_repo, task.base_commit, task.model_patch)
+            if apply_err is not None:
+                reason = f"patch 前置预检不通过（{apply_err}）"
+                report.failed.append(
+                    FailureCase(
+                        instance_id=task.instance_id,
+                        kind="harness_fault",
+                        reason=reason,
+                        patch=task.model_patch,
+                    )
+                )
+                self._backfill(report, task, False, "harness_fault", reason)
+            else:
+                kept.append(task)
+        report.tasks = kept
+        if not report.tasks:
+            return  # 全部被预检拦截，无题进容器
+        try:
+            outcomes = judge(
+                self._docker,
+                report.tasks,
+                eval_work_dir=self._work_dir,
+                eval_run_id=report.run_id,
+            )
+        except DockerJudgeError as exc:
+            for task in report.tasks:
+                kind: FailureKind = "harness_fault"
+                reason = f"Docker 判分失败：{exc}"
+                report.failed.append(
+                    FailureCase(
+                        instance_id=task.instance_id,
+                        kind=kind,
+                        reason=reason,
+                        patch=task.model_patch,
+                    )
+                )
+                self._backfill(report, task, False, kind, reason)
+            return
+        for task, outcome in zip(report.tasks, outcomes):
+            if outcome.resolved:
+                report.resolved.append(task.instance_id)
+                report.metrics.resolved += 1
+                self._backfill(report, task, True)
+                continue
+            if outcome.error or outcome.empty_patch or not task.model_patch.strip():
+                # 环境/空补丁属 harness 侧问题，不是能力问题——直接 harness_fault
+                kind: FailureKind = "harness_fault"
+                reason = outcome.reason or "模型补丁为空"
+            else:
+                kind, reason = classify(task, task.model_patch, test_passed=False, agent_error="")
+            report.failed.append(
+                FailureCase(
+                    instance_id=task.instance_id, kind=kind, reason=reason, patch=task.model_patch
+                )
+            )
+            self._backfill(report, task, False, kind, reason)
+
     @staticmethod
-    def _build_prompt(task: EvalTask) -> str:
-        base = f"问题描述：\n{task.problem_statement}\n"
+    def _build_prompt(task: EvalTask, work_dir: Path | None = None) -> str:
+        """任务 prompt：问题描述 + 环境说明（D96 治理①）。
+
+        环境说明段针对实测踩坑（台账经验 10）：3437 首轮 `cd /testbed`（SWE-bench 容器
+        惯例路径）导致 Bash/Grep 全失败；B3 3429/3679 弃工作区、pip download 外部源码、
+        读 site-packages 验证导致空 patch。明示 Windows 绝对路径 + 工作区可 pip install
+        自装依赖验证，把模型引导回工作区内。
+        """
+        env_note = ""
+        if work_dir is not None:
+            env_note = (
+                f"工作目录（Windows 绝对路径）：{work_dir}\n"
+                "环境说明：本环境是 Windows，工作目录是绝对路径；不存在 /testbed 等 Linux "
+                "容器路径，不要使用 / 开头的路径。若工作目录内已预装依赖（存在 .venv），"
+                "验证请用 `.venv/Scripts/python.exe`（或激活 .venv）；否则可在工作目录内执行 "
+                "`pip install -e .`（必要时先 `pip install -r requirements.txt`）自装依赖。"
+                "不要 pip download 到 /tmp、也不要读工作目录外的库源码来验证——所有改动与验证 "
+                "必须基于工作目录内的源码。\n"
+            )
+        base = f"{env_note}问题描述：\n{task.problem_statement}\n"
         if task.fail_to_pass:
             base += f"\n必须修复的测试：{task.fail_to_pass}\n"
         if task.pass_to_pass:

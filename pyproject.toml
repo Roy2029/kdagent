@@ -52,6 +52,9 @@ warn_unreachable = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# D96 治理⑤：pytest-asyncio ≥0.24 需要显式声明 fixture loop scope，
+# 否则每个 async fixture 发出 PytestDeprecationWarning。
+asyncio_default_fixture_loop_scope = "function"
 
 # 国内网络环境使用镜像源（pypi.org 直连常 TLS 失败）
 [tool.uv]

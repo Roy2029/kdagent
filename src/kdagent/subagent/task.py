@@ -464,7 +464,9 @@ class TaskUpdate:
                 content=f"后台任务不存在：{input.get('id')}",
                 is_error=True,
             )
-        task.status = input["status"]
+        # D95 防御：validate 已保证 status，但并发/异常输入下防 KeyError
+        # （偶发并发 bug KeyError: 'status' 候选点之一）。
+        task.status = input.get("status") or "completed"
         if input.get("result"):
             task.result = str(input.get("result"))
         task.end_time = time.perf_counter()

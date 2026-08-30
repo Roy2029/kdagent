@@ -34,6 +34,12 @@ class EvalTask:
     test_cmd: str = ""  # 判分测试命令（可选；给了才跑真实测试）
     p2p_cmd: str = ""  # PASS_TO_PASS 判分测试命令（D81：给了则跑，破坏 → 不 resolved）
     constraint: str = ""  # 任务约束（如「不要改测试文件」）→ 类 5 标记
+    # ---- 官方 Docker harness 判分信息（swebench.py loader 保留，224 落地读取）----
+    test_cmds: list[str] = field(default_factory=list)  # 官方 test_cmds（Docker 判分用）
+    test_patch: str = ""  # 官方测试补丁（harness 注入环境）
+    log_parser: str = ""  # 官方日志解析器（pytest 等）
+    # 判分后回填：模型补丁（Docker 判分 / 复核展示用）
+    model_patch: str = ""
 
 
 @dataclass(slots=True)

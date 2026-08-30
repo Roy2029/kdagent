@@ -11,3 +11,7 @@ __pycache__/
 .kd/
 docs/
 run_kdagent.bat
+# OpenSpec（本地归档，不入库；含其安装的 Claude Code 集成）
+openspec/
+.claude/commands/opsx/
+.claude/skills/openspec-*/
