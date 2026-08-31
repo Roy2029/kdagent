@@ -34,7 +34,9 @@ from kdagent.eval.trace_store import failed_events, load_traces
 from kdagent.obs.model import Span, Trace
 
 _CMD_HINT = "题号看详情 / d<行号> 事件详情 / f<类型> 过滤 / b 返回 / q 退出"
-_ANNOT_VALID = ("not_located", "wrong_fix", "regression", "harness_fault", "constraint_conflict")
+_ANNOT_VALID = (
+    "empty_patch", "not_located", "wrong_fix", "regression", "harness_fault", "constraint_conflict"
+)
 
 _CSS = """
 EvalReportScreen {

@@ -9,12 +9,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-# 失败归类五类（11 §3.4）
+# 失败归类六类（11 §3.4；D4 v052 拆出 empty_patch，harness_fault 仅留基础设施故障）
 FailureKind = Literal[
+    "empty_patch",      # 0 模型未产出补丁（中途退出/未产出改动）
     "not_located",      # 1 没定位到该改的文件
     "wrong_fix",        # 2 定位对但修法不对
     "regression",       # 3 修对但碰坏别的测试
-    "harness_fault",    # 4 改动越滚越大/超时/工具报错/中途放弃
+    "harness_fault",    # 4 基础设施故障（封史/判分/环境/工具报错）
     "constraint_conflict",  # 5 约束冲突主动放弃
 ]
 
@@ -40,6 +41,10 @@ class EvalTask:
     log_parser: str = ""  # 官方日志解析器（pytest 等）
     # 判分后回填：模型补丁（Docker 判分 / 复核展示用）
     model_patch: str = ""
+    # 判分后回填：Docker harness 逐题 F2P/P2P 明细（D4 v052，report.json 落盘）
+    f2p_tests: list[str] = field(default_factory=list)  # 该题 FAIL_TO_PASS 测试
+    p2p_tests: list[str] = field(default_factory=list)  # 该题 PASS_TO_PASS 测试
+    p2p_failed: list[str] = field(default_factory=list)  # 被补丁碰坏的 P2P 测试（失败时非空）
 
 
 @dataclass(slots=True)

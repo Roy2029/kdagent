@@ -53,6 +53,8 @@ def backfill_verdict(
     passed: bool,
     kind: str | None = None,
     reason: str | None = None,
+    f2p: list[str] | None = None,
+    p2p_failed: list[str] | None = None,
 ) -> int:
     """打分后回填 trace 判定（07 §3.8 验收 276 / 11 §5 225）。
 
@@ -60,6 +62,8 @@ def backfill_verdict(
     header attributes 追加 `eval.passed`（bool）+ `eval.kind`/`eval.reason`
     （失败归类）——判分结果除 report.json 外写进 trace 本体，trace 成为自包含
     产物（/metrics 聚合、复核阅读等直接读 trace 的消费者不用 join 报告）。
+    D4 v052：f2p/p2p_failed 可选——Docker 判分有逐题 F2P/P2P 明细时写
+    `eval.f2p`/`eval.p2p_failed`（None 不写，非 Docker 路径 trace 保持干净）。
 
     原子写防半行；返回改写的 trace 数（0 = 无命中）。幂等：重复回填覆盖上次
     判定。读/写失败（OSError/脏行）跳过该文件不抛——回填是加分项，不阻断判分。
@@ -90,6 +94,10 @@ def backfill_verdict(
             new_attrs["eval.kind"] = kind
         if reason is not None:
             new_attrs["eval.reason"] = reason
+        if f2p is not None:
+            new_attrs["eval.f2p"] = f2p
+        if p2p_failed is not None:
+            new_attrs["eval.p2p_failed"] = p2p_failed
         header["attributes"] = new_attrs
         lines[0] = json.dumps(header, ensure_ascii=False)
         try:

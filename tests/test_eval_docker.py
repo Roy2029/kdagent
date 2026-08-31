@@ -12,15 +12,16 @@ from pathlib import Path
 import pytest
 from conftest import FakeLLM, done, tool_call
 
+from kdagent.config import Config
 from kdagent.eval.docker_judge import (
     DockerJudgeConfig,
     DockerJudgeError,
+    JudgeOutcome,
     build_dataset,
     build_predictions,
     judge,
 )
 from kdagent.eval.model import EvalReport, EvalTask
-from kdagent.config import Config
 from kdagent.eval.runner import EvalRunner
 from kdagent.subagent import BUILTIN_AGENTS_DIR
 from kdagent.subagent.manager import AgentManager
@@ -83,6 +84,38 @@ def test_build_dataset_log_parser_default() -> None:
     assert row["log_parser"] == "pytest"
 
 
+# ---- D4 v052：harness report 逐题 F2P/P2P 明细解析 ----
+
+def test_test_details_parses_f2p_p2p_and_failed() -> None:
+    """logs[instance_id] 的 F2P/P2P/tests_status → (f2p_tests, p2p_tests, p2p_failed)。"""
+    from kdagent.eval.docker_judge import _test_details
+
+    logs = {
+        "i1": {
+            "FAIL_TO_PASS": ["test_f.py::test_a"],
+            "PASS_TO_PASS": ["test_p.py::test_b", "test_p.py::test_c"],
+            "tests_status": {
+                "test_f.py::test_a": "PASSED",
+                "test_p.py::test_b": "PASSED",
+                "test_p.py::test_c": "FAILED",
+            },
+        }
+    }
+    f2p, p2p, p2p_failed = _test_details(logs, "i1")
+    assert f2p == ["test_f.py::test_a"]
+    assert p2p == ["test_p.py::test_b", "test_p.py::test_c"]
+    assert p2p_failed == ["test_p.py::test_c"]  # 非 PASSED → 被碰坏
+
+
+def test_test_details_missing_entry_returns_empty() -> None:
+    """结构缺失/题不在 logs 里 → 全空（判分结果仍由 resolved/error 承载，不阻断）。"""
+    from kdagent.eval.docker_judge import _test_details
+
+    assert _test_details(None, "i1") == ([], [], [])
+    assert _test_details({"i2": {"FAIL_TO_PASS": []}}, "i1") == ([], [], [])
+    assert _test_details({"i1": "not-a-dict"}, "i1") == ([], [], [])
+
+
 # ---- runner 集成 ----
 
 @pytest.mark.asyncio
@@ -123,7 +156,7 @@ async def test_docker_mode_skips_local_judging(
     # 不真跑 harness：mock judge 返回 resolved
     monkeypatch.setattr(
         "kdagent.eval.runner.judge",
-        lambda *a, **kw: [type("O", (), {"instance_id": "d1", "resolved": True, "error": False, "empty_patch": False, "reason": ""})()],
+        lambda *a, **kw: [JudgeOutcome(instance_id="d1", resolved=True)],
     )
     report = await ev.run("dr1")
     assert report.resolved == ["d1"]
@@ -155,9 +188,9 @@ def test_docker_judge_report_resolved_and_classified(
     for t in (ok, bad, far):
         t.model_patch = t.model_patch or "+++ src/a.py\n+right\n"
     outcomes = [
-        type("O", (), {"instance_id": "a", "resolved": True, "error": False, "empty_patch": False, "reason": ""})(),
-        type("O", (), {"instance_id": "b", "resolved": False, "error": False, "empty_patch": False, "reason": ""})(),
-        type("O", (), {"instance_id": "c", "resolved": False, "error": False, "empty_patch": False, "reason": ""})(),
+        JudgeOutcome("a", True),
+        JudgeOutcome("b", False),
+        JudgeOutcome("c", False),
     ]
     monkeypatch.setattr("kdagent.eval.runner.judge", lambda *a, **kw: outcomes)
     ev = _bare_runner()
@@ -171,16 +204,16 @@ def test_docker_judge_report_resolved_and_classified(
     assert kinds["c"] == "not_located"
 
 
-def test_docker_judge_report_error_and_empty_are_harness_fault(
+def test_docker_judge_report_error_harness_fault_and_empty_patch_kind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("kdagent.eval.runner.patch_applies", lambda *a, **kw: None)  # 预检放行
-    """harness 环境错误 / 空补丁 → 直接 harness_fault（不是能力问题，不误归类）。"""
+    """D4 v052 账目拆分：harness 环境错误 → harness_fault；模型空补丁 → empty_patch。"""
     err = _task(instance_id="e")
     empty = _task(instance_id="f", model_patch="")
     outcomes = [
-        type("O", (), {"instance_id": "e", "resolved": False, "error": True, "empty_patch": False, "reason": "容器失败"})(),
-        type("O", (), {"instance_id": "f", "resolved": False, "error": False, "empty_patch": True, "reason": "模型补丁为空"})(),
+        JudgeOutcome("e", False, error=True, reason="容器失败"),
+        JudgeOutcome("f", False, empty_patch=True, reason="模型补丁为空"),
     ]
     monkeypatch.setattr("kdagent.eval.runner.judge", lambda *a, **kw: outcomes)
     ev = _bare_runner()
@@ -188,7 +221,40 @@ def test_docker_judge_report_error_and_empty_are_harness_fault(
     report.metrics.total = 2
     ev._docker_judge_report(report)
     assert report.resolved == []
-    assert all(c.kind == "harness_fault" for c in report.failed)
+    kinds = {c.instance_id: c.kind for c in report.failed}
+    assert kinds["e"] == "harness_fault"  # 容器/环境问题仍是基础设施故障
+    assert kinds["f"] == "empty_patch"  # 模型没产出 → 独立账目
+
+
+def test_docker_judge_report_persists_f2p_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("kdagent.eval.runner.patch_applies", lambda *a, **kw: None)  # 预检放行
+    """D4 v052：harness 逐题 F2P/P2P 明细写回 EvalTask（report.json asdict 落盘）。"""
+    ok = _task(instance_id="a")
+    bad = _task(instance_id="b", gold_patch=_GOLD, model_patch="+++ src/a.py\n+wrong\n")
+    for t in (ok, bad):
+        t.model_patch = t.model_patch or "+++ src/a.py\n+right\n"
+    outcomes = [
+        JudgeOutcome(
+            "a", True,
+            f2p_tests=["test_f.py::test_x"], p2p_tests=["test_p.py::test_y"], p2p_failed=[],
+        ),
+        JudgeOutcome(
+            "b", False,
+            f2p_tests=["test_f.py::test_x"], p2p_tests=["test_p.py::test_y"],
+            p2p_failed=["test_p.py::test_y"],
+        ),
+    ]
+    monkeypatch.setattr("kdagent.eval.runner.judge", lambda *a, **kw: outcomes)
+    ev = _bare_runner()
+    report = EvalReport(run_id="r1", tasks=[ok, bad])
+    report.metrics.total = 2
+    ev._docker_judge_report(report)
+    # resolved 题附 F2P 明细（目标测试全过）；失败题附 P2P 被碰坏明细
+    assert ok.f2p_tests == ["test_f.py::test_x"]
+    assert ok.p2p_failed == []
+    assert bad.p2p_failed == ["test_p.py::test_y"]
 
 
 def test_docker_judge_report_harness_error_all_fault(
@@ -228,7 +294,23 @@ def test_judge_invokes_harness_and_parses_report(tmp_path: Path, monkeypatch: py
         harness_run_id = cmd[cmd.index("--run_id") + 1]
         report = out_dir / f"kdagent.{harness_run_id}.json"
         report.write_text(
-            json.dumps({"resolved_ids": ["t1"], "error_ids": [], "empty_patch_ids": []}),
+            json.dumps(
+                {
+                    "resolved_ids": ["t1"],
+                    "error_ids": [],
+                    "empty_patch_ids": [],
+                    "logs": {  # D4 v052：逐题 F2P/P2P 明细
+                        "t1": {
+                            "FAIL_TO_PASS": ["test_f.py::test_a"],
+                            "PASS_TO_PASS": ["test_p.py::test_b"],
+                            "tests_status": {
+                                "test_f.py::test_a": "PASSED",
+                                "test_p.py::test_b": "PASSED",
+                            },
+                        }
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         return type("P", (), {"returncode": 0, "stdout": ""})()
@@ -243,6 +325,9 @@ def test_judge_invokes_harness_and_parses_report(tmp_path: Path, monkeypatch: py
     assert len(outcomes) == 2
     assert outcomes[0].resolved is True
     assert outcomes[1].resolved is False
+    # D4 v052：明细随 outcomes 带出
+    assert outcomes[0].f2p_tests == ["test_f.py::test_a"]
+    assert outcomes[0].p2p_failed == []
     # predictions/dataset 已落盘
     out = config.resolve_out(tmp_path, "r1")
     assert (out / "predictions.jsonl").is_file()

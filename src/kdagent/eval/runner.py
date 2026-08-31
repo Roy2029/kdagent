@@ -44,8 +44,6 @@ _GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
 
 # 补丁提取/判分要排除的运行时目录（不会成为改动的一部分）
 _RUNTIME_DIRS = (".kdagent", ".claude", ".venv")  # .venv：D96③ preinstall 副本内 venv，不进补丁
-# 判分时不参与「改对了」判定的测试文件（回归防护用）
-_TEST_FILE_HINTS = ("test_", "_test", "tests/", "spec.", ".test.")
 
 # gold 相似度回退判分的阈值（无 test_cmd 时）
 _GOLD_SIM_THRESHOLD = 0.5
@@ -209,12 +207,33 @@ def install_repo_deps(sealed: Path, python: str | None = None) -> tuple[bool, st
         return False, f"预装异常：{type(exc).__name__}: {exc}"
 
 
+def _is_test_path(path: str) -> bool:
+    """测试文件判定（D4 v052 收紧）：conftest.py / tests/ 段 / test_ 前缀 / _test 后缀。
+
+    旧 `_TEST_FILE_HINTS` 子串匹配把 `falcon/testing/client.py` 误判成测试文件
+    （含 "testing"），回归防护把正经改动错判成「碰测试」。判定收窄为明确模式：
+    - basename == conftest.py（pytest 共享夹具）
+    - 任一路径段 == tests（SWE-bench 惯例目录）
+    - basename 以 test_ 开头（pytest 约定）
+    - basename 以 _test 结尾（pytest 约定）
+    """
+    parts = path.replace("\\", "/").split("/")
+    name = parts[-1]
+    stem = name[:-3] if name.endswith(".py") else name  # helper_test.py → helper_test
+    return (
+        name == "conftest.py"
+        or "tests" in parts
+        or name.startswith("test_")
+        or stem.endswith("_test")
+    )
+
+
 def _touches_test_file(patch: str) -> bool:
     """补丁是否改了测试文件（回归防护：判分 harness 注入自己的测试，补丁碰测试会冲突）。"""
     for line in patch.splitlines():
         if line.startswith("+++ ") or line.startswith("--- "):
             path = line[4:].split("\t")[0]
-            if any(hint in path for hint in _TEST_FILE_HINTS):
+            if _is_test_path(path):
                 return True
     return False
 
@@ -285,12 +304,16 @@ def gold_check(base_repo: Path, base_commit: str, gold_patch: str) -> bool:
 def classify(
     task: EvalTask, model_patch: str, test_passed: bool | None, agent_error: str
 ) -> tuple[FailureKind, str]:
-    """失败归类五类（11 §3.4，启发式）：纯函数，可单测。
+    """失败归类六类（11 §3.4，启发式；D4 v052 拆 empty_patch）：纯函数，可单测。
 
-    优先级：中途放弃/工具报错 → 约束冲突 → 碰坏测试 → 定位 vs 修法。
+    优先级：基础设施故障（跑批/工具报错）→ 模型未产出补丁 → 约束冲突 →
+    碰坏测试 → 定位 vs 修法。harness_fault 仅留给基础设施故障，模型侧
+    「没产出改动」独立归 empty_patch（判分账目口径统一，D4）。
     """
-    if agent_error or not model_patch.strip():
-        return "harness_fault", agent_error or "模型补丁为空（中途退出/未产出改动）"
+    if agent_error:
+        return "harness_fault", agent_error
+    if not model_patch.strip():
+        return "empty_patch", "模型未产出补丁（中途退出/未产出改动）"
     if test_passed is True:
         return "harness_fault", "test 通过但 gold 校验失败"  # 理论不可达（判分先过）
     if _touches_test_file(model_patch):
@@ -516,42 +539,54 @@ class EvalRunner:
         passed: bool,
         kind: str | None = None,
         reason: str | None = None,
+        f2p: list[str] | None = None,
+        p2p_failed: list[str] | None = None,
     ) -> None:
         """打分后回填 trace 判定（07 §3.8 验收 276）；obs 未启用时 no-op。
 
         回填失败不阻断判分（backfill_verdict 内部已防御 OSError/脏行跳过）——
         判定结果已由 report.json 承载，trace 回填是让 trace 自包含的加分项。
+        D4 v052：Docker 判分路径带 F2P/P2P 明细（f2p/p2p_failed），写 eval.f2p
+        /eval.p2p_failed；本地双轨不带（None），trace 保持原样。
         """
         if self._obs_dir is None:
             return
-        backfill_verdict(self._obs_dir, report.run_id, task.instance_id, passed, kind, reason)
+        backfill_verdict(
+            self._obs_dir, report.run_id, task.instance_id, passed, kind, reason, f2p, p2p_failed
+        )
 
     def _docker_judge_report(self, report: EvalReport) -> None:
         """11 §5 224：Docker 判分批量执行 + 报告回填。
 
         调官方 harness 判分全部已跑完的题 → 逐题更新 report：
         - resolved → 移入 report.resolved + 回填 passed=True；
-        - 失败 → classify 归类（error/empty_patch 直接 harness_fault）→ failed + 回填。
+        - 失败 → 归类（error→harness_fault；empty_patch/无补丁→empty_patch；
+          其余 classify 启发式）→ failed + 回填；
+        - 逐题 F2P/P2P 明细（f2p_tests/p2p_failed）写回 EvalTask → report.json 落盘
+          与 trace 回填（D4 v052，判分账目）。
         harness 整体失败（镜像缺失/Docker 未起/超时）→ 全部归 harness_fault，
         report 不为空（metrics.total 已在 _safe_task 计过，resolved=0 可读）。
         """
         assert self._docker is not None
         # D96 治理②：patch 前置预检——质量差的 patch（临时文件 hunk/上下文不匹配/CRLF）
         # 本地 git apply --check 拦截，不进 Docker 判分白跑一轮容器（B3 3437/B4 2322 实录）。
+        # D4 v052：预检拦截的是模型补丁质量问题——空补丁归 empty_patch、非空无法应用
+        # 归 classify 启发式（reason 保留预检错误），不占 harness_fault（仅基础设施故障）。
         kept: list[EvalTask] = []
         for task in report.tasks:
             apply_err = patch_applies(self._source_repo, task.base_commit, task.model_patch)
             if apply_err is not None:
+                kind, _ = classify(task, task.model_patch, test_passed=False, agent_error="")
                 reason = f"patch 前置预检不通过（{apply_err}）"
                 report.failed.append(
                     FailureCase(
                         instance_id=task.instance_id,
-                        kind="harness_fault",
+                        kind=kind,
                         reason=reason,
                         patch=task.model_patch,
                     )
                 )
-                self._backfill(report, task, False, "harness_fault", reason)
+                self._backfill(report, task, False, kind, reason)
             else:
                 kept.append(task)
         report.tasks = kept
@@ -566,7 +601,7 @@ class EvalRunner:
             )
         except DockerJudgeError as exc:
             for task in report.tasks:
-                kind: FailureKind = "harness_fault"
+                kind = "harness_fault"
                 reason = f"Docker 判分失败：{exc}"
                 report.failed.append(
                     FailureCase(
@@ -579,15 +614,25 @@ class EvalRunner:
                 self._backfill(report, task, False, kind, reason)
             return
         for task, outcome in zip(report.tasks, outcomes, strict=False):
+            # D4 v052：harness 逐题 F2P/P2P 明细回填 EvalTask → report.json 落盘
+            task.f2p_tests = outcome.f2p_tests
+            task.p2p_tests = outcome.p2p_tests
+            task.p2p_failed = outcome.p2p_failed
             if outcome.resolved:
                 report.resolved.append(task.instance_id)
                 report.metrics.resolved += 1
-                self._backfill(report, task, True)
+                self._backfill(
+                    report, task, True, f2p=outcome.f2p_tests, p2p_failed=outcome.p2p_failed
+                )
                 continue
-            if outcome.error or outcome.empty_patch or not task.model_patch.strip():
-                # 环境/空补丁属 harness 侧问题，不是能力问题——直接 harness_fault
+            if outcome.error:
+                # harness 环境错误（容器启动失败/镜像/Docker daemon）→ 基础设施故障
                 kind = "harness_fault"
-                reason = outcome.reason or "模型补丁为空"
+                reason = outcome.reason or "harness 环境错误"
+            elif outcome.empty_patch or not task.model_patch.strip():
+                # 模型未产出补丁 → empty_patch（D4：独立账目，不占 harness_fault）
+                kind = "empty_patch"
+                reason = outcome.reason or "模型补丁为空（中途退出/未产出改动）"
             else:
                 kind, reason = classify(task, task.model_patch, test_passed=False, agent_error="")
             report.failed.append(
@@ -595,7 +640,10 @@ class EvalRunner:
                     instance_id=task.instance_id, kind=kind, reason=reason, patch=task.model_patch
                 )
             )
-            self._backfill(report, task, False, kind, reason)
+            self._backfill(
+                report, task, False, kind, reason,
+                f2p=outcome.f2p_tests, p2p_failed=outcome.p2p_failed,
+            )
 
     @staticmethod
     def _build_prompt(task: EvalTask, work_dir: Path | None = None) -> str:

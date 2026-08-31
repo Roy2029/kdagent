@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from kdagent.eval.model import EvalTask
@@ -54,6 +54,10 @@ class JudgeOutcome:
     error: bool = False  # harness 环境错误（容器启动失败等）
     empty_patch: bool = False  # 模型补丁为空（harness 记录 empty_patch_ids）
     reason: str = ""  # 失败/错误补充说明
+    # D4 v052：harness report 逐题 F2P/P2P 明细（report.json 落盘 / trace 回填用）
+    f2p_tests: list[str] = field(default_factory=list)  # 该题 FAIL_TO_PASS 测试
+    p2p_tests: list[str] = field(default_factory=list)  # 该题 PASS_TO_PASS 测试
+    p2p_failed: list[str] = field(default_factory=list)  # 被补丁碰坏的 P2P 测试
 
 
 def _normalize_patch(patch: str) -> str:
@@ -136,6 +140,34 @@ def _report_path(out_dir: Path, model_name: str, harness_run_id: str) -> Path:
     return out_dir / f"{model_name.replace('/', '__')}.{harness_run_id}.json"
 
 
+def _test_details(
+    logs: object, instance_id: str
+) -> tuple[list[str], list[str], list[str]]:
+    """从 harness report 逐题 logs 解析 F2P/P2P 明细（D4 v052）。
+
+    report.json 的 `logs[instance_id]` 带 FAIL_TO_PASS/PASS_TO_PASS 测试名列表与
+    tests_status（PASSED/FAILED/ERROR）。返回 (f2p_tests, p2p_tests, p2p_failed)：
+    p2p_failed = PASS_TO_PASS 里非 PASSED 的（被补丁碰坏）。结构缺失/脏数据回退空
+    （判分结果已由 resolved/error 承载，明细是加分项，不因解析失败而阻断）。
+    """
+    if not isinstance(logs, dict):
+        return [], [], []
+    entry = logs.get(instance_id)
+    if not isinstance(entry, dict):
+        return [], [], []
+    f2p = entry.get("FAIL_TO_PASS")
+    p2p = entry.get("PASS_TO_PASS")
+    f2p_list = [str(t) for t in f2p] if isinstance(f2p, list) else []
+    p2p_list = [str(t) for t in p2p] if isinstance(p2p, list) else []
+    p2p_failed: list[str] = []
+    status = entry.get("tests_status")
+    if isinstance(status, dict):
+        for t in p2p_list:
+            if str(status.get(t, "")).upper() != "PASSED":
+                p2p_failed.append(t)
+    return f2p_list, p2p_list, p2p_failed
+
+
 def judge(
     config: DockerJudgeConfig,
     tasks: list[EvalTask],
@@ -196,11 +228,15 @@ def judge(
     resolved_ids = set(data.get("resolved_ids") or [])
     error_ids = set(data.get("error_ids") or [])
     empty_ids = set(data.get("empty_patch_ids") or [])
+    logs = data.get("logs")  # 逐题 F2P/P2P 明细（D4 v052），判分结果外附账目
     outcomes: list[JudgeOutcome] = []
     for task in tasks:
         iid = task.instance_id
+        f2p, p2p, p2p_failed = _test_details(logs, iid)
         if iid in resolved_ids:
-            outcomes.append(JudgeOutcome(iid, True))
+            outcomes.append(
+                JudgeOutcome(iid, True, f2p_tests=f2p, p2p_tests=p2p, p2p_failed=p2p_failed)
+            )
         elif iid in error_ids:
             outcomes.append(
                 JudgeOutcome(
@@ -208,10 +244,25 @@ def judge(
                     False,
                     error=True,
                     reason=_error_reason(out, harness_run_id, model_name, iid),
+                    f2p_tests=f2p,
+                    p2p_tests=p2p,
+                    p2p_failed=p2p_failed,
                 )
             )
         elif iid in empty_ids:
-            outcomes.append(JudgeOutcome(iid, False, empty_patch=True, reason="模型补丁为空"))
+            outcomes.append(
+                JudgeOutcome(
+                    iid,
+                    False,
+                    empty_patch=True,
+                    reason="模型补丁为空",
+                    f2p_tests=f2p,
+                    p2p_tests=p2p,
+                    p2p_failed=p2p_failed,
+                )
+            )
         else:
-            outcomes.append(JudgeOutcome(iid, False))
+            outcomes.append(
+                JudgeOutcome(iid, False, f2p_tests=f2p, p2p_tests=p2p, p2p_failed=p2p_failed)
+            )
     return outcomes

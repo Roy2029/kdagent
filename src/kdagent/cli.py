@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--annotate",
         nargs=3,
         metavar=("RUN_ID", "TASK_ID", "KIND"),
-        help="批注：人工修正失败归类（not_located/wrong_fix/regression/harness_fault/constraint_conflict）",
+        help="批注：人工修正失败归类（empty_patch/not_located/wrong_fix/regression/harness_fault/constraint_conflict）",
     )
     eval_p.add_argument(
         "--note",

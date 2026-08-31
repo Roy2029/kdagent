@@ -164,10 +164,11 @@ def test_classify_harness_fault_on_error() -> None:
     assert "provider 挂了" in reason
 
 
-def test_classify_harness_fault_on_empty_patch() -> None:
+def test_classify_empty_patch_kind() -> None:
+    """D4 v052：模型未产出补丁（无基础设施故障）→ 独立 empty_patch，不占 harness_fault。"""
     kind, reason = classify(_task(), "", None, "")
-    assert kind == "harness_fault"
-    assert "补丁为空" in reason
+    assert kind == "empty_patch"
+    assert "未产出补丁" in reason
 
 
 def test_classify_not_located() -> None:
@@ -191,6 +192,30 @@ def test_classify_constraint_conflict() -> None:
     task = _task(constraint="不要改测试文件")
     kind, _ = classify(task, "+++ tests/test_bug.py\n+x\n", False, "")
     assert kind == "constraint_conflict"
+
+
+# ---- D4 v052：测试文件判定收紧（_is_test_path） ----
+
+def test_is_test_path_patterns() -> None:
+    """falcon/testing/client.py 不再误判为测试文件（旧 _TEST_FILE_HINTS 子串 bug）。"""
+    from kdagent.eval.runner import _is_test_path
+
+    # 真测试文件
+    assert _is_test_path("tests/test_bug.py")  # tests/ 目录
+    assert _is_test_path("test_utils.py")  # test_ 前缀
+    assert _is_test_path("pkg/helper_test.py")  # _test 后缀
+    assert _is_test_path("tests/conftest.py")  # conftest.py
+    assert _is_test_path("src/tests/whatever.py")  # 任意深度 tests 段
+    # 非测试文件（旧实现子串命中的回归点）
+    assert not _is_test_path("falcon/testing/client.py")  # testing/ ≠ tests/
+    assert not _is_test_path("src/contest.py")  # 子串 "test" 不命中
+    assert not _is_test_path("README.md")
+
+
+def test_classify_testing_dir_not_regression() -> None:
+    """改动 falcon/testing/client.py 不算碰测试 → 走定位启发式（D4 收紧回归点）。"""
+    kind, _ = classify(_task(), "+++ falcon/testing/client.py\n+fix\n", False, "")
+    assert kind == "not_located"  # gold 为空无交集，不误判 regression
 
 
 # ---- 流水线端到端 ----
@@ -231,8 +256,8 @@ async def test_eval_runner_resolves_via_test_cmd(repo: Path, tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_eval_runner_harness_fault_on_no_patch(repo: Path, tmp_path: Path) -> None:
-    """Agent 只回文本不改动 → 空补丁 → harness_fault。"""
+async def test_eval_runner_empty_patch_on_no_patch(repo: Path, tmp_path: Path) -> None:
+    """Agent 只回文本不改动 → 空补丁 → empty_patch（D4 v052，非 harness_fault）。"""
     llm = FakeLLM([done("我看了下，没问题")])
     runner = _runner(tmp_path, llm)
     manager = AgentManager([BUILTIN_AGENTS_DIR])
@@ -252,7 +277,7 @@ async def test_eval_runner_harness_fault_on_no_patch(repo: Path, tmp_path: Path)
     report = await ev.run("run-2")
     assert report.resolved == []
     assert len(report.failed) == 1
-    assert report.failed[0].kind == "harness_fault"
+    assert report.failed[0].kind == "empty_patch"
 
 
 @pytest.mark.asyncio

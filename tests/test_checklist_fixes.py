@@ -14,10 +14,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from kdagent.config import Config
-from kdagent.engine.agent import Agent, HOOK_PROMPT_MARKER
+from kdagent.engine.agent import HOOK_PROMPT_MARKER, Agent
 from kdagent.engine.conversation import ConversationManager
 from kdagent.engine.llm.base import LLMStreamEvent, Payload, ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient, _serialize_messages
@@ -33,7 +31,6 @@ from kdagent.sessions.records import SessionRecord
 from kdagent.tools import build_default_registry
 from kdagent.tools.base import ToolResult
 from kdagent.tools.shell import Bash
-
 
 # ---- 公共构造 ----
 

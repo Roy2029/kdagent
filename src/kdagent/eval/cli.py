@@ -339,9 +339,11 @@ def run_annotate_cli(
     tasks_file: Path, run_id: str, task_id: str, kind: str, note: str
 ) -> int:
     """批注：人工修正失败归类 + 备注 → annotations.json（复测携带，不丢人工修正）。"""
-    valid = {"not_located", "wrong_fix", "regression", "harness_fault", "constraint_conflict"}
+    valid = {"empty_patch", "not_located", "wrong_fix", "regression", "harness_fault",
+             "constraint_conflict"}
     if kind not in valid:
-        print(f"非法归类：{kind}（可选 {sorted(valid)}）", file=sys.stderr)
+        opts = "、".join(sorted(valid))
+        print(f"非法归类：{kind}（可选 {opts}）", file=sys.stderr)
         return 2
     try:
         _, work_dir = load_workspace(tasks_file)

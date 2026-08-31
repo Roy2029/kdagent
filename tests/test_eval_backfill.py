@@ -92,6 +92,19 @@ def test_backfill_idempotent_overwrites(tmp_path: Path) -> None:
     assert attrs["eval.reason"] == "新"
 
 
+def test_backfill_writes_f2p_detail(tmp_path: Path) -> None:
+    """D4 v052：Docker 判分明细写 eval.f2p/eval.p2p_failed 属性。"""
+    _emit_trace(tmp_path / "obs", "run-1", "t1")
+    n = backfill_verdict(
+        tmp_path / "obs", "run-1", "t1", False, "wrong_fix", "改错文件",
+        f2p=["test_f.py::test_x"], p2p_failed=["test_p.py::test_y"],
+    )
+    assert n == 1
+    attrs = load_traces(tmp_path / "obs", run_id="run-1", task_id="t1")[0].attributes
+    assert attrs["eval.f2p"] == ["test_f.py::test_x"]
+    assert attrs["eval.p2p_failed"] == ["test_p.py::test_y"]
+
+
 def test_backfill_direct_layout_empty_session(tmp_path: Path) -> None:
     """空 session_id（子代理默认）→ jsonl 直接在 traces/ 下，同样命中。"""
     obs = tmp_path / "obs"
@@ -189,12 +202,12 @@ async def test_runner_backfills_kind_on_failure(repo: Path, tmp_path: Path) -> N
         work_dir=tmp_path / "eval", task_loader=lambda: [task], obs_dir=obs_dir,
     )
     report = await ev.run("run-2")
-    assert report.failed[0].kind == "harness_fault"
+    assert report.failed[0].kind == "empty_patch"  # D4 v052：空补丁独立账目
     traces = load_traces(obs_dir, run_id="run-2", task_id="t2")
     assert len(traces) == 1
     attrs = traces[0].attributes
     assert attrs["eval.passed"] is False
-    assert attrs["eval.kind"] == "harness_fault"
+    assert attrs["eval.kind"] == "empty_patch"
 
 
 @pytest.mark.asyncio
