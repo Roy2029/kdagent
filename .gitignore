@@ -15,3 +15,6 @@ run_kdagent.bat
 openspec/
 .claude/commands/opsx/
 .claude/skills/openspec-*/
+# Claude Code 个人配置与会话状态（项目 skill 等共享内容除外）
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
