@@ -52,7 +52,7 @@ from kdagent.engine.llm.base import (
     Usage,
     is_transient_llm_error,
 )
-from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
+from kdagent.engine.messages import ContentBlock, Message, TextBlock, ToolUseBlock
 from kdagent.harness.checkpoints import (
     LARGE_CHANGE_THRESHOLD,
     REINJECT_COOLDOWN,
@@ -716,51 +716,57 @@ class Agent:
         max_tokens = self._config.extra.get("max_tokens")
         if not isinstance(max_tokens, int):
             max_tokens = 100_000  # 全局默认（用户拍板：长任务不受 4k 截断）
-        # 08 §3.3 静默读：记忆索引随 CLAUDE.md 走同一管线注入（索引是动态增长的——
-        # build 时注入会过期，payload 组装时现取）。索引用 `<system-reminder>` 醒目注入
-        # （与 09 §3.5 延迟工具/§3.9 Skill 同机制：改 reminder 不改 system → 前缀缓存
-        # 不受影响）。只注入索引指针不注入全文——模型按需 ReadFile 取详情，省 token。
-        # 08 §3.5 主动线：记忆使用说明随索引一起注入，让模型知道何时翻记忆。
         system = self._system_prompt
+        # 动态内容注入通道（review 修复 2026-08-31，01 §3.3 / 08 §3.3 / 09 §3.5/§3.9）：
+        # 记忆索引/延迟工具清单/Skill 清单三类动态 reminder 组装为**末尾临时 user 消息**
+        # 的 `<system-reminder>` 块，不再拼进 system 字段——原先三者任一变化（静默写/
+        # ToolSearch 发现/新建 Skill）都改 system → 整条前缀缓存失效，与规格
+        # 「改 reminder 不改 system → 前缀缓存不受影响」相悖。
+        # 临时消息不进 conversation 历史（不落盘、不参与提取/压缩），随每轮 payload
+        # 现取现注入（D27：build 时注入会过期）。system 恒为静态常驻区。
+        # 08 §3.3 静默读：索引指针注入 + 提示直接 ReadFile（指针已是绝对路径）；
+        # user/feedback 类记忆全文注入（称呼/身份/偏好问答可靠性，store.user_memory_markdown）。
+        reminders: list[str] = []
         if self._memory_store is not None:
             index = self._memory_store.index_markdown()
             if index:
-                # 08 §3.3 静默读增强：user/feedback 类记忆（称呼/身份/偏好）全文注入
-                # ——模型被问「你叫什么」时凭基础身份自我介绍不读文件，全文直接
-                # 进上下文才可靠（store.user_memory_markdown）。
-                prefs = self._memory_store.user_memory_markdown()
-                memory_reminder = (
-                    "<system-reminder>\n记忆索引已随初始上下文加载（KDAgent 四类 "
-                    "Markdown 记忆）。涉及过往工作/决策/待办时，第一轮就直"
-                    "接用 ReadFile 读取下方指针指向的 `.md` 文件取详情（指针已是"
-                    "绝对路径，直接作为 ReadFile 的 path 参数即可），无需在文件系统"
-                    "里重新探索记忆目录。\n"
+                reminders.append(
+                    "<system-reminder>\n记忆索引（KDAgent 四类 Markdown 记忆）。"
+                    "涉及过往工作/决策/待办时，第一轮就直接用 ReadFile 读取下方指"
+                    "针指向的 `.md` 文件取详情（指针已是绝对路径，直接作为 "
+                    "ReadFile 的 path 参数即可），无需在文件系统里重新探索记忆目录。\n"
                     + index
-                    + prefs
-                    + "\n</system-reminder>"
+                    + self._memory_store.user_memory_markdown()
+                    + "\n</system-reminder>\n\n"
+                    + MEMORY_USAGE_INSTRUCTION
                 )
-                system = f"{system}\n\n{memory_reminder}\n\n{MEMORY_USAGE_INSTRUCTION}"
         # 09 §3.5 延迟加载：MCP 工具不进 tools 字段（数量不可控、token 省 ~85%），
-        # 名字进 system-reminder 提示用 ToolSearch 加载。改 reminder 不改 system
-        # → 前缀缓存不受影响。
+        # 名字进 reminder 提示用 ToolSearch 加载。
         tools, deferred_names = self._tools.payload_schemas()
         if deferred_names:
             listing = "\n".join(deferred_names)
-            reminder = (
+            reminders.append(
                 "<system-reminder>\n以下工具可通过 ToolSearch 加载（名称精确指定 "
                 "或关键词搜索）：\n" + listing + "\n</system-reminder>"
             )
-            system = f"{system}\n\n{reminder}"
-        # 09 §3.9 两阶段加载：Skill 轻量清单注入 system-reminder（只列 name+description，
-        # 渐进式披露）；完整 SOP 经 LoadSkill 按需加载。改 reminder 不改 system → 前缀缓存
-        # 不受影响（与延迟工具同机制）。清单变化随 payload 组装现取，build 时注入会过期。
+        # 09 §3.9 两阶段加载：Skill 轻量清单（只列 name+description，渐进式披露）；
+        # 完整 SOP 经 LoadSkill 按需加载。清单变化随 payload 组装现取。
         if self._skills is not None:
             skills_reminder = build_skills_reminder(self._skills.list())
             if skills_reminder:
-                system = f"{system}\n\n{skills_reminder}"
+                reminders.append(skills_reminder)
+        messages = self._conversation.messages
+        if reminders:
+            # 浅拷贝历史（不改 conversation），末尾追加一条 user 消息承载 reminder。
+            # Anthropic 相邻同角色由 API 自动合并（adapter docstring），OpenAI 兼容
+            # 接受连续 user 消息。
+            messages = [
+                *messages,
+                Message(role="user", content=[TextBlock("\n\n".join(reminders))]),
+            ]
         return Payload(
             system=system,
-            messages=self._conversation.messages,
+            messages=messages,
             tools=tools,
             max_tokens=max_tokens,
         )

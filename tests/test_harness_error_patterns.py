@@ -234,28 +234,71 @@ async def test_different_kinds_each_precipitate(tmp_path: Path) -> None:
     assert "error-pattern-edit-no-match" in names
 
 
-# ---- M1 静默读：记忆索引注入 system-reminder ----
+# ---- M1 静默读 + 注入通道迁移（v052 review）：reminder 走 messages 层 ----
+
+
+def _payload_reminder_text(payload: Any) -> str:
+    """payload 末尾临时 user 消息里的 `<system-reminder>` 文本（无则空串）。"""
+    if not payload.messages:
+        return ""
+    last = payload.messages[-1]
+    if last.role != "user" or not last.content:
+        return ""
+    return getattr(last.content[-1], "text", "") or ""
+
 
 def test_assemble_payload_injects_memory_index(tmp_path: Path) -> None:
-    """新会话 payload：记忆索引以 `<system-reminder>` 注入 system，并提示直接 ReadFile。
+    """payload：记忆索引以 `<system-reminder>` 进末尾临时 user 消息，提示直接 ReadFile。
 
-    M1 修复：索引不再埋在 system 中间，而是醒目 system-reminder（与 09 §3.5 延迟工具
-    同机制，改 reminder 不改 system → 前缀缓存不受影响）。只注索引指针不注全文。
+    v052 review 迁移：reminder 不再拼进 system（静默写曾击穿前缀缓存），
+    system 恒为静态常驻区。只注索引指针不注全文。
     """
     store = MemoryStore(tmp_path / "user", tmp_path / "proj")
     store.create(MemoryFile(name="沙箱环境", description="记录沙箱约束", type="project", content="body"))
     agent = _make_agent([_done()], tmp_path, memory_store=store)
-    system = agent._assemble_payload().system
-    assert "<system-reminder>" in system
-    assert "记忆索引已随初始上下文加载" in system
-    assert "沙箱环境.md" in system  # 索引指针在
-    assert "记录沙箱约束" in system  # 索引行描述在
-    assert "body" not in system  # 不注全文（省 token）
+    payload = agent._assemble_payload()
+    reminder = _payload_reminder_text(payload)
+    assert "<system-reminder>" in reminder
+    assert "记忆索引" in reminder
+    assert "沙箱环境.md" in reminder  # 索引指针在
+    assert "记录沙箱约束" in reminder  # 索引行描述在
+    assert "body" not in reminder  # 不注全文（省 token）
+    # system 恒静态：不含 reminder
+    assert "沙箱环境.md" not in payload.system
+    assert "<system-reminder>" not in payload.system
 
 
 def test_assemble_payload_skips_memory_without_store(tmp_path: Path) -> None:
     """无 memory_store（08 未启用）→ 不注入记忆索引。"""
     agent = _make_agent([_done()], tmp_path)
-    system = agent._assemble_payload().system
-    assert "记忆索引已随初始上下文加载" not in system
-    assert "<system-reminder>" not in system  # 本用例无 skills/mcp 时无 reminder
+    payload = agent._assemble_payload()
+    assert "记忆索引" not in _payload_reminder_text(payload)
+    # 本用例无 skills/mcp 时 payload 末尾不追加临时消息
+    assert len(payload.messages) == len(agent._conversation.messages)
+
+
+def test_assemble_payload_system_stable_across_memory_write(tmp_path: Path) -> None:
+    """🔴 回归：静默记忆写入后 system 字段逐字节不变，reminder 在 messages 层更新。
+
+    前缀缓存保护的核心断言——MEMORY.md 更新（索引增长）不再改 system。
+    """
+    store = MemoryStore(tmp_path / "user", tmp_path / "proj")
+    agent = _make_agent([_done()], tmp_path, memory_store=store)
+    system_before = agent._assemble_payload().system
+    store.create(MemoryFile(name="新记忆", description="迁移后新增", type="project", content="c2"))
+    payload_after = agent._assemble_payload()
+    assert payload_after.system == system_before  # 逐字节不变
+    assert "新记忆.md" in _payload_reminder_text(payload_after)  # reminder 已更新
+
+
+def test_assemble_payload_tool_use_rounds_keep_reminder(tmp_path: Path) -> None:
+    """多轮 payload：临时 reminder 消息不进 conversation 历史（不落盘不重复）。"""
+    store = MemoryStore(tmp_path / "user", tmp_path / "proj")
+    store.create(MemoryFile(name="a", description="d", type="project", content="c"))
+    agent = _make_agent([_done()], tmp_path, memory_store=store)
+    p1 = agent._assemble_payload()
+    assert len(p1.messages) == len(agent._conversation.messages) + 1
+    # 组装后再组装（模拟多轮），conversation 历史不被 reminder 污染
+    agent._assemble_payload()
+    assert len(agent._conversation.messages) == len(p1.messages) - 1
+    assert all("system-reminder" not in str(m.content) for m in agent._conversation.messages)

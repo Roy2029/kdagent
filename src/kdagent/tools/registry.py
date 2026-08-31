@@ -47,8 +47,9 @@ class ToolRegistry:
     def payload_schemas(self) -> tuple[list[ToolSchema], list[str]]:
         """09 §3.5 payload 组装：常驻 + 已发现工具给完整 schema，未发现延迟工具只给名字。
 
-        返回 `(tools, deferred_names)`；deferred_names 进 system-reminder 提示
-        可用 ToolSearch 加载（不改 system 字段 → 前缀缓存不受影响）。
+        返回 `(tools, deferred_names)`；deferred_names 以 `<system-reminder>` 块进
+        payload 末尾的临时 user 消息（不进 system 字段 → 前缀缓存不受影响，
+        v052 review 迁移后此注释与实现一致）。
         """
         tools: list[ToolSchema] = []
         deferred: list[str] = []

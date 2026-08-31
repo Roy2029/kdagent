@@ -280,12 +280,16 @@ def test_agent_payload_injects_skill_reminder(tmp_path: Path) -> None:
         work_dir=tmp_path,
         skills=mgr,
     )
-    system = agent._assemble_payload().system
-    assert "<system-reminder>" in system
-    assert "可用 Skill" in system
-    assert "commit：分析 git 变更并生成 commit" in system
+    payload = agent._assemble_payload()
+    reminder = payload.messages[-1].content[-1].text  # 末尾临时 user 消息承载 reminder
+    assert "<system-reminder>" in reminder
+    assert "可用 Skill" in reminder
+    assert "commit：分析 git 变更并生成 commit" in reminder
     # 只注入清单（name+description），不注入完整正文
-    assert "git status" not in system
+    assert "git status" not in reminder
+    # v052 review 迁移：system 恒静态，不含 reminder
+    assert "<system-reminder>" not in payload.system
+    assert "可用 Skill" not in payload.system
 
 
 def test_agent_payload_without_skills(tmp_path: Path) -> None:
@@ -297,4 +301,7 @@ def test_agent_payload_without_skills(tmp_path: Path) -> None:
         events=lambda ev: None,
         work_dir=tmp_path,
     )
-    assert "可用 Skill" not in agent._assemble_payload().system
+    payload = agent._assemble_payload()
+    # 无 skills/mcp/memory 时：system 静态且末尾不追加临时消息
+    assert "可用 Skill" not in payload.system
+    assert len(payload.messages) == len(agent._conversation.messages)
