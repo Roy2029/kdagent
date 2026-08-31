@@ -2,6 +2,34 @@
 
 KDAgent 版本对应档位里程碑（版本路线见 `docs/技术规格/00-总览与路线图.md`，docs 本地维护不随仓库分发）。
 
+## [0.5.3] - 2026-09-01 — 整体 Review 修复批 + SWE-bench-Live 评测闭环（D86-D104）
+
+> **BREAKING**：见文末「破坏性变更」。
+
+### 评测闭环（D86-D96 + D104）
+- **SWE-bench-Live 评测入口**（D87）：`python -m kdagent.eval.swebench` 从 HF 拉题生成 tasks.json（`--repo/--instance-id/--limit` 过滤，本地 JSON 缓存）
+- **Docker 判分链路**（D91/D92）：官方 harness + starryzhang 镜像 + Windows 兼容启动器（`import resource` stub + 本地 .json 数据集）+ `--docker-harness` 正式批累积 33 题（B1-B5 + faker-conc7，台账 RUNS.md）
+- **trace 阅读 HTML**（D88）+ 增量 prompt 日志 + 对话历史渲染（D90）+ LLM 输入可见 + 全局 max_tokens 100k（D89）+ Windows 只读目录强制删除（D91）
+- **评测工程环境治理五连**（D96）：prompt 环境说明（无 /testbed）· patch 前置预检 + harness error 细分 · 封史副本依赖预装（`--preinstall`）· **TodoWrite 无状态化（并发 KeyError 根治）** · work_dir 语义统一
+- **L2 压缩经济性标定**（D104）：compactor 内置 PROVIDER_COST_TABLE（deepseek/glm 价目，零配置可用）+ L2Decision 判定模型 + `l2_calibration` 标定工具（T7/T8 数值待真实会话标定）
+
+### v0.5.2 整体 Review 修复批（D97-D103，见 openspec/changes/v052-review-remediation/）
+- **工程卫生**（D97）：mypy 7 错 + ruff 23 错清零 · l2 标定工具兼容平铺 trace 布局 · .claude 逐文件入库（swebench-loop skill 入库、个人配置忽略）
+- **权限防线加固**（D98）：learn YAML 安全化（损坏降级不阻断）· 只读白名单收紧（env 移除 / find 危险 token 不放行）· Bash 敏感路径「出现即拦」兜底层 · resolved 路径判定 · 规则大小写不敏感 · /permissions 去掉 bypass · **子 Agent 权限收口** · Explore 只读
+- **LLM 瞬态重试链**（D99）：429/5xx/连接错误/超时 → 指数退避重试（1s→2s→4s，≤3 次）· 请求超时 60s→120s · SSE 容错 · PromptTooLongError 映射紧急压缩
+- **动态注入通道归位**（D100）：记忆索引/偏好全文/延迟工具清单/Skill 清单四段从 system 拼接迁为末尾 user 消息 `<system-reminder>` 块（与检查点 extra_blocks 机制统一）——prompt 前缀逐字节稳定
+- **散点缺口闭合**（D101）：会话过期清理接线（`sessions.cleanup_days`）· 记忆首跑增量门 · Grep 子进程 60s 超时 · hooks 列表追加去重合并
+- **ToolSearch keywords 命中即加载**（D102）：keywords 分支复用 select 路径，命中即 mark_discovered + 完整 schema
+- **评测判分账目**（D103）：Docker harness 逐题 F2P/P2P 明细落盘 report.json + trace attributes（eval.f2p/eval.p2p_failed）· 模型未产出补丁独立归 `empty_patch` · harness_fault 仅留基础设施故障 · 测试文件判定收紧（conftest.py/tests//test_/test.py 后缀，falcon/testing/client.py 不再误判）· 并发回归批 faker-conc7 无 KeyError 复现
+
+### 破坏性变更（BREAKING）
+- **失败归类口径**（D103）：模型未产出补丁（中途退出/无改动）由 harness_fault 改为独立 `empty_patch`；`harness_fault` 仅留基础设施故障（封史/判分/环境/工具报错）。旧 report.json 的归类需在新口径下人工复核（`--annotate`）。
+- **子 Agent 权限收口**（D98）：default/acceptEdits 模式下子 Agent 的权限请求改为「警告事件 + is_error 拒绝」，不再自动继承父进程 HITL 弹窗；`dontAsk` 模式自动 allow；AgentDef 显式声明 `permissionMode` 时按自身模式裁决。此前依赖「子 Agent 无权限拦截」的行为需重新评估。
+- **动态注入通道迁移**（D100）：记忆索引/偏好/Skill/延迟工具清单从 system prompt 常驻区迁为每轮末尾 user 消息 `<system-reminder>` 块。对模型可见的注入内容不变，但 prompt 结构变化——依赖旧 system 常驻段位置的提示词需适配。
+
+### 验收基线
+953 passed + 6 skipped · mypy 干净 · ruff 干净
+
 ## [0.5.2] - 2026-08-27 — M1 记忆实测修复批（模型端读不到记忆的真根因）
 
 ### 记忆修复（M1 闭环）

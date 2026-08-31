@@ -2,7 +2,7 @@
 
 类 Claude Code 的 Coding Agent（Python 3.11+ / Textual）。
 
-- **状态**：阶段 8 实现期 · **M5 生产级完成**（v0.5.0）｜M1 能跑 v0.1.0 → M2 能用 v0.2.0 → M3 可控 v0.3.0 → M4 好用 v0.4.0 → M5 生产级 v0.5.0
+- **状态**：阶段 8 实现期 · **评测迭代中**（v0.5.3）｜M1 能跑 v0.1.0 → M2 能用 v0.2.0 → M3 可控 v0.3.0 → M4 好用 v0.4.0 → M5 生产级 v0.5.0 → 实测反馈与评测闭环迭代 v0.5.1-v0.5.3
 - **更新日志**：[CHANGELOG.md](CHANGELOG.md)
 - 技术规格与路线图：`docs/技术规格/`（本地维护，未纳入仓库分发，主文档 `00-总览与路线图.md`）
 
@@ -38,7 +38,8 @@
 - **SubAgent 体系**：`Agent≈Tool` 统一入口 + 工具过滤四层 + Task 工具集 + 内置 4 Agent + Fork（继承父对话）
 - **Worktree 空间隔离**：slug 白名单 + 显式 cwd + fail-closed 清理 + `/worktree`
 - **后台任务**：生命周期 + `<task-notification>` 注入 + worktree 创建后设置；**命名 Agent**（SendMessage 多消息续跑）
-- **评估 MVP**：`kdagent eval` 封史防作弊 → 隔离执行 → 判分双轨 → 失败归类五类 + 复核界面（CLI/TUI）+ 复测对比 + 并发跑批
+- **评估 MVP**：`kdagent eval` 封史防作弊 → 隔离执行 → 判分双轨 → 失败归类（六类启发式 + 人工复核）→ 复核界面（CLI/TUI）→ 复测对比（`--diff`/`--metrics`）→ 并发跑批（`--workers N`）
+- **SWE-bench-Live 评测闭环**（v0.5.1-v0.5.3）：`python -m kdagent.eval.swebench` 拉题 → 真实 LLM 解题 → **官方 Docker harness 判分**（`--docker-harness`，逐题 F2P/P2P 明细落盘）→ trace 判定回填 + 判分账目（empty_patch 独立归类）；台账见 `D:/个人开发/benchmark/swebench-live/RUNS.md`，闭环流程见 `.claude/skills/swebench-loop/`
 
 **M5 遗留增强（31 块）速览**：
 - Harness 测试闭环：TestRunner（三沙箱）+ 规则量化四规则 + 测试基建探测
@@ -48,11 +49,18 @@
 - SubAgent：子 Agent 挂父 trace · adoptRunning 前台切后台（超时/取消自动转后台）
 - 补全：Hook 子 Agent 生效 · GitRevert 精确回退 · MCP 外部内容来源标注 · TestingEvent UI 三态
 
+**v0.5.1-v0.5.3 迭代速览**：
+- 实测反馈修复批：权限模式持久化 · acceptEdits 只读免弹 · 记忆读不到的三层根因（绝对指针/沙箱 roots/work_dir 入沙箱）
+- **评测产物可读**：trace 一键转 HTML（`scripts/trace2html.bat`）· 增量 prompt 日志 + 对话历史渲染 · 全局 max_tokens 100k
+- **评测工程治理**：patch 前置预检 · 封史副本依赖预装（`--preinstall`）· 并发 KeyError 根治（TodoWrite 无状态化）
+- **整体 Review 修复批**：权限防线加固（learn YAML 安全化 / 子 Agent 权限收口 / Explore 只读）· LLM 瞬态重试链 · 动态注入通道迁回 messages 层 · ToolSearch keywords 命中即加载
+- **L2 压缩经济性标定**：内置计价表 + L2Decision 判定模型 + `l2_calibration` 标定工具
+
 ## 开发
 
 ```bash
 uv sync               # 安装依赖 + dev 工具链
-uv run pytest         # 测试（712 passed / 5 skipped）
+uv run pytest         # 测试（953 passed / 6 skipped）
 uv run mypy src       # 类型检查（strict + warn_unreachable）
 uv run ruff check .   # lint
 uv run kdagent --version
