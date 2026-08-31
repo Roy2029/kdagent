@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import shutil
@@ -101,14 +102,12 @@ def _terminate_tree(proc: asyncio.subprocess.Process) -> None:
                 timeout=10,
             )
         else:
-            os.kill(proc.pid, signal.SIGKILL)
+            os.kill(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except (OSError, subprocess.SubprocessError):
         pass
     finally:
-        try:
+        with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
 
 
 async def _run_command(
@@ -138,14 +137,14 @@ async def _run_command(
         )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_BASH_TIMEOUT)
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         _terminate_tree(proc)
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-        except (asyncio.TimeoutError, OSError):
+        except (TimeoutError, OSError):
             stdout, stderr = b"", b""
         raise _BashTimeoutError(f"Bash 命令超过 {_BASH_TIMEOUT:.0f}s 未完成") from exc
-    return proc.returncode, stdout, stderr
+    return proc.returncode if proc.returncode is not None else -1, stdout, stderr
 
 
 async def _sleep(seconds: float) -> None:

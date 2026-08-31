@@ -10,7 +10,7 @@ tasks.json 结构：
 {
   "run_id": "eval-1",
   "repo_dir": "path/to/source/git/repo",   # 含 base_commit 的原始仓库（封史来源）
-  "work_dir": "path/to/eval/workspace",    # 评测工作根：封史副本 + .kdagent 产物（可选，默认 repo_dir）
+  "work_dir": "path/to/eval/workspace",  # 评测工作根：封史副本 + 产物（可选，默认 repo_dir）
   "tasks": [ { "instance_id", "base_commit", "problem_statement",
                "fail_to_pass", "pass_to_pass", "gold_patch", "test_cmd", "constraint" } ]
 }
@@ -31,9 +31,9 @@ from typing import cast
 
 from kdagent.config import load_api_key, load_config
 from kdagent.context.compactor import cost_params_from_table
-from kdagent.eval.docker_judge import DockerJudgeConfig
 from kdagent.engine.llm.base import ProviderConfig
 from kdagent.engine.llm.openai import OpenAICompatClient
+from kdagent.eval.docker_judge import DockerJudgeConfig
 from kdagent.eval.model import EvalReport, EvalTask, FailureCase, FailureKind
 from kdagent.eval.report_diff import diff_runs, load_report, metrics_by_run, render_run_diff
 from kdagent.eval.review import (

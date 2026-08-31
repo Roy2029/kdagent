@@ -151,7 +151,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--split", default="test", choices=SPLITS)
     p.add_argument("--repo", action="append", default=[], help="过滤 repo（org/repo，可多次）")
-    p.add_argument("--instance-id", action="append", default=[], help="精确选题（可多次，按给定顺序）")
+    p.add_argument(
+        "--instance-id", action="append", default=[], help="精确选题（可多次，按给定顺序）"
+    )
     p.add_argument("--limit", type=int, default=None, help="取前 N 道（冒烟）")
     p.add_argument("--repo-dir", required=True, help="本地 clone 的源码 repo 目录（封史来源）")
     p.add_argument("--work-dir", default=None, help="eval 工作目录（默认 repo_dir/.kdagent/eval）")

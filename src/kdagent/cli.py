@@ -127,7 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--docker-python",
         metavar="VENV_PYTHON",
         default=None,
-        help="装了官方 swebench 包的 venv python（默认 --docker-harness 同目录 .venv/Scripts/python.exe）",
+        help=(
+            "装了官方 swebench 包的 venv python"
+            "（默认 --docker-harness 同目录 .venv/Scripts/python.exe）"
+        ),
     )
     eval_p.add_argument(
         "--docker-namespace",

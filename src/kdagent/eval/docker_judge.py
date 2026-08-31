@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from kdagent.eval.model import EvalTask
@@ -35,7 +35,8 @@ class DockerJudgeConfig:
     python: Path  # 装了 swebench 包的 venv python
     namespace: str = "starryzhang"  # DockerHub 预构建镜像命名空间
     max_workers: int = 1  # harness 并发容器数
-    out_dir: Path | None = None  # predictions/dataset/report 落点（默认 work_dir/.kdagent/eval/<run_id>/docker）
+    # predictions/dataset/report 落点（默认 work_dir/.kdagent/eval/<run_id>/docker）
+    out_dir: Path | None = None
     run_id_prefix: str = "judge"  # harness run_id = f"{prefix}-<eval_run_id>"
 
     def resolve_out(self, eval_work_dir: Path, eval_run_id: str) -> Path:

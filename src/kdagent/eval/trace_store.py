@@ -12,11 +12,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
-from kdagent.obs.model import Span, SpanLog, Trace
+from kdagent.obs.model import LogLevel, Span, SpanLog, Trace
 
 _EVAL_RUN_KEY = "eval.run_id"
 _EVAL_TASK_KEY = "eval.task_id"
+
+# 落盘行里的 level 是不受信数据：白名单外一律降级 info（mypy 收窄 Literal）
+_LOG_LEVELS: frozenset[str] = frozenset({"debug", "info", "warn", "error"})
+
+
+def _log_level(raw: object) -> LogLevel:
+    lvl = str(raw) if raw else "info"
+    return cast(LogLevel, lvl if lvl in _LOG_LEVELS else "info")
 
 
 def _iter_trace_files(base: Path) -> list[Path]:
@@ -126,7 +135,7 @@ def _load_one(path: Path) -> Trace | None:
                     # 此前只读 attributes 把 logs 丢了，HTML/复核界面看不到 LLM 输入）。
                     logs=[
                         SpanLog(
-                            level=str(log.get("level", "info")),
+                            level=_log_level(log.get("level")),
                             message=str(log.get("message", "")),
                             ts=int(log.get("ts", 0)),
                             attributes=dict(log.get("attributes") or {}),

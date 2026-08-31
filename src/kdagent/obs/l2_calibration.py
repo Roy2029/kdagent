@@ -90,7 +90,8 @@ def _collect_trace(rep: CalibrationReport, rows: list[dict[str, object]]) -> Non
         attrs = row.get("attributes")
         attrs = attrs if isinstance(attrs, dict) else {}
         if name == "llm.call":
-            calls.append((int(row.get("start_ts") or 0), attrs))
+            start_ts = row.get("start_ts")
+            calls.append((int(start_ts) if isinstance(start_ts, (int, float)) else 0, attrs))
             model = attrs.get("model")
             key = model if isinstance(model, str) and model else "<unknown>"
             bucket = rep.cost_tokens.setdefault(key, [0, 0, 0])
@@ -199,7 +200,7 @@ def suggest_params(rep: CalibrationReport) -> dict[str, object]:
         suggested = int(min(max(1_000, ((p90 or 8_000) // 1_000) * 1_000), 8_000))
         sugg["ONLINE_COMPRESS_MIN"] = suggested
         sugg["ONLINE_COMPRESS_MIN_note"] = (
-            f"L2 窗口内无样本（占比 0.0%），建议下调至 ~P90 扩大覆盖（供参考）"
+            "L2 窗口内无样本（占比 0.0%），建议下调至 ~P90 扩大覆盖（供参考）"
         )
     else:
         sugg["ONLINE_COMPRESS_MIN"] = ONLINE_COMPRESS_MIN
@@ -218,7 +219,7 @@ def _histogram(xs: list[int]) -> list[tuple[str, int]]:
                 idx = i - 1
                 break
         counts[max(0, idx)] += 1
-    return list(zip(_X_LABELS, counts))
+    return list(zip(_X_LABELS, counts, strict=True))
 
 
 def _f_ratio(num: float, den: float) -> str:
@@ -231,7 +232,8 @@ def format_markdown(rep: CalibrationReport, sugg: dict[str, object]) -> str:
     A = L.append
     A("# L2 标定报告（01 §9.2 T8）")
     A("")
-    A(f"- trace 文件：{rep.trace_files}；有 llm.call 的 trace：{sum(1 for n in rep.p_trace_turns if n)}")
+    llm_traces = sum(1 for n in rep.p_trace_turns if n)
+    A(f"- trace 文件：{rep.trace_files}；有 llm.call 的 trace：{llm_traces}")
     A("- 口径：eligible = reason ∈ {compress, econ_fail}；X = 工具结果原始 token 估算（估计值）")
     A("")
 
@@ -245,7 +247,8 @@ def format_markdown(rep: CalibrationReport, sugg: dict[str, object]) -> str:
         A("| 指标 | 值 |")
         A("|---|---|")
         A(f"| 参与 trace 数 | {n_traces} |")
-        A(f"| 每轮增长均值 | {statistics.mean(rep.p_deltas):,.0f} token（{len(rep.p_deltas)} 个样本） |")
+        p_mean = statistics.mean(rep.p_deltas)
+        A(f"| 每轮增长均值 | {p_mean:,.0f} token（{len(rep.p_deltas)} 个样本） |")
         A(f"| P50 / P90 | {p50:,.0f} / {p90:,.0f} |")
         A(f"| 建议 AVG_GROWTH_PER_TURN | {int(statistics.mean(rep.p_deltas)):,} |")
         A("")
@@ -265,8 +268,15 @@ def format_markdown(rep: CalibrationReport, sugg: dict[str, object]) -> str:
         A("| 指标 | 值 |")
         A("|---|---|")
         A(f"| 样本数 | {len(rep.x_tokens)}（覆盖率 {rep.x_with_size}/{rep.x_total}） |")
-        A(f"| P50 / P90 / P99 / max | {p50:,.0f} / {p90:,.0f} / {p99:,.0f} / {max(rep.x_tokens):,} token |")
-        A(f"| Top 工具 | {'、'.join(f'{k}({v})' for k, v in sorted(rep.x_tool_counts.items(), key=lambda kv: -kv[1])[:5])} |")
+        A(
+            f"| P50 / P90 / P99 / max | {p50:,.0f} / {p90:,.0f} / {p99:,.0f}"
+            f" / {max(rep.x_tokens):,} token |"
+        )
+        top_tools = "、".join(
+            f"{k}({v})"
+            for k, v in sorted(rep.x_tool_counts.items(), key=lambda kv: -kv[1])[:5]
+        )
+        A(f"| Top 工具 | {top_tools} |")
         A("")
         A("| 分桶(token) | 计数 |")
         A("|---|---|")
@@ -306,11 +316,19 @@ def format_markdown(rep: CalibrationReport, sugg: dict[str, object]) -> str:
         eligible = sum(rep.decide_reasons.get(r, 0) for r in _ELIGIBLE_REASONS)
         compressed = rep.decide_reasons.get("compress", 0)
         A("")
-        A(f"- eligible（compress + econ_fail）：{eligible}；触发率 = compress/eligible = {_f_ratio(compressed, eligible)}")
+        A(
+            f"- eligible（compress + econ_fail）：{eligible}；"
+            f"触发率 = compress/eligible = {_f_ratio(compressed, eligible)}"
+        )
         if rep.econ_fail_pairs:
             missed = sum(1 for be, en in rep.econ_fail_pairs if en > be)
-            A(f"- econ_fail {len(rep.econ_fail_pairs)} 例中 {missed} 例 expected_n > break_even（本可回本却跳过，潜在漏压）")
-            A(f"- econ_fail break_even 均值 {statistics.mean(be for be, _ in rep.econ_fail_pairs):.1f} / expected 均值 {statistics.mean(en for _, en in rep.econ_fail_pairs):.1f}")
+            A(
+                f"- econ_fail {len(rep.econ_fail_pairs)} 例中 {missed} 例"
+                " expected_n > break_even（本可回本却跳过，潜在漏压）"
+            )
+            be_mean = statistics.mean(be for be, _ in rep.econ_fail_pairs)
+            en_mean = statistics.mean(en for _, en in rep.econ_fail_pairs)
+            A(f"- econ_fail break_even 均值 {be_mean:.1f} / expected 均值 {en_mean:.1f}")
         A("")
     else:
         A("无 context.l2_decide 样本——决策数据未采集（需新版埋点采集后积累）。")
@@ -344,7 +362,10 @@ def format_markdown(rep: CalibrationReport, sugg: dict[str, object]) -> str:
             A(f"| {t} | {v} |")
     else:
         A("- EXPECTED_RATIO_BY_TYPE：样本不足，沿用先验。")
-    A(f"- ONLINE_COMPRESS_MIN：**{sugg.get('ONLINE_COMPRESS_MIN')}**（{sugg.get('ONLINE_COMPRESS_MIN_note', '')}）")
+    A(
+        f"- ONLINE_COMPRESS_MIN：**{sugg.get('ONLINE_COMPRESS_MIN')}**"
+        f"（{sugg.get('ONLINE_COMPRESS_MIN_note', '')}）"
+    )
     A("")
     return "\n".join(L)
 
@@ -373,7 +394,9 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(prog="kdagent obs calibrate", description="L2 标定报告")
-    parser.add_argument("--obs-dir", default=None, help="obs 根目录（默认 {work_dir}/.kdagent/obs）")
+    parser.add_argument(
+        "--obs-dir", default=None, help="obs 根目录（默认 {work_dir}/.kdagent/obs）"
+    )
     parser.add_argument("--run-id", default=None, help="只统计指定 eval 轮（trace 头 eval.run_id）")
     parser.add_argument("--json", action="store_true", help="输出结构化 JSON")
     parser.add_argument("--output", default=None, help="写文件（默认 stdout）")

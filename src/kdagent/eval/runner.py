@@ -43,7 +43,7 @@ from kdagent.subagent.runner import SubAgentRunner
 _GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": ""}
 
 # 补丁提取/判分要排除的运行时目录（不会成为改动的一部分）
-_RUNTIME_DIRS = (".kdagent", ".claude", ".venv")  # .venv：D96 治理③ preinstall 建在副本内的 venv，不进补丁
+_RUNTIME_DIRS = (".kdagent", ".claude", ".venv")  # .venv：D96③ preinstall 副本内 venv，不进补丁
 # 判分时不参与「改对了」判定的测试文件（回归防护用）
 _TEST_FILE_HINTS = ("test_", "_test", "tests/", "spec.", ".test.")
 
@@ -105,7 +105,9 @@ def patch_applies(source_repo: Path, base_commit: str, patch: str) -> str | None
             timeout=120,
         )
         if archive.returncode != 0:
-            return f"git archive 失败：{archive.stderr.strip() or archive.stdout.strip()}"
+            err = archive.stderr.decode("utf-8", "replace").strip()
+            out = archive.stdout.decode("utf-8", "replace").strip()
+            return f"git archive 失败：{err or out}"
         with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as tar:
             try:
                 tar.extractall(dest, filter="data")  # Python 3.12+（数据过滤）
@@ -576,7 +578,7 @@ class EvalRunner:
                 )
                 self._backfill(report, task, False, kind, reason)
             return
-        for task, outcome in zip(report.tasks, outcomes):
+        for task, outcome in zip(report.tasks, outcomes, strict=False):
             if outcome.resolved:
                 report.resolved.append(task.instance_id)
                 report.metrics.resolved += 1
@@ -584,7 +586,7 @@ class EvalRunner:
                 continue
             if outcome.error or outcome.empty_patch or not task.model_patch.strip():
                 # 环境/空补丁属 harness 侧问题，不是能力问题——直接 harness_fault
-                kind: FailureKind = "harness_fault"
+                kind = "harness_fault"
                 reason = outcome.reason or "模型补丁为空"
             else:
                 kind, reason = classify(task, task.model_patch, test_passed=False, agent_error="")

@@ -65,7 +65,10 @@ class ToolRegion(Vertical):
     def _detail(self, e: ToolEntry) -> str:
         """详情体：完整参数 + 输出全文（动态文本一律 escape_text，防 markup 解析破坏）。"""
         parts = [f"[bold]参数：[/bold]{escape_text(e.args)}"]
-        parts.append(f"[bold]输出：[/bold]{escape_text(e.content)}" if e.content else "[dim]（执行中…）[/dim]")
+        if e.content:
+            parts.append(f"[bold]输出：[/bold]{escape_text(e.content)}")
+        else:
+            parts.append("[dim]（执行中…）[/dim]")
         return "\n".join(parts)
 
     def _rebuild(self) -> None:

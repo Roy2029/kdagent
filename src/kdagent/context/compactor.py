@@ -24,7 +24,7 @@ import re
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 from kdagent.context.history import PersistedOutput, ProcessedToolResult
 from kdagent.engine.conversation import ConversationManager
@@ -289,6 +289,19 @@ class L2Decision:
     expected_n: int | None = None
 
 
+class DecisionKwargs(TypedDict, total=False):
+    """`evaluate_l2_decision` 的关键字参数集（`should_online_compress` 透传用）。"""
+
+    expected_remaining: int | None
+    cost: CostParams | None
+    window_size: int
+    avg_growth_per_turn: int
+    online_compress_min: int
+    save_threshold_tokens: int
+    expected_ratio: dict[str, float] | None
+    compress_instruction_tokens: int
+
+
 def evaluate_l2_decision(
     result: ToolResult,
     p_tokens: int,
@@ -345,7 +358,7 @@ def evaluate_l2_decision(
 def should_online_compress(
     result: ToolResult,
     p_tokens: int,
-    **kwargs,
+    **kwargs: Unpack[DecisionKwargs],
 ) -> bool:
     """L2 三门槛决策的 bool 封装（01 §5.3）；签名与语义保持不变，供既有调用方/测试。
 
