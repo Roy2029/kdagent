@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from kdagent.tools.base import ToolContext, ToolResult
+from kdagent.tools.shell import _terminate_tree
 
 
 def _result(
@@ -42,6 +43,10 @@ _WSL_MNT_RE = re.compile(r"^/mnt/([a-zA-Z])/")
 # git-bash/MSYS 盘符路径：/d/...（本环境 Bash 工具是 git-bash，pwd 返回此风格，
 # 与 WSL 的 /mnt/d/... 不同——D92 实测 Grep/Glob 收到 /d/... 被拼成 D:\d\... 双重盘符）
 _MSYS_DRIVE_RE = re.compile(r"^/([a-zA-Z])(/|$)")
+
+# Grep 超时（秒，D5 v052 review）：rg 扫大目录/网络挂载可能永久挂起，仿 shell.py
+# D87 模式——超时杀进程树，输出已收集部分 + is_error 提示，不永久挂住 Agent。
+_GREP_TIMEOUT = 60.0
 
 
 def _drive_exists(drive: str) -> bool:
@@ -391,10 +396,33 @@ class Grep:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await _wait_communicate(proc, _GREP_TIMEOUT)
+        except TimeoutError:
+            # D87 模式：超时杀进程树防孤儿，再读 5s 收尾缓冲输出。
+            _terminate_tree(proc)
+            try:
+                stdout, stderr = await _wait_communicate(proc, 5)
+            except (TimeoutError, OSError):
+                stdout, stderr = b"", b""
+            err = stderr.decode(errors="replace").strip()
+            content = f"rg 搜索超时（>{_GREP_TIMEOUT:.0f}s），已终止进程树"
+            partial = stdout.decode(errors="replace").rstrip()
+            if partial:
+                content = f"{content}\n已收集输出结尾：\n{partial[-2000:]}"
+            if err:
+                content = f"{content}\nstderr：{err}"
+            return _result(ctx, self.name, content, start, True)
         if proc.returncode == 2:
             err = stderr.decode(errors="replace").strip()
             return _result(ctx, self.name, f"rg 执行失败：{err}", start, True)
         # returncode == 1 表示无匹配，是正常结果而非错误
         content = stdout.decode(errors="replace").rstrip()
         return _result(ctx, self.name, content, start)
+
+
+async def _wait_communicate(
+    proc: asyncio.subprocess.Process, timeout: float
+) -> tuple[bytes, bytes]:
+    """包一层 wait_for（Grep 超时测试的 monkeypatch 目标，同 agent._retry_sleep 手法）。"""
+    return await asyncio.wait_for(proc.communicate(), timeout=timeout)

@@ -50,12 +50,13 @@ def _extractor(
     clock: _Clock | None = None,
     min_interval: float = 600.0,
     min_delta: int = 20_000,
+    estimate: int = 10_000,
 ) -> MemoryExtractor:
     clock = clock or _Clock()
     return MemoryExtractor(
         _store(tmp_path),
         llm,
-        estimate=lambda c: 10_000,  # 固定 token 估算
+        estimate=lambda c: estimate,  # 固定 token 估算
         min_interval=min_interval,
         min_delta=min_delta,
         clock=clock,
@@ -65,9 +66,20 @@ def _extractor(
 # ---- 触发门槛 ----
 
 @pytest.mark.asyncio
-async def test_first_run_always_extracts(tmp_path: Path) -> None:
+async def test_first_run_small_delta_skips(tmp_path: Path) -> None:
+    """首跑增量门（D5 v052）：首轮 mark 视为 0，会话增量 <20K（如「你好」）不提取。"""
     llm = _FakeLLM(['{"ops": []}'])
-    ex = _extractor(tmp_path, llm, clock=_Clock())
+    ex = _extractor(tmp_path, llm, clock=_Clock(), estimate=10_000)
+    conv = ConversationManager()
+    await ex.maybe_extract(conv)
+    assert llm.calls == 0  # 零 LLM 调用，会话刚建不值得惊动提取
+
+
+@pytest.mark.asyncio
+async def test_first_run_large_delta_extracts(tmp_path: Path) -> None:
+    """首跑增量门：会话已有 ≥20K 增量（说明是实质工作会话）→ 首轮即提取。"""
+    llm = _FakeLLM(['{"ops": []}'])
+    ex = _extractor(tmp_path, llm, clock=_Clock(), estimate=25_000)
     conv = ConversationManager()
     await ex.maybe_extract(conv)
     assert llm.calls == 1
@@ -77,9 +89,9 @@ async def test_first_run_always_extracts(tmp_path: Path) -> None:
 async def test_time_throttle_skips(tmp_path: Path) -> None:
     llm = _FakeLLM(['{"ops": []}'])
     clock = _Clock()
-    ex = _extractor(tmp_path, llm, clock=clock, min_interval=600.0)
+    ex = _extractor(tmp_path, llm, clock=clock, min_interval=600.0, estimate=25_000)
     conv = ConversationManager()
-    await ex.maybe_extract(conv)  # 首轮提取
+    await ex.maybe_extract(conv)  # 首轮提取（增量够）
     assert llm.calls == 1
     clock.now += 60.0  # 未到 10 分钟
     await ex.maybe_extract(conv)
@@ -90,10 +102,10 @@ async def test_time_throttle_skips(tmp_path: Path) -> None:
 async def test_delta_throttle_skips(tmp_path: Path) -> None:
     llm = _FakeLLM(['{"ops": []}'])
     clock = _Clock()
-    ex = _extractor(tmp_path, llm, clock=clock, min_interval=0.0, min_delta=20_000)
+    ex = _extractor(tmp_path, llm, clock=clock, min_interval=0.0, min_delta=20_000, estimate=25_000)
     conv = ConversationManager()
 
-    # 首轮提取（记录 token mark = 10_000）
+    # 首轮提取（记录 token mark = 25_000）
     await ex.maybe_extract(conv)
     assert llm.calls == 1
 
@@ -113,7 +125,7 @@ async def test_extract_applies_ops(tmp_path: Path) -> None:
         '{"action": "create", "name": "use-tabs", "type": "user", "description": "用户偏好", "content": "喜欢 tab"}'
         "]}"
     ])
-    ex = _extractor(tmp_path, llm)
+    ex = _extractor(tmp_path, llm, estimate=25_000)  # 首轮增量够 → 触发提取
     await ex.maybe_extract(ConversationManager())
     s = _store(tmp_path)
     assert s.read("lang-python") is not None
@@ -126,7 +138,7 @@ async def test_extract_applies_ops(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_empty_ops_creates_nothing(tmp_path: Path) -> None:
     llm = _FakeLLM(['{"ops": []}'])
-    ex = _extractor(tmp_path, llm)
+    ex = _extractor(tmp_path, llm, estimate=25_000)  # 首轮增量够 → 触发提取
     await ex.maybe_extract(ConversationManager())
     assert _store(tmp_path).list_all() == []
 

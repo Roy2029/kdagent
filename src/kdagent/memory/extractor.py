@@ -78,7 +78,10 @@ class MemoryExtractor:
         if self._last_run > 0 and elapsed < self._min_interval:
             return False
         if self._last_token_mark is None:
-            return True  # 从未提取过：首轮直接提取
+            # 首轮（从未提取过）：时间门槛豁免，但量级门槛保留——首轮 mark
+            # 视为 0，会话累计增量 ≥ min_delta 才触发。会话刚建只有「你好」
+            # 级别的增量不该惊动 LLM（D5 v052 review 修复首跑即提取）。
+            return self._estimate(conversation) >= self._min_delta
         delta = self._estimate(conversation) - self._last_token_mark
         return delta >= self._min_delta
 

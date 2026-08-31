@@ -47,6 +47,9 @@ class Config:
     # 01 T5-1 计价表：cost 段（按 provider 嵌套 {deepseek: {c_in..}} 或单一价目
     # {c_in, c_out, c_hit}，D83 机制就绪，数值待实测标定）。零配置回退 DEFAULT_COST。
     cost: dict[str, object] = field(default_factory=dict)
+    # 04 §3.6 会话保留：sessions 段（cleanup_days 过期清理天数，默认 30，0=关，
+    # D5 v052 review：cli 启动接线 cleanup_expired）。
+    sessions: dict[str, object] = field(default_factory=dict)
 
     def get_cost_table(self) -> dict[str, object]:
         """01 T5-1：`cost:` 计价表（cost_params_from_table 消费，按 provider 取价目）。"""
@@ -59,6 +62,14 @@ class Config:
         """
         v = self.agents.get("auto_background_ms", 120_000)
         return int(v) if isinstance(v, (int, float)) else 120_000
+
+    def get_cleanup_days(self) -> int:
+        """04 §3.6 会话保留：过期清理天数（`sessions.cleanup_days`，默认 30，0=关）。
+
+        非法值回退默认（零配置可用）。
+        """
+        v = self.sessions.get("cleanup_days", 30)
+        return int(v) if isinstance(v, (int, float)) else 30
 
 
 def load_config(project_dir: Path | None = None) -> Config:
@@ -99,6 +110,7 @@ def load_config(project_dir: Path | None = None) -> Config:
         mcp_servers=_dict("mcp_servers"),
         agents=_dict("agents"),
         cost=_dict("cost"),
+        sessions=_dict("sessions"),
     )
 
 
@@ -112,13 +124,55 @@ def _load_yaml_dict(path: Path) -> dict[str, Any]:
 
 
 def _deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
-    """dict 深合并：双方同层同 key 且都是 dict 时递归，否则后源覆盖。"""
+    """dict 深合并：双方同层同 key 且都是 dict 时递归，否则后源覆盖。
+
+    `hooks` 列表特殊（D5 v052 review）：三源合并时追加拼接 + 组合键去重——
+    用户级与项目级定义的 hook 应**同时生效**（覆盖语义会把项目级 hooks 整个
+    冲掉），同行为不重复触发；其余 list 键保持覆盖（最小变更，防误伤）。
+    """
     for key, value in over.items():
         if isinstance(value, dict) and isinstance(base.get(key), dict):
             base[key] = _deep_merge(base[key], value)
+        elif key == "hooks" and isinstance(value, list):
+            base[key] = _merge_hooks(base.get(key), value)
         else:
             base[key] = value
     return base
+
+
+def _merge_hooks(base: Any, over: list[Any]) -> list[Any]:
+    """hooks 列表追加合并：同组合键后源覆盖前源，异键追加。base 非列表按空处理。"""
+    merged = list(base) if isinstance(base, list) else []
+    for hook in over:
+        key = _hook_dedup_key(hook)
+        for i, existing in enumerate(merged):
+            if _hook_dedup_key(existing) == key:
+                merged[i] = hook  # 后源优先（与 dict 覆盖语义一致）
+                break
+        else:
+            merged.append(hook)
+    return merged
+
+
+def _hook_dedup_key(hook: Any) -> Any:
+    """hook 条目的组合键：event + matcher(if) + action.type + action 主负载。
+
+    「主负载」= action 里首个非空字符串值（command/prompt/url），对齐 D5 的
+    type+matcher+command 语义；非 dict 条目退化为自身（照常保留，不误去重）。
+    """
+    if not isinstance(hook, dict):
+        return hook
+    action = hook.get("action")
+    if isinstance(action, dict):
+        # 主负载排除 type 键本身：command/prompt/url 才是行为标识。
+        payload = next(
+            (v for k, v in action.items() if k != "type" and isinstance(v, str) and v),
+            "",
+        )
+        action_type = action.get("type")
+    else:
+        payload, action_type = "", None
+    return (hook.get("event"), hook.get("if"), action_type, payload)
 
 
 def load_api_key() -> str:

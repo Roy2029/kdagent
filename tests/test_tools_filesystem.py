@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -133,6 +134,42 @@ async def test_grep_no_match_is_not_error(tmp_path: Path) -> None:
     result = await Grep().execute(_ctx(tmp_path), {"pattern": "nothere"})
     assert result.is_error is False
     assert result.content == ""
+
+
+@_skip_no_rg
+async def test_grep_timeout_returns_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """rg 子进程超时 → is_error + 超时提示 + 杀进程树（D5 v052，仿 shell D87）。
+
+    `_wait_communicate` 首调抛 TimeoutError 模拟 rg 永久挂起；断言走超时分支：
+    终止进程树被调用、返回 is_error、带已终止提示。
+    """
+    import kdagent.tools.filesystem as fs_mod
+
+    killed: list[Any] = []
+    real_terminate = fs_mod._terminate_tree
+
+    def _spy_terminate(proc: Any) -> None:
+        killed.append(proc)
+        real_terminate(proc)  # 真实杀进程树（防孤儿）
+
+    calls = {"n": 0}
+
+    async def _hang(proc: Any, timeout: float) -> tuple[bytes, bytes]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError()
+        return b"", b""  # 收尾读取：无缓冲输出
+
+    monkeypatch.setattr(fs_mod, "_wait_communicate", _hang)
+    monkeypatch.setattr(fs_mod, "_terminate_tree", _spy_terminate)
+    _write(tmp_path / "a.py", "x = 1\n")
+    result = await Grep().execute(_ctx(tmp_path), {"pattern": "x"})
+    assert result.is_error is True
+    assert "超时" in result.content
+    assert "已终止进程树" in result.content
+    assert len(killed) == 1  # 终止被调用一次
 
 
 def test_meta_declarations() -> None:

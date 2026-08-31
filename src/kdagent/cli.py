@@ -33,6 +33,7 @@ from kdagent.memory.extractor import MemoryExtractor
 from kdagent.memory.store import build_memory_store
 from kdagent.permission.checker import build_permission_checker
 from kdagent.permission.modes import MODE_MATRIX
+from kdagent.sessions.manager import SessionManager
 from kdagent.skill import BUILTIN_SKILLS_DIR, LoadSkill, SkillCreator, SkillManager
 from kdagent.subagent import (
     BUILTIN_AGENTS_DIR,
@@ -193,6 +194,20 @@ def build_kdapp(work_dir: Path | None = None) -> KDApp:
     else:
         llm = _MissingKeyClient()
     kd_dir = work_dir / (config.kdagent_dir or ".kdagent")
+    # 04 §3.6 会话保留（D5 v052 review 接线）：启动清理过期会话。天数
+    # `sessions.cleanup_days`（默认 30，0=关）；清理失败只告警不阻断启动
+    # （损坏文件/无权限目录不应挡在 TUI 之前）。obs 目录随会话删除联动。
+    try:
+        cleanup_days = config.get_cleanup_days()
+        if cleanup_days > 0:
+            SessionManager(kd_dir / "sessions", obs_dir=kd_dir / "obs").cleanup_expired(
+                days=cleanup_days
+            )
+    except Exception as exc:
+        print(
+            f"[kdagent] 警告：会话过期清理失败已跳过（{exc}）",
+            file=sys.stderr,
+        )
     # 06 M3 可控档：五层裁决器 + Hook 引擎（config.hooks 列表）。本地规则
     # learn 目标 = 项目级 permissions.local.yaml。
     # N2：模式默认来自 config.permissions.mode，但上次 /permissions 切换已落盘
