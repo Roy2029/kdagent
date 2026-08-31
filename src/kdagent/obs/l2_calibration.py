@@ -146,22 +146,27 @@ def analyze(obs_dir: Path, run_id: str | None = None) -> CalibrationReport:
     traces_dir = obs_dir / "traces"
     if not traces_dir.is_dir():
         return rep
-    for sid_dir in sorted(traces_dir.iterdir()):
-        if not sid_dir.is_dir():
+    # 兼容两种落盘布局：标准 `traces/{session_id}/{trace_id}.jsonl`，以及 eval/脚本
+    # 产出的平铺 `traces/{trace_id}.jsonl`（无 session 分目录，文件即 trace）。
+    trace_files: list[Path] = []
+    for item in sorted(traces_dir.iterdir()):
+        if item.is_dir():
+            trace_files += sorted(item.glob("*.jsonl"))
+        elif item.suffix == ".jsonl":
+            trace_files.append(item)
+    for file in trace_files:
+        rows = _read_rows(file)
+        trace_attrs: dict[str, Any] = {}
+        for row in rows:
+            if row.get("_type") == "trace":
+                a = row.get("attributes")
+                if isinstance(a, dict):
+                    trace_attrs = a
+                break
+        if run_id and trace_attrs.get("eval.run_id") != run_id:
             continue
-        for file in sorted(sid_dir.glob("*.jsonl")):
-            rows = _read_rows(file)
-            trace_attrs: dict[str, Any] = {}
-            for row in rows:
-                if row.get("_type") == "trace":
-                    a = row.get("attributes")
-                    if isinstance(a, dict):
-                        trace_attrs = a
-                    break
-            if run_id and trace_attrs.get("eval.run_id") != run_id:
-                continue
-            rep.trace_files += 1
-            _collect_trace(rep, rows)
+        rep.trace_files += 1
+        _collect_trace(rep, rows)
     for model, bucket in rep.cost_tokens.items():
         rep.cost_cny += estimate_token_cost(
             bucket[0], bucket[1], bucket[2],

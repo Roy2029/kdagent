@@ -192,6 +192,45 @@ def test_run_id_filter(tmp_path: Path) -> None:
     assert rep.cost_tokens["deepseek-v4-flash"] == [23_000, 200, 20_000]
 
 
+def _write_trace_flat(obs_dir: Path, trace_id: str, run_id: str, rows: list[dict]) -> None:
+    """eval 跑批的平铺布局：traces/{trace_id}.jsonl 直放（无 session 分目录）。"""
+    d = obs_dir / "traces"
+    d.mkdir(parents=True, exist_ok=True)
+    header = {
+        "_type": "trace",
+        "trace_id": trace_id,
+        "session_id": "",
+        "attributes": {"eval.run_id": run_id},
+    }
+    lines = [json.dumps(header, ensure_ascii=False)] + [
+        json.dumps(r, ensure_ascii=False) for r in rows
+    ]
+    (d / f"{trace_id}.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_analyze_flat_layout_eval_traces(tmp_path: Path) -> None:
+    """平铺布局（eval 跑批 traces/{trace_id}.jsonl）与 run_id 过滤同样生效。"""
+    obs_dir = tmp_path / "obs"
+    _write_trace_flat(
+        obs_dir,
+        "tr-flat",
+        "eval-flat",
+        [
+            _llm_call(10_000, 100, 10_000, start_ts=1),
+            _llm_call(13_000, 100, 10_000, start_ts=2),  # Δ3000
+            _tool_exec("Bash", 1_000, 4_000),
+        ],
+    )
+    rep = analyze(obs_dir)
+    assert rep.trace_files == 1
+    assert rep.p_deltas == [3_000]
+    assert rep.x_tokens == [1_000]
+    assert rep.cost_tokens["deepseek-v4-flash"] == [23_000, 200, 20_000]
+    # run_id 过滤在平铺布局同样生效
+    assert analyze(obs_dir, run_id="eval-other").trace_files == 0
+    assert analyze(obs_dir, run_id="eval-flat").trace_files == 1
+
+
 def test_no_data_empty_dir(tmp_path: Path) -> None:
     """空 obs → trace_files=0，各桶为空（不 crash）。"""
     empty = tmp_path / "nonexistent-obs"
