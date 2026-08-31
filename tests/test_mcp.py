@@ -175,6 +175,35 @@ def test_toolsearch_keywords_search() -> None:
     assert miss.is_error
 
 
+def test_toolsearch_keywords_single_hit_loads_and_marks() -> None:
+    """D6 v052：keywords 单命中复用 select 路径——立即 mark_discovered + 完整 schema。
+
+    不再要求模型二次 select；返回结构标注 discovered: true。
+    """
+    registry, _ = _registry_with_deferred()
+    ts = ToolSearch(registry)
+    result = ts._by_keywords("prometheus", "t1")
+    assert not result.is_error
+    assert "discovered: true" in result.content  # 标注已发现
+    assert "Prometheus 查询" in result.content  # 完整 description
+    assert registry.is_discovered("mcp_prom_promql_query")
+    # 已发现 → 不再是延迟名（下一轮 payload 进完整 schema）
+    assert registry.deferred_tool_names() == ["mcp_prom_delete_data"]
+
+
+def test_toolsearch_keywords_multi_hit_lists_no_load() -> None:
+    """多命中：只列候选让模型 select 精确锁定，不批量加载（防 context 浪费）。"""
+    registry, _ = _registry_with_deferred()
+    ts = ToolSearch(registry)
+    result = ts._by_keywords("prom", "t1")  # 两工具名都含 mcp_prom
+    assert not result.is_error
+    assert "命中多个" in result.content
+    assert "mcp_prom_promql_query" in result.content
+    assert "mcp_prom_delete_data" in result.content
+    assert not registry.is_discovered("mcp_prom_promql_query")
+    assert not registry.is_discovered("mcp_prom_delete_data")
+
+
 # ---- registry 延迟加载 ----
 
 def test_payload_schemas_defers_mcp_keeps_builtin() -> None:

@@ -15,8 +15,9 @@ from typing import Any
 from kdagent.tools.base import ToolContext, ToolResult
 from kdagent.tools.registry import ToolRegistry
 
-# 延迟工具 schema 渲染（完整喂给模型，供正常调用）。
-_SCHEMA_TEMPLATE = """工具 {name}（延迟，已加载，下一轮可用）
+# 延迟工具 schema 渲染（完整喂给模型，供正常调用）。discovered: true 显式
+# 标注已加载（D6 v052 review：keywords 与 select 命中即加载，模型可区分）。
+_SCHEMA_TEMPLATE = """工具 {name}（discovered: true，已加载，下一轮可用）
 
 {description}
 
@@ -96,14 +97,14 @@ class ToolSearch:
             return ToolResult(
                 tool_use_id=tool_use_id, name=self.name, content="keywords 为空", is_error=True
             )
-        hits: list[str] = []
+        # 循环内捕获 (name, tool) 对：类型收窄，单/多命中共用。
+        hits: list[tuple[str, Any]] = []
         for name in self._registry.deferred_tool_names():
             tool = self._registry.get(name)
             if tool is None:
                 continue
             if kw in name.lower() or kw in (tool.description or "").lower():
-                first_line = tool.description.splitlines()[0] if tool.description else ""
-                hits.append(f"- {name}：{first_line}")
+                hits.append((name, tool))
         if not hits:
             return ToolResult(
                 tool_use_id=tool_use_id,
@@ -111,10 +112,27 @@ class ToolSearch:
                 content=f"未命中延迟工具（关键词：{keywords}）",
                 is_error=True,
             )
+        if len(hits) > 1:
+            # 多命中：列表让模型用 select 精确锁定，不批量加载（防 context 浪费）。
+            lines = []
+            for name, tool in hits:
+                first_line = tool.description.splitlines()[0] if tool.description else ""
+                lines.append(f"- {name}：{first_line}")
+            return ToolResult(
+                tool_use_id=tool_use_id,
+                name=self.name,
+                content="命中多个延迟工具（可用 select 精确加载）：\n" + "\n".join(lines),
+            )
+        # 单命中：复用 select 路径（D6）——立即 mark_discovered + 返回完整 schema，
+        # 不再要求二次 select。与 `_by_name` 行为对齐。
+        name, tool = hits[0]
+        self._registry.mark_discovered(name)
         return ToolResult(
             tool_use_id=tool_use_id,
             name=self.name,
-            content="命中延迟工具（可用 select 精确加载）：\n" + "\n".join(hits),
+            content=_SCHEMA_TEMPLATE.format(
+                name=name, description=tool.description, schema=_schema_text(tool.input_schema)
+            ),
         )
 
 
