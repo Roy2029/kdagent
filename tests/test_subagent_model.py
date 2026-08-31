@@ -32,7 +32,7 @@ def test_parse_valid_minimal() -> None:
     assert agent.disallowed_tools == ()
     assert agent.model == "inherit"
     assert agent.max_turns == DEFAULT_MAX_TURNS
-    assert agent.permission_mode == "default"
+    assert agent.permission_mode == ""  # 未声明 = 继承父 checker（v052 review 收口语义）
     assert agent.system_prompt == "正文\n指令"
 
 
@@ -93,9 +93,10 @@ def test_parse_max_turns_invalid_fallback() -> None:
 
 
 def test_parse_permission_mode_invalid_fallback() -> None:
+    """非法 permissionMode → 未声明语义（""），不误落到 default 自动拒绝。"""
     agent = parse_agent_text(_text(permissionMode="anything"))
     assert agent is not None
-    assert agent.permission_mode == "default"
+    assert agent.permission_mode == ""
 
 
 def test_parse_file(tmp_path) -> None:

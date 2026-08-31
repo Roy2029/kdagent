@@ -419,22 +419,30 @@ def test_permissions_switch_mode(tmp_path: Path) -> None:
 
 
 def test_permissions_switch_camelcase_modes(tmp_path: Path) -> None:
-    """camelCase 模式名（acceptEdits/bypassPermissions）可切换，不被小写化误伤。"""
-    for args, expect in (("acceptEdits", "acceptEdits"), ("bypassPermissions", "bypassPermissions")):
-        ui = _PermissionUI()
-        cmd = build_default_commands().find("permissions")
-        cmd.handler(_ctx(tmp_path, ui, args=args))  # type: ignore[union-attr]
-        assert ui.mode == expect
-        assert any(f"已切换到权限模式：{expect}" in m for m in ui.messages)
+    """camelCase 模式名（acceptEdits）可切换，不被小写化误伤。"""
+    ui = _PermissionUI()
+    cmd = build_default_commands().find("permissions")
+    cmd.handler(_ctx(tmp_path, ui, args="acceptEdits"))  # type: ignore[union-attr]
+    assert ui.mode == "acceptEdits"
+    assert any("已切换到权限模式：acceptEdits" in m for m in ui.messages)
 
 
 def test_permissions_switch_mode_lowercase_aliases(tmp_path: Path) -> None:
-    """小写别名（acceptedits/bypasspermissions）同样命中，回传规范 camelCase。"""
-    for args, expect in (("acceptedits", "acceptEdits"), ("bypasspermissions", "bypassPermissions")):
+    """小写别名（acceptedits）同样命中，回传规范 camelCase。"""
+    ui = _PermissionUI()
+    cmd = build_default_commands().find("permissions")
+    cmd.handler(_ctx(tmp_path, ui, args="acceptedits"))  # type: ignore[union-attr]
+    assert ui.mode == "acceptEdits"
+
+
+def test_permissions_cannot_switch_bypass(tmp_path: Path) -> None:
+    """bypassPermissions 仅配置文件可开启（D16）：UI 切换被拒并提示。"""
+    for args in ("bypassPermissions", "bypasspermissions"):
         ui = _PermissionUI()
         cmd = build_default_commands().find("permissions")
         cmd.handler(_ctx(tmp_path, ui, args=args))  # type: ignore[union-attr]
-        assert ui.mode == expect
+        assert ui.mode == "default"  # 未被切换
+        assert any("仅配置文件可开启" in m for m in ui.messages)
 
 
 def test_permissions_unknown_mode_guides(tmp_path: Path) -> None:

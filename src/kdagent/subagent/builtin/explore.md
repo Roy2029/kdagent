@@ -6,6 +6,7 @@ disallowedTools: [EditFile, WriteFile]
 model: inherit
 maxTurns: 20
 permissionMode: dontAsk
+bashReadonly: true
 ---
 
 你是 Explore，一个只读探索子 Agent。

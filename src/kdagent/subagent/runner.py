@@ -39,7 +39,7 @@ from kdagent.engine.llm.base import LLMClient, Usage
 from kdagent.engine.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock
 from kdagent.hooks.engine import HookEngine
 from kdagent.obs.telemetry import Telemetry
-from kdagent.permission.checker import PermissionChecker
+from kdagent.permission.checker import PermissionChecker, _bash_pipeline_readonly
 from kdagent.subagent.model import AgentDef
 from kdagent.tools.registry import ToolRegistry
 
@@ -77,6 +77,33 @@ FORK_SYSTEM_PROMPT = (
 )
 
 
+class _ReadOnlyBashTool:
+    """bash_readonly Agent 的 Bash 门禁包装（review 修复 2026-08-31）。
+
+    机制级只读限制而非仅提示词约束：`validate_input` 校验命令全段只读
+    （复用 06 `_bash_pipeline_readonly` 白名单口径），非只读直接拒绝
+    （is_error 进历史）。其余属性/方法全部透传内部工具。
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    def validate_input(self, input: dict[str, Any]) -> list[str]:
+        errors: list[str] = list(self._inner.validate_input(input))
+        if errors:
+            return errors
+        cmd = input.get("command")
+        if isinstance(cmd, str) and not _bash_pipeline_readonly(cmd):
+            return [
+                "该 Agent 为只读 Agent：只允许只读 Bash 命令"
+                "（ls/find/grep/cat 等及其只读管道组合），写操作请用文件工具或主 Agent。"
+            ]
+        return []
+
+
 @dataclass(frozen=True, slots=True)
 class SubAgentResult:
     """子 Agent 运行结果（Agent 工具的返回载荷）。"""
@@ -99,6 +126,8 @@ def filter_tools(
 
     `fork=True` 跳过第 2/4 层（Fork 继承全部工具不过滤），第 1 层全局禁始终生效
     （Fork 内再 Fork 被拦截）；后台模式叠加第 3 层白名单。
+    `bash_readonly` 定义（Explore 类）→ Bash 换只读门禁包装（机制级限制，
+    非 `env` 类提权通道、非只读命令直接拒绝——review 修复 2026-08-31）。
     """
     filtered = ToolRegistry()
     for tool in source.all():
@@ -116,6 +145,8 @@ def filter_tools(
             # 第 2/4 层：disallowedTools 黑名单从中排除。
             if name in definition.disallowed_tools:
                 continue
+        if definition is not None and definition.bash_readonly and name == "Bash":
+            tool = _ReadOnlyBashTool(tool)
         filtered.register(tool)
     return filtered
 
@@ -154,14 +185,18 @@ def build_forked_messages(parent_messages: list[Message], task: str) -> list[Mes
 
 
 class _SubSink:
-    """子 Agent 事件收集器：文本累积 + usage + 自动批准 ask（headless 无 HITL）。
+    """子 Agent 事件收集器：文本累积 + usage + 按 permissionMode 裁决 L5 HITL。
 
-    `PermissionRequestEvent` 自动 allow：子 Agent 的能力边界已被工具过滤四层锁死，
-    父 Agent 调用 Agent 工具即完成「人级授权」——子 Agent 内不再逐次弹窗。
-    deny 类安全规则仍由 PermissionChecker 裁决（M3 五层，子 Agent 不绕过）。
+    `PermissionRequestEvent`（L5 人工确认）裁决（review 修复 2026-08-31）：
+    - `dontAsk` 显式声明 → 自动 allow（10 §3.7 全自动无弹窗语义）；
+    - `default`/`acceptEdits` 显式声明 → deny（headless 无 UI 可问，fail-closed；
+      拒绝经 D23 语义 is_error 进历史，子 Agent 重决策不中断）；
+    - 未声明（""）→ 自动 allow（向后兼容：既有依赖 headless 放行的用法不破坏）。
+    L1-L4 硬防线仍由 PermissionChecker 裁决，子 Agent 不绕过。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, permission_mode: str = "") -> None:
+        self.permission_mode = permission_mode
         self.text_parts: list[str] = []
         self.usage = Usage()
         self.error: str | None = None
@@ -172,7 +207,10 @@ class _SubSink:
         elif isinstance(ev, UsageEvent):
             self.usage = ev.usage
         elif isinstance(ev, PermissionRequestEvent):
-            ev.future.set_result("allow")
+            if self.permission_mode in ("default", "acceptEdits"):
+                ev.future.set_result("deny")
+            else:
+                ev.future.set_result("allow")
         elif isinstance(ev, ErrorEvent):
             self.error = ev.error
 
@@ -247,7 +285,13 @@ class SubAgentRunner:
         conversation = ConversationManager()
         if fork and parent_conversation is not None:
             conversation.restore(build_forked_messages(parent_conversation.messages, task))
-        sink = _SubSink()
+        # review 修复（2026-08-31）：permissionMode 接入——声明的模式裁决 L5（sink），
+        # acceptEdits 派生同组件 checker 让矩阵层一致（L1-L3 共享不绕过）；未声明（""）
+        # 与 dontAsk 继承父 checker 原行为。
+        sink = _SubSink(permission_mode=definition.permission_mode)
+        checker = self._permission_checker
+        if definition.permission_mode == "acceptEdits" and checker is not None:
+            checker = checker.with_mode("acceptEdits")
         llm = self._llm
         if model and model != self._config.model and self._make_client is not None:
             llm = self._make_client(model)
@@ -263,7 +307,7 @@ class SubAgentRunner:
                 else definition.system_prompt
             ),
             max_iterations=definition.max_turns,
-            permission_checker=self._permission_checker,
+            permission_checker=checker,
             telemetry=active_telemetry,  # 10 §5 342：setter 注入后子 Agent 也产 trace
             session_id=parent_session_id,  # 10 §5 342：继承父会话（trace 归属落父目录）
             parent_trace_id=parent_trace_id,

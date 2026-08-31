@@ -10,6 +10,8 @@ Agent body 是子 Agent 启动时的**系统提示**（伴随整个生命周期�
 字段（规格 10 §3.4）：name/description 必填；tools/disallowedTools（白名单确定范围、
 黑名单排除——优先黑名单）；model（inherit 默认）；maxTurns（20 默认）；
 permissionMode（default/acceptEdits/dontAsk）；isolation（worktree）；background。
+bashReadonly（false 默认）：置位后该 Agent 的 Bash 只放行只读命令（Explore 类用，
+机制级限制而非仅提示词——review 修复 2026-08-31）。
 """
 
 from __future__ import annotations
@@ -43,9 +45,10 @@ class AgentDef:
     disallowed_tools: tuple[str, ...] = ()  # 黑名单：从中排除
     model: str = "inherit"  # inherit = 沿用父模型
     max_turns: int = DEFAULT_MAX_TURNS
-    permission_mode: str = "default"  # default/acceptEdits/dontAsk
+    permission_mode: str = ""  # 声明的权限模式 default/acceptEdits/dontAsk；"" = 未声明（继承父）
     isolation: str = ""  # worktree（M5-b 落地）；空 = 共享主目录
     background: bool = False  # 定义级默认后台（当前仅 Fork 强制）
+    bash_readonly: bool = False  # Bash 只放行只读命令（机制级，Explore 类 Agent 用）
     system_prompt: str = ""  # 正文：子 Agent 系统提示
     path: Path | None = None  # 源文件路径
 
@@ -85,13 +88,14 @@ def parse_agent_text(text: str, *, path: Path | None = None) -> AgentDef | None:
     max_turns = raw.get("maxTurns", DEFAULT_MAX_TURNS)
     if not isinstance(max_turns, int) or max_turns <= 0:
         max_turns = DEFAULT_MAX_TURNS
-    permission_mode = raw.get("permissionMode", "default")
+    permission_mode = raw.get("permissionMode", "")
     if permission_mode not in _PERMISSION_MODES:
-        permission_mode = "default"
+        permission_mode = ""  # 未声明或非法值 → 未声明语义（继承父 checker，向后兼容）
     isolation = raw.get("isolation", "")
     if not isinstance(isolation, str) or isolation not in _ISOLATIONS:
         isolation = ""
     background = bool(raw.get("background", False))
+    bash_readonly = bool(raw.get("bashReadonly", False))
     return AgentDef(
         name=name,
         description=description.strip(),
@@ -102,6 +106,7 @@ def parse_agent_text(text: str, *, path: Path | None = None) -> AgentDef | None:
         permission_mode=permission_mode,
         isolation=isolation,
         background=background,
+        bash_readonly=bash_readonly,
         system_prompt=text[m.end() :].strip(),
         path=path,
     )

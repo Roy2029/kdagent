@@ -509,8 +509,12 @@ def register_skill_commands(
         )
 
 
-# 06 M3 可控档：权限模式清单（/permissions 可切换；bypassPermissions 仅黑名单仍生效）。
-_PERMISSION_MODES = ("default", "acceptEdits", "plan", "bypassPermissions")
+# 06 M3 可控档：权限模式清单（/permissions 可切换）。
+# 🔴 review 修复（2026-08-31）：收回 bypassPermissions 的 UI 切换入口——D16 明确
+# 「bypassPermissions 仅配置文件开启，不提供 UI 快捷切换」（提权面不应一键触达）。
+_PERMISSION_MODES = ("default", "acceptEdits", "plan")
+# 仅配置文件可开启的模式（/permissions 查看时显示提示，不可切换）。
+_CONFIG_ONLY_MODES = ("bypassPermissions",)
 
 
 def _cmd_eval(ctx: CommandContext) -> None:
@@ -541,7 +545,12 @@ def _cmd_permissions(ctx: CommandContext) -> None:
     mode = ctx.ui.get_permission_mode()
     if not ctx.args:
         options = "、".join(f"/permissions {m}" for m in _PERMISSION_MODES)
-        lines = [f"当前权限模式：{mode}", f"可切换：{options}"]
+        config_only = "、".join(_CONFIG_ONLY_MODES)
+        lines = [
+            f"当前权限模式：{mode}",
+            f"可切换：{options}",
+            f"仅配置文件可开启：{config_only}（/permissions 不可切换，D16）",
+        ]
         ctx.ui.add_system_message("\n".join(lines))
         return
     # 模式名含 camelCase（acceptEdits/bypassPermissions），参数统一小写后
@@ -550,6 +559,11 @@ def _cmd_permissions(ctx: CommandContext) -> None:
     by_lower = {m.lower(): m for m in _PERMISSION_MODES}
     canonical = by_lower.get(target.lower())
     if canonical is None:
+        if target.lower() in {m.lower() for m in _CONFIG_ONLY_MODES}:
+            ctx.ui.add_system_message(
+                f"{target} 仅配置文件可开启（permissions.mode），/permissions 不可切换"
+            )
+            return
         ctx.ui.add_system_message(f"未知权限模式：{ctx.args}（可选：{'、'.join(_PERMISSION_MODES)}）")
         return
     ctx.ui.set_permission_mode(canonical)

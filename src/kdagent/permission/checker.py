@@ -43,14 +43,23 @@ _SENSITIVE_DIRNAMES = frozenset({"skills"})
 # 用户在 acceptEdits 下看到"只读命令也弹窗"。这里对**单条**只读命令放行。
 # 只收录明确无写变体的命令（排除 sed -i、awk、tr 等有破坏性变体的）；
 # 复杂形态（重定向/管道/命令组合）不走此判断，仍按 L4 矩阵 ask，安全优先。
+# 🔴 review 修复（2026-08-31）：移除 `env`——它是通用命令执行器
+# （`env python -c "..."` 免审批执行任意代码），不属于只读。
 _READONLY_COMMANDS = frozenset(
     {
         "ls", "find", "grep", "cat", "head", "tail", "wc", "pwd", "echo",
         "printf", "which", "type", "diff", "file", "strings", "du", "df",
         "free", "whoami", "dirname", "basename", "date", "stat", "realpath",
-        "tree", "sort", "uniq", "cut", "env", "printenv",
+        "tree", "sort", "uniq", "cut", "printenv",
     }
 )
+
+# 只读命令的危险变体：参数命中排除 token 即不放行（find -delete/-exec 可写盘）。
+_READONLY_EXCLUDE_TOKENS: dict[str, frozenset[str]] = {
+    "find": frozenset(
+        {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fls", "-fprint", "-fprintf"}
+    ),
+}
 
 
 def _is_readonly_bash(command: str) -> bool:
@@ -58,6 +67,8 @@ def _is_readonly_bash(command: str) -> bool:
 
     首 token 经 ``Path(name).name`` 容忍 `/usr/bin/grep` 全路径；含
     ``> | < ; & $() ` `` 任一即不视为纯只读（可能改写外部状态）。
+    白名单命令若命中 `_READONLY_EXCLUDE_TOKENS` 的危险变体（如 `find -delete`）
+    也不放行（🔴 review 修复）。
     """
     if not command or not command.strip():
         return False
@@ -72,7 +83,44 @@ def _is_readonly_bash(command: str) -> bool:
         return False
     if not tokens:
         return False
-    return Path(tokens[0]).name in _READONLY_COMMANDS
+    first = Path(tokens[0]).name
+    if first not in _READONLY_COMMANDS:
+        return False
+    exclude = _READONLY_EXCLUDE_TOKENS.get(first)
+    return not (exclude is not None and any(tok in exclude for tok in tokens[1:]))
+
+
+def _bash_pipeline_readonly(command: str) -> bool:
+    """命令全只读 → True（bash_readonly Agent 门禁用）。
+
+    与 `_is_readonly_bash`（单条保守口径，acceptEdits 自动放行）不同：允许纯只读
+    管道/组合（`grep x src | wc -l`、`ls && git log`）——按 ``&& || ; |`` 分段后
+    逐段过只读白名单；任一段非只读（rm/sed -i/重定向/命令替换）即 False。
+    """
+    for seg in re.split(r"&&|\|\||;|\|", command):
+        seg = seg.strip()
+        if seg and not _is_readonly_bash(seg):
+            return False
+    return True
+
+
+# 敏感路径「出现即拦」兜底（🔴 review 修复）：写语法提取（rm/mv/cp/重定向）之外，
+# 命令文本同时满足「引用 kdagent 目录」+「点名敏感文件/skills」→ 升级 ask。
+# 覆盖 `cd .kdagent && rm permissions.local.yaml`、`sed -i`、`python -c "os.remove(...)"`
+# 等所有写形态——不变量是「命令文本出现敏感路径即需确认」，不再穷举写命令语法。
+# 拦的是 ask 不是 deny（用户可放行）；误伤面 = 读写敏感路径多一次确认，可接受。
+_SENSITIVE_SUBSTRINGS: tuple[str, ...] = (
+    "config.yaml", "config.local.yaml", "permissions.yaml", "permissions.local.yaml",
+    "skills",
+)
+
+
+def _mentions_sensitive_path(command: str) -> bool:
+    """命令引用 kdagent 目录且点名敏感文件/目录 → True（大小写不敏感，子串匹配）。"""
+    lowered = command.casefold()
+    if ".kdagent" not in lowered:
+        return False  # 未引用 kd 目录（如根目录 `cat config.yaml`）不构成写风险
+    return any(s in lowered for s in _SENSITIVE_SUBSTRINGS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +161,21 @@ class PermissionChecker:
         if mode not in MODE_MATRIX:
             raise ValueError(f"未知权限模式：{mode}")
         self._mode = mode
+
+    def with_mode(self, mode: Mode) -> PermissionChecker:
+        """同组件派生指定模式的新 checker（子 Agent permissionMode 收口用）。
+
+        黑名单/沙箱/规则/工作目录/kd 目录全部共享同一实例，仅 L4 矩阵模式不同——
+        子 Agent 不绕过 L1-L3（review 修复 2026-08-31）。
+        """
+        return PermissionChecker(
+            mode=mode,
+            blacklist=self._blacklist,
+            sandbox=self._sandbox,
+            rules=self._rules,
+            work_dir=self._work_dir,
+            kdagent_dirs=self._kdagent_dirs,
+        )
 
     # ---- 裁决 ----
 
@@ -165,6 +228,13 @@ class PermissionChecker:
             effect, rule_str = self._rules.evaluate(tool.name, content)
             if effect is not None:
                 return Decision(effect, "权限规则命中", rule=rule_str)
+
+        # 敏感路径「出现即拦」兜底（🔴 review 修复）：置于 L3 之后（显式规则优先）、
+        # 只读免审批与 L4 之前——读敏感文件也值得一次确认。
+        if tool.name == "Bash" and _mentions_sensitive_path(content):
+            return Decision(
+                "ask", "命令引用 kdagent 敏感路径（出现即拦兜底），需确认"
+            )
 
         # D10 命令级只读判断（N3）：acceptEdits 下 Bash 单条只读命令免审批。
         # 置于 L3 之后（规则优先：用户显式 deny 的仍拦）、L4 之前（只读不落矩阵 ask）。
@@ -227,15 +297,18 @@ class PermissionChecker:
         except OSError:
             real = p.absolute()
         real_str = str(real)
-        name = p.name.casefold()
+        # 🔴 review 修复：name/parts 与 containment 统一用 resolved 路径——
+        # 原 name/parts 取未解析的 p，work_dir 内 symlink 指向 .kdagent/skills/
+        # 时（real 落在 kd 目录内进入分支）parts 无 skills → 绕过禁写。
+        name = real.name.casefold()
         for kd in self._kdagent_dirs:
             kd_str = str(kd)
             sep = "\\" if kd_str.find("\\") >= 0 else "/"
             if not (real_str == kd_str or real_str.startswith(kd_str + sep)):
                 continue
             if name in _SENSITIVE_FILENAMES:
-                return f"敏感路径禁写：{raw_path}（{p.name} 属系统配置文件）"
-            if any(part.casefold() in _SENSITIVE_DIRNAMES for part in p.parts):
+                return f"敏感路径禁写：{raw_path}（{real.name} 属系统配置文件）"
+            if any(part.casefold() in _SENSITIVE_DIRNAMES for part in real.parts):
                 return f"敏感路径禁写：{raw_path}（skills/ 可注入系统提示词）"
         return None
 
