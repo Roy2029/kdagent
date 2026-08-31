@@ -134,12 +134,18 @@ class _OpenAIStreamParser:
         self._emitted_text = False
 
     def feed(self, line: str) -> list[LLMStreamEvent]:
+        # SSE 容错（review 修复 2026-08-31）：空行/`:` 注释行/event:/id: 等非 data
+        # 行、以及非 JSON 的 data 行一律跳过——SSE 规范本就允许，解析炸了会中断
+        # 整条流把瞬态噪声放大成终止错误。
         if not line.startswith("data:"):
             return []
         data = line[5:].strip()
         if data == "[DONE]":
             return self._ensure_stop()
-        chunk = json.loads(data)
+        try:
+            chunk = json.loads(data)
+        except json.JSONDecodeError:
+            return []
         events: list[LLMStreamEvent] = []
         if chunk.get("usage"):
             events.append(LLMStreamEvent(type="usage", usage=_parse_usage(chunk["usage"])))
@@ -243,7 +249,9 @@ class _OpenAIStreamParser:
 class OpenAICompatClient:
     """OpenAI 兼容协议客户端（DeepSeek 主 provider 走此 adapter）。"""
 
-    def __init__(self, config: ProviderConfig, timeout: float = 60.0) -> None:
+    # 120s：DeepSeek 长 prompt 首 token 可达分钟级（review 修复 2026-08-31，
+    # 原 60s 误杀长上下文请求）；流式开始后由读超时自然接管。
+    def __init__(self, config: ProviderConfig, timeout: float = 120.0) -> None:
         self._config = config
         self._timeout = timeout
         base = (config.base_url or "https://api.deepseek.com/v1").rstrip("/")

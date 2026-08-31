@@ -17,6 +17,32 @@ class PromptTooLongError(RuntimeError):
     """API 返回上下文超长（prompt too long）——01 §6 ③ 紧急压缩触发点。"""
 
 
+# 瞬态错误特征（02 §3.9 重试链，review 修复 2026-08-31）。按类型名/消息子串
+# 匹配而非硬绑 httpx 类型——adapter 可换厂商库，分类语义保持稳定。
+_TRANSIENT_MARKERS: tuple[str, ...] = (
+    "ratelimit", "rate limit", "too many requests", "429",
+    "timeout", "timed out", "connect", "connection",
+    "unavailable", "bad gateway", "gateway timeout", "internal server",
+    "server error", "overloaded", "502", "503", "504",
+)
+
+
+def is_transient_llm_error(err: Exception) -> bool:
+    """瞬态 LLM 错误判定：429/5xx/连接/超时 → True（可指数退避重试）。
+
+    优先按 response.status_code 精确判断（adapter raise_for_status 场景）；
+    无 response 时按异常类型名 + 消息子串匹配。4xx 认证/协议错误、
+    PromptTooLongError / ToolTruncatedError 等领域异常 → False（不重试）。
+    """
+    code = getattr(getattr(err, "response", None), "status_code", None)
+    if isinstance(code, int):
+        return code == 429 or code >= 500
+    if isinstance(err, PromptTooLongError | ToolTruncatedError):
+        return False
+    text = f"{type(err).__name__}: {err}".lower()
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
 class ToolTruncatedError(RuntimeError):
     """工具参数不完整（arguments JSON 解析失败，通常因输出被 max_tokens 截断）。
 

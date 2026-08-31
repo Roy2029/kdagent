@@ -22,6 +22,7 @@ import httpx
 from kdagent.engine.llm.base import (
     LLMStreamEvent,
     Payload,
+    PromptTooLongError,
     ProviderConfig,
     ToolSchema,
     ToolTruncatedError,
@@ -83,6 +84,19 @@ def _serialize_tools(tools: list[ToolSchema]) -> list[dict[str, Any]]:
         {"name": t.name, "description": t.description, "input_schema": t.input_schema}
         for t in tools
     ]
+
+
+def _raise_prompt_too_long(status_code: int, body_text: str) -> None:
+    """Anthropic 超窗响应 → PromptTooLongError（01 紧急压缩触发点；纯函数可测）。
+
+    仅 400/413 且响应体含超窗特征时抛；其余状态码/响应体原样返回由
+    raise_for_status 走通用错误路径。
+    """
+    lowered = body_text.lower()
+    if status_code in (400, 413) and (
+        "prompt is too long" in lowered or "prompt too long" in lowered
+    ):
+        raise PromptTooLongError(f"Anthropic 上下文超长：{body_text[:300]}")
 
 
 class _AnthropicStreamParser:
@@ -235,7 +249,8 @@ class _AnthropicStreamParser:
 class AnthropicClient:
     """Anthropic Messages 协议客户端（备用 provider）。"""
 
-    def __init__(self, config: ProviderConfig, timeout: float = 60.0) -> None:
+    # 120s：长 prompt 首 token 场景（与 openai adapter 对齐，review 修复）。
+    def __init__(self, config: ProviderConfig, timeout: float = 120.0) -> None:
         self._config = config
         self._timeout = timeout
         base = (config.base_url or "https://api.anthropic.com/v1").rstrip("/")
@@ -261,6 +276,12 @@ class AnthropicClient:
             httpx.AsyncClient(timeout=self._timeout) as client,
             client.stream("POST", self._url, json=body, headers=headers) as resp,
         ):
+            # PromptTooLong 映射（review 修复 2026-08-31，02 §3.9）：备用 provider
+            # 撞上下文上限不再 raise_for_status 终止，而是走 01 紧急压缩路径重试。
+            if resp.status_code in (400, 413):
+                _raise_prompt_too_long(
+                    resp.status_code, (await resp.aread()).decode("utf-8", "replace")
+                )
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 for event in parser.feed(line):

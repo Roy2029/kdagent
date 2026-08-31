@@ -50,6 +50,7 @@ from kdagent.engine.llm.base import (
     PromptTooLongError,
     ToolTruncatedError,
     Usage,
+    is_transient_llm_error,
 )
 from kdagent.engine.messages import ContentBlock, TextBlock, ToolUseBlock
 from kdagent.harness.checkpoints import (
@@ -89,6 +90,15 @@ AgentStatus = Literal["CONTINUE", "TERMINAL"]
 MAX_ITERATIONS = 50  # T11：安全网，正常编码任务很少超过
 CONCURRENCY_LIMIT = 5  # T11：并发批上限初值，待实测校准
 CIRCUIT_BREAK_LIMIT = 3  # 连续失败挂起阈值（规格 02 §3.5）
+# 瞬态 LLM 错误重试（02 §3.9，review 修复 2026-08-31）：429/5xx/连接/超时指数
+# 退避 ≤3 次（1s→2s→4s），重试不推进轮次计数；一次网络抖动不再废掉整个 50 轮 run。
+TRANSIENT_RETRY_MAX = 3
+TRANSIENT_RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+
+async def _retry_sleep(seconds: float) -> None:
+    """重试退避休眠（模块级便于测试 monkeypatch）。"""
+    await asyncio.sleep(seconds)
 # 07 tool.exec span 工具返回截断上限（11 §3.4 复核界面「阅读」返回；防大输出撑爆 span）
 _TRACE_OUTPUT_CAP = 1000
 
@@ -419,6 +429,7 @@ class Agent:
         # 阶段 B（01 §6 ③）：prompt_too_long 撞墙 → 紧急压缩 → 重建 payload 重试一次。
         retry = 0  # PromptTooLong 重试计数（输入侧，紧急压缩后限重试一次）
         truncate_retry = 0  # 输出截断重试计数（B：反馈模型拆小输出，限 2 次防死循环）
+        transient_retry = 0  # 瞬态错误重试计数（02 §3.9：429/5xx/连接/超时，≤3 次）
         while True:
             err = await self._stream_llm(payload)
             if err is None:
@@ -434,6 +445,19 @@ class Agent:
                     self._run_hook("error", HookContext(event="error", error=str(err)))
                     return "TERMINAL"
                 payload = self._assemble_payload()
+                continue
+            # 瞬态重试（02 §3.9）：重试不推进轮次；超上限落到下方 TERMINAL 分支。
+            if is_transient_llm_error(err) and transient_retry < TRANSIENT_RETRY_MAX:
+                transient_retry += 1
+                delay = TRANSIENT_RETRY_DELAYS[transient_retry - 1]
+                self._pending_text = []
+                self._pending_tool_uses = []
+                retry_note = (
+                    f"LLM 瞬态错误（{err}），"
+                    f"正在重试 {transient_retry}/{TRANSIENT_RETRY_MAX}（{delay:.0f}s 后）"
+                )
+                self._events(ErrorEvent(error=retry_note))
+                await _retry_sleep(delay)
                 continue
             if (
                 not isinstance(err, PromptTooLongError)
